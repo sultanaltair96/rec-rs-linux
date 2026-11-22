@@ -1,0 +1,69 @@
+name: ci
+
+# Everything runs in the same dev container developers use, so CI and a local
+# `scripts/dev.sh cargo test` cannot drift. The image is built with the
+# buildx/GHA layer cache and tagged with the Dockerfile's hash, which is the
+# label scripts/dev.sh compares to decide whether it must rebuild.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Dockerfile hash (the label scripts/dev.sh checks)
+        id: dockerfile
+        run: echo "hash=$(sha256sum dev/Dockerfile | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: dev
+          file: dev/Dockerfile
+          tags: rec-rs-linux-dev
+          load: true
+          labels: rec-rs-linux.dockerfile=${{ steps.dockerfile.outputs.hash }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Format
+        run: scripts/dev.sh cargo fmt --check
+
+      - name: Clippy
+        run: scripts/dev.sh cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: scripts/dev.sh cargo test
+
+      - name: Build (release)
+        run: scripts/dev.sh cargo build --release
+
+      - name: Self-test (headless, test pattern)
+        run: scripts/dev.sh scripts/selftest.sh
+
+      - name: Keep the self-test recordings and logs when something failed
+        if: failure()
+        run: |
+          docker run --rm -v "$PWD:/out" -v rec-rs-linux-cache:/home/dev rec-rs-linux-dev \
+            sh -c 'cp -r /home/dev/Videos/rec-rs-tests /out/selftest-results 2>/dev/null || true'
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: selftest-results
+          path: selftest-results/**
+          if-no-files-found: ignore
