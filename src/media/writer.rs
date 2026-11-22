@@ -8,16 +8,52 @@
 //! timestamps stay on the host clock, which every source shares, so audio is
 //! never stretched and stays in sync.
 //!
-//! The file is a fragmented MP4/MOV while recording — a crash leaves a
-//! playable file up to the last fragment — and is finalised on stop.
+//! # Track layout (upstream's, from the README)
+//!
+//! 1. video
+//! 2. the system+mic mix (AAC-LC 48 kHz stereo 256 kb/s, the default track)
+//! 3. the system stem (AAC 48 kHz stereo 256 kb/s)
+//! 4. the mic stem (AAC 48 kHz mono 192 kb/s)
+//!
+//! With `--audio-tracks mix` only the mix is written; with `stems` only the two
+//! stems; a session with a single source writes that source's stem alone. When
+//! the mix and the stems coexist the audio tracks share an alternate group with
+//! the mix enabled, so a player gets the mix and an editor picks a stem.
+//!
+//! Faders are applied once per captured buffer, before the mix, the stem and
+//! the live encode see it, exactly like upstream; the mix bus limiter keeps the
+//! mix under −1 dBFS. At 0 dB a stem carries the device's samples unchanged.
+//!
+//! # AAC priming
+//!
+//! Every AAC encoder delays its output by its look-ahead (fdkaacenc 2048
+//! samples, avenc_aac 1024). AVFoundation writes an edit list that makes
+//! players skip it; [`super::mp4`] writes the same `elst` here, so the first
+//! beep in a file is at 0 ms instead of 42.7 ms late.
+//!
+//! # Crash safety and the final file
+//!
+//! While recording, the muxer writes a fragment every two seconds, so a crash
+//! leaves a playable file up to the last fragment. On a normal stop
+//! [`super::mp4::finalize`] appends a regular `moov` that indexes the samples
+//! where they lie and flips the fragment boxes to `free` — upstream's
+//! `ftyp ... mdat moov`, with no media bytes moved. If the finalise fails the
+//! fragmented file is kept and a warning says why.
+//!
+//! # Camera timing
+//!
+//! Webcams deliver frames 70–120 ms after capture. Emission runs behind real
+//! time by the slowest source's arrival latency (at least [`LAG_SECS`], at most
+//! 300 ms), so a late frame still lands in its own slot; a cold camera holds
+//! the start of the file until its exposure has settled (upstream's 2 s gate).
 //!
 //! Adapted from rec-rs src/writer.rs (MIT OR Apache-2.0), with AVAssetWriter
-//! replaced by GStreamer appsrc pipelines.
+//! replaced by GStreamer appsrc pipelines and the finalise done in
+//! [`super::mp4`].
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,9 +62,13 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 use serde::{Deserialize, Serialize};
 
+use crate::compose::{PipSpec, Scene};
+use crate::gpu::Renderer;
+use crate::live;
+use crate::media::mp4;
 use crate::media::pauses::Pauses;
-use crate::media_types::{AudioChunk, AudioKind, PixelFormat, VideoFrame};
-use crate::mixer::{self, Fader, Resampler, Volume};
+use crate::media_types::{AudioChunk, AudioKind, FrameSink, PixelFormat, VideoFrame};
+use crate::mixer::{self, Fader, Mixer, Resampler, Volume};
 
 /// The video codec of the recording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -79,8 +119,11 @@ pub struct Stats {
     pub video_dups: u64,
     /// Slots the encoder could not take (or a malformed frame).
     pub video_drops: u64,
+    /// Slots retried because the encoder was busy (upstream's backlog rule).
+    pub video_retries: u64,
     pub audio_sys_buffers: u64,
     pub audio_mic_buffers: u64,
+    pub audio_mix_buffers: u64,
     /// Audio buffers or parts that could not be written.
     pub audio_drops: u64,
     /// Audio gaps (late start, dropped device buffers) filled with silence.
@@ -89,25 +132,44 @@ pub struct Stats {
     pub audio_clipped_samples: u64,
     /// Grid slots skipped while paused or past `--duration`.
     pub paused_slots: u64,
+    /// Arrival latency (host now − capture pts), max and sum, in seconds.
+    pub screen_latency_max: f64,
+    pub screen_latency_sum: f64,
+    pub cam_latency_max: f64,
+    pub cam_latency_sum: f64,
+    /// What the finalise cost, and how big the movie was.
+    pub finalize_millis: u128,
+    pub fragments: usize,
 }
 
 /// How far behind real time emission runs, so late-arriving frames still land
 /// in their own slot.
 pub const LAG_SECS: f64 = 0.05;
 
+/// The most emission may run behind real time, whatever the sources report.
+pub const MAX_LAG_SECS: f64 = 0.3;
+
 /// Frames buffered per source before the oldest are dropped. A screen source's
 /// own queue depth is about 8: hold fewer, which covers the emission lag at
 /// 60 fps up to about 115 ms of continuous motion.
 const QUEUE_MAX: usize = 7;
 
-/// Audio timestamp jitter tolerated before a stem is padded or trimmed.
+/// How far behind its time a slot may fall while the encoder is busy before it
+/// is dropped instead of retried (upstream's `MAX_BACKLOG_SECS`).
+pub const MAX_BACKLOG_SECS: f64 = 0.5;
+
+/// Audio timestamp jitter tolerated before a track is padded or trimmed.
 pub const SNAP_SECS: f64 = 0.0015;
 
-/// How long finalising the file may take (muxing the trailer, flushing).
-const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Start without the camera if it delivers nothing for this long after the
+/// settle time.
+const CAMERA_TIMEOUT_SECS: f64 = 3.0;
 
-/// Video PTS of output slot `slot` in nanoseconds (60 fps divides a second
-/// exactly, so the grid alternates 16666666/16666667 ns and never drifts).
+/// How long finalising the file may take (muxing the trailer, the defragment).
+const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Video PTS of output slot `slot` in nanoseconds (every allowed fps divides a
+/// second, so the grid alternates 16666666/16666667 ns and never drifts).
 fn slot_ns(slot: i64, fps: u32) -> u64 {
     ((slot as i128 * 1_000_000_000i128) / fps as i128).max(0) as u64
 }
@@ -116,16 +178,27 @@ fn secs_ns(t: f64) -> u64 {
     (t * 1_000_000_000.0).round().max(0.0) as u64
 }
 
+/// Which track of the file an audio stream goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Mix,
+    System,
+    Mic,
+}
+
 /// One audio track being written.
 struct AudioTrack {
-    kind: AudioKind,
+    target: Target,
     appsrc: AppSrc,
-    /// Rate of the device feeding this track; a different one sets up the
-    /// resampler.
-    source_rate: Option<u32>,
-    resampler: Option<Resampler>,
+    channels: u8,
     /// Output-timeline position (seconds) where this track continues.
     next: Option<f64>,
+}
+
+/// One audio source's stream state: resampling to 48 kHz and its fader.
+struct SourceAudio {
+    rate: Option<u32>,
+    resampler: Option<Resampler>,
     fader: Fader,
     /// Gain for the level meters without mute (a muted source still shows its
     /// level).
@@ -140,6 +213,19 @@ struct Sink {
     tracks: Vec<AudioTrack>,
     path: PathBuf,
     encoder: String,
+    /// Track layout to apply when the file is finalised.
+    layout: mp4::Layout,
+}
+
+/// The camera gate: hold the start of the file until the camera has delivered
+/// a frame and had time to settle its exposure (upstream's `wait_for_camera`).
+struct CamGate {
+    settle: f64,
+    /// The newest screen frame held back meanwhile.
+    pending: Option<VideoFrame>,
+    /// Capture time the camera is ready (first camera frame + settle).
+    ready_at: Option<f64>,
+    give_up: f64,
 }
 
 /// The recording writer: the constant-frame-rate grid, the pause timeline,
@@ -160,6 +246,8 @@ pub struct Writer {
     /// Newest captured frames, with the time they were captured.
     screen_q: VecDeque<(f64, Arc<VideoFrame>)>,
     screen_last: Option<Arc<VideoFrame>>,
+    cam_q: VecDeque<(f64, Arc<VideoFrame>)>,
+    cam_last: Option<Arc<VideoFrame>>,
     /// Audio that arrived before the first video frame set the clock.
     preroll: VecDeque<(AudioKind, AudioChunk)>,
     /// Seconds added to [system, mic] audio timestamps for sync (output device
@@ -167,6 +255,36 @@ pub struct Writer {
     audio_offset: [f64; 2],
     /// Sources the session will feed.
     audio_wanted: [bool; 2],
+    /// Per-source resampler and fader.
+    sources: [SourceAudio; 2],
+    /// The mix bus for the file's mix track (output timeline).
+    mixer: Option<Mixer>,
+    /// The mix bus for the live encode (real time, keeps running while paused).
+    live_mixer: Option<Mixer>,
+    /// The shared live encode (replay buffer, streams; phase 1D).
+    live: Option<Arc<live::Live>>,
+    /// Where every emitted frame is offered (the app's preview; phase 1E).
+    preview: Option<FrameSink>,
+    /// Last preview time on the real grid (upstream throttles it to 30 fps).
+    last_preview: f64,
+    /// GPU compositor, when phase 1C's renderer is available.
+    renderer: Option<Renderer>,
+    /// The session has a camera, even before its first frame arrives.
+    cam_expected: bool,
+    /// Size of the newest camera frame, for `cam_aspect` before the first
+    /// emitted slot picks it.
+    cam_size: Option<(usize, usize)>,
+    scene: Scene,
+    pip: PipSpec,
+    /// Hold the start until the camera is ready (see [`CamGate`]).
+    cam_gate: Option<CamGate>,
+    /// Decaying peak arrival latency [screen, camera] and when it was set.
+    latency_peak: [f64; 2],
+    latency_at: [f64; 2],
+    /// Caps currently announced to the video appsrc.
+    caps_key: Option<(usize, usize, PixelFormat)>,
+    /// A CPU-fallback scene note is printed once.
+    warned_overlay: bool,
     pub stats: Stats,
     failed: Option<String>,
     levels: [f32; 2],
@@ -185,6 +303,8 @@ impl Writer {
         mic: bool,
         layout: AudioLayout,
         volumes: [Volume; 2],
+        scene: Scene,
+        pip: PipSpec,
     ) -> Result<Self> {
         if spec.width < 16 || spec.height < 16 || !(1..=240).contains(&spec.fps) {
             bail!(
@@ -200,7 +320,7 @@ impl Writer {
             bail!("{} already exists", p.display());
         }
         let sink = match path {
-            Some(p) => Some(open_sink(p, spec, system, mic, layout, volumes)?),
+            Some(p) => Some(open_sink(p, spec, system, mic, layout)?),
             None => None,
         };
         Ok(Writer {
@@ -213,9 +333,32 @@ impl Writer {
             limit: None,
             screen_q: VecDeque::new(),
             screen_last: None,
+            cam_q: VecDeque::new(),
+            cam_last: None,
             preroll: VecDeque::new(),
             audio_offset: [0.0; 2],
             audio_wanted: [system, mic],
+            sources: std::array::from_fn(|i| SourceAudio {
+                rate: None,
+                resampler: None,
+                fader: Fader::new(volumes[i].gain()),
+                meter_gain: volumes[i].fader_gain(),
+            }),
+            mixer: None,
+            live_mixer: None,
+            live: None,
+            preview: None,
+            last_preview: 0.0,
+            renderer: None,
+            cam_expected: false,
+            cam_size: None,
+            scene,
+            pip,
+            cam_gate: None,
+            latency_peak: [0.0; 2],
+            latency_at: [0.0; 2],
+            caps_key: None,
+            warned_overlay: false,
             stats: Stats::default(),
             failed: None,
             levels: [0.0; 2],
@@ -247,15 +390,12 @@ impl Writer {
         self.audio_offset = offsets;
     }
 
-    /// Change a source's level: everything captured from now on follows, in its
-    /// own track (and, once phase 1C adds it, the mix and the live encode).
+    /// Change a source's level: everything captured from now on follows, in the
+    /// mix, both stems and the live encode.
     pub fn set_volumes(&mut self, volumes: [Volume; 2]) {
-        if let Some(sink) = self.sink.as_mut() {
-            for t in &mut sink.tracks {
-                let v = volumes[t.kind.index()];
-                t.fader.set(v.gain());
-                t.meter_gain = v.fader_gain();
-            }
+        for (i, v) in volumes.into_iter().enumerate() {
+            self.sources[i].fader.set(v.gain());
+            self.sources[i].meter_gain = v.fader_gain();
         }
     }
 
@@ -270,11 +410,11 @@ impl Writer {
         self.t0.is_some()
     }
 
-    /// How far behind real time emission runs. Late webcam frames widen it in
-    /// upstream (it adapts to the slowest source); the phase 0 sources are all
-    /// on time, so the constant is enough.
+    /// How far behind real time emission runs: the slowest source's recent
+    /// arrival latency plus a margin, never less than [`LAG_SECS`].
     pub fn lag(&self) -> f64 {
-        LAG_SECS
+        let worst = self.latency_peak[0].max(self.latency_peak[1]);
+        (worst + 0.025).clamp(LAG_SECS, MAX_LAG_SECS)
     }
 
     /// The first error the pipeline reported, if any.
@@ -309,7 +449,98 @@ impl Writer {
         ((now - t0) * self.spec.fps as f64).ceil().max(0.0) as i64
     }
 
-    /// Take a captured frame. Called from the capture thread.
+    /// The writer's live tap: every emitted frame and every post-fader audio
+    /// buffer is offered to the shared live encode (replay buffer, streams).
+    /// Non-blocking, and it keeps running while a recording is paused and with
+    /// `--no-record`.
+    pub fn set_live(&mut self, live: Arc<live::Live>) {
+        self.live = Some(live);
+    }
+
+    /// Tell the writer the session has a camera, so a camera scene can be
+    /// selected before the first frame arrives.
+    pub fn set_camera_expected(&mut self, yes: bool) {
+        self.cam_expected = yes;
+    }
+
+    /// Offer every emitted (composited) frame to `sink`, at most 30 times a
+    /// second. This is the app's preview; it shows what is recorded, overlay
+    /// included.
+    pub fn set_preview(&mut self, sink: FrameSink) {
+        self.preview = Some(sink);
+    }
+
+    /// Make phase 1C's compositor available. Called by the session when a
+    /// camera is used; until 1C lands the writer falls back to the CPU path.
+    pub fn set_renderer(&mut self, renderer: Option<Renderer>) {
+        self.renderer = renderer;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_scene(self.scene);
+            r.set_pip(self.pip.clone());
+        }
+    }
+
+    /// Switch scenes live. `Screen` always works; `Cam` needs camera frames;
+    /// `ScreenCam` needs the compositor (the overlay is drawn on the GPU).
+    pub fn set_scene(&mut self, scene: Scene) -> bool {
+        let ok = match scene {
+            Scene::Screen => true,
+            Scene::Cam => {
+                self.renderer.is_some() || self.cam_expected || self.cam_last.is_some()
+            }
+            Scene::ScreenCam => self.renderer.is_some(),
+        };
+        if ok {
+            self.scene = scene;
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_scene(scene);
+            }
+        }
+        ok
+    }
+
+    /// Change the camera overlay live (no-op without a compositor).
+    pub fn set_pip(&mut self, pip: PipSpec) {
+        self.pip = pip.clone();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_pip(pip);
+        }
+    }
+
+    /// Aspect ratio of the camera, once frames arrive.
+    pub fn cam_aspect(&self) -> Option<f64> {
+        if let Some(r) = self.renderer.as_ref() {
+            return Some(r.cam_aspect());
+        }
+        self.cam_size
+            .or_else(|| self.cam_last.as_ref().map(|f| (f.width, f.height)))
+            .map(|(w, h)| w as f64 / h.max(1) as f64)
+    }
+
+    /// Start only once the camera has delivered a frame and then run for
+    /// `settle` seconds (its exposure settling). Gives up after a few seconds
+    /// without camera frames rather than never starting (upstream's gate).
+    pub fn wait_for_camera(&mut self, settle: f64) {
+        let now = crate::media_types::now();
+        self.cam_gate = Some(CamGate {
+            settle,
+            pending: None,
+            ready_at: None,
+            give_up: now + settle + CAMERA_TIMEOUT_SECS,
+        });
+    }
+
+    /// Track arrival latency as a peak that decays by 50 ms per second, so one
+    /// stall (a busy thread, a device starting) does not keep the output
+    /// delayed for the rest of the session.
+    fn note_latency(&mut self, i: usize, lat: f64, at: f64) {
+        let p = &mut self.latency_peak[i];
+        let decayed = (*p - 0.05 * (at - self.latency_at[i]).max(0.0)).max(0.0);
+        *p = decayed.max(lat);
+        self.latency_at[i] = at;
+    }
+
+    /// Take a captured screen frame. Called from the capture thread.
     pub fn push_video(&mut self, frame: VideoFrame) {
         self.stats.video_frames_in += 1;
         if !frame.is_well_formed() {
@@ -325,25 +556,114 @@ impl Writer {
             }
             return;
         }
-        if self.t0.is_none() {
-            self.t0 = Some(frame.pts);
-            if let Some(sink) = self.sink.as_ref() {
-                let _ = sink.pipeline.set_state(gst::State::Playing);
+        let lat = crate::media_types::now() - frame.pts;
+        self.stats.screen_latency_max = self.stats.screen_latency_max.max(lat);
+        self.stats.screen_latency_sum += lat;
+        self.note_latency(0, lat, frame.pts);
+        // The camera gate: hold the first screen frame until the camera is
+        // ready (a still screen sends no more frames).
+        if self.t0.is_none()
+            && let Some(gate) = self.cam_gate.as_mut()
+        {
+            let now = frame.pts;
+            if gate.ready_at.is_none_or(|r| now < r) && now < gate.give_up {
+                gate.pending = Some(frame);
+                return;
             }
-            // Audio that arrived before the clock started continues from the
-            // session start.
-            for (kind, chunk) in std::mem::take(&mut self.preroll) {
-                self.push_audio(kind, &chunk);
+            self.cam_gate = None;
+        }
+        self.push_screen_frame(frame, true);
+    }
+
+    /// Take a captured camera frame. Called from the capture thread.
+    pub fn push_cam(&mut self, frame: VideoFrame) {
+        self.stats.video_frames_in += 1;
+        if !frame.is_well_formed() {
+            self.stats.video_drops += 1;
+            if self.failed.is_none() {
+                self.failed = Some("malformed camera frame".into());
+            }
+            return;
+        }
+        let lat = crate::media_types::now() - frame.pts;
+        self.stats.cam_latency_max = self.stats.cam_latency_max.max(lat);
+        self.stats.cam_latency_sum += lat;
+        self.note_latency(1, lat, frame.pts);
+        self.cam_expected = true;
+        self.cam_size = Some((frame.width, frame.height));
+        // The camera gate releases as soon as the camera has settled: the
+        // held screen frame starts the file at this camera frame's time.
+        if self.t0.is_none()
+            && let Some(gate) = self.cam_gate.as_mut()
+        {
+            let ready = *gate.ready_at.get_or_insert(frame.pts + gate.settle);
+            if frame.pts >= ready.min(gate.give_up)
+                && let Some(mut screen) = gate.pending.take()
+            {
+                // The waiting screen frame starts the file now: it is what is
+                // on screen at the moment the camera is ready (upstream passes
+                // the camera's time for it).
+                screen.pts = frame.pts;
+                self.cam_gate = None;
+                self.push_screen_frame(screen, false);
             }
         }
+        // A camera frame can start the clock too: with no gate and no screen
+        // frame yet (a camera-only session, or a still screen), the file
+        // starts here rather than never.
+        if !self.started() && self.cam_gate.is_none() {
+            self.start_clock(frame.pts);
+        }
+        self.cam_q.push_back((frame.pts, Arc::new(frame)));
+        let due = self.due_time();
+        Self::cap(&mut self.cam_q, &mut self.cam_last, QUEUE_MAX, due);
+    }
+
+    /// Queue a screen frame (already counted) and start the clock if needed.
+    fn push_screen_frame(&mut self, frame: VideoFrame, counted: bool) {
+        if !self.started() {
+            self.start_clock(frame.pts);
+        }
         let pts = frame.pts;
+        let _ = counted;
         self.screen_q.push_back((pts, Arc::new(frame)));
         let due = self.due_time();
-        Self::cap(&mut self.screen_q, &mut self.screen_last, QUEUE_MAX, due);
+        Self::cap(
+            &mut self.screen_q,
+            &mut self.screen_last,
+            QUEUE_MAX,
+            due,
+        );
+    }
+
+    /// The first frame set the session clock: start the pipeline, the mix bus
+    /// and the audio that arrived before it.
+    fn start_clock(&mut self, t0: f64) {
+        self.t0 = Some(t0);
+        if let Some(sink) = self.sink.as_ref() {
+            let _ = sink.pipeline.set_state(gst::State::Playing);
+        }
+        if self.audio_wanted.iter().any(|w| *w) {
+            if self.sink.as_ref().is_some_and(|s| s.tracks.iter().any(|t| t.target == Target::Mix))
+            {
+                self.mixer = Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
+            }
+            if self.live.is_some() {
+                self.live_mixer =
+                    Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
+            }
+        }
+        for (kind, chunk) in std::mem::take(&mut self.preroll) {
+            self.push_audio(kind, &chunk);
+        }
     }
 
     /// Take audio from a source. Called from the capture thread.
     pub fn push_audio(&mut self, kind: AudioKind, chunk: &AudioChunk) {
+        let i = kind.index();
+        if !self.audio_wanted[i] || chunk.frames() == 0 {
+            return;
+        }
         let Some(t0) = self.t0 else {
             // Keep it until the clock starts; the part after t0 is used.
             self.preroll.push_back((kind, chunk.clone()));
@@ -352,52 +672,52 @@ impl Writer {
             }
             return;
         };
-        let i = kind.index();
-        if !self.audio_wanted[i] || chunk.frames() == 0 {
-            return;
-        }
         // When the sound was heard (see `set_audio_offsets`).
         let real = chunk.pts + self.audio_offset[i];
-        let meter_gain = self
-            .sink
-            .as_ref()
-            .and_then(|s| s.tracks.iter().find(|t| t.kind.index() == i))
-            .map(|t| t.meter_gain);
-        if let Some(g) = meter_gain {
-            self.levels[i] = self.levels[i].max(chunk.peak() * g);
-        }
-        let Some(sink) = self.sink.as_mut() else {
-            return;
-        };
-        let Some(track) = sink.tracks.iter_mut().find(|t| t.kind.index() == i) else {
-            return;
-        };
-        // The track's audio: 48 kHz stereo frames, faded by this source's fader.
+        // The meter reads the raw device level after the fader gain but before
+        // mute, like upstream.
+        self.levels[i] = self.levels[i].max(chunk.peak() * self.sources[i].meter_gain);
+
+        // One canonical 48 kHz stereo stream, resampled once.
+        let src = &mut self.sources[i];
         let input = mixer::stereo_frames(chunk);
         let (pts48, mut frames) = if (chunk.rate as f64 - mixer::RATE).abs() < 0.5 {
-            track.resampler = None;
+            src.resampler = None;
             (real, input)
         } else {
-            if track.source_rate != Some(chunk.rate) {
-                track.source_rate = Some(chunk.rate);
-                track.resampler = Some(Resampler::new(chunk.rate as f64, real));
+            if src.rate != Some(chunk.rate) {
+                src.rate = Some(chunk.rate);
+                src.resampler = Some(Resampler::new(chunk.rate as f64, real));
             }
-            track
-                .resampler
+            src.resampler
                 .as_mut()
                 .unwrap()
                 .push(real, chunk.rate as f64, input)
         };
-        let rate = mixer::RATE;
-        if let Some(env) = track.fader.envelope(frames.len(), rate) {
-            for (f, g) in frames.iter_mut().zip(env) {
-                f[0] = (f[0] * g).clamp(-1.0, 1.0);
-                f[1] = (f[1] * g).clamp(-1.0, 1.0);
-            }
+        // The fader is applied once, and the same faded samples feed the mix,
+        // the stem and the live encode. `Fader` returns None at unity, so a
+        // stem at 0 dB keeps the device's samples byte for byte.
+        if let Some(env) = src.fader.envelope(frames.len(), mixer::RATE) {
+            apply_gain(&mut frames, &env);
         }
-        // Cut the chunk at pause boundaries (sample-accurate: the track's
-        // buffers are laid end to end, so a dropped or overlapping piece would
+
+        // The live encode keeps running while the file is paused: it gets the
+        // whole buffer on the host clock.
+        if self.live.is_some() {
+            if self.live_mixer.is_none() {
+                self.live_mixer =
+                    Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
+            }
+            if let Some(m) = self.live_mixer.as_mut() {
+                m.push(kind, real, mixer::RATE, frames.clone());
+            }
+            self.drain_live(false);
+        }
+
+        // The file: cut the buffer at pause boundaries (sample-accurate: the
+        // tracks are laid end to end, so a dropped or overlapping piece would
         // shift everything after it).
+        let rate = mixer::RATE;
         let n = frames.len();
         let to_slot = |t: f64| (t - t0) * self.spec.fps as f64;
         let (a, b) = (to_slot(pts48), to_slot(pts48 + n as f64 / rate));
@@ -421,24 +741,93 @@ impl Writer {
         // The file's timeline starts at the session start (the first frame),
         // so host time becomes output time here.
         let out_s = pts48 - t0 + i0 as f64 / rate - off as f64 / self.spec.fps as f64;
+        let part = frames[i0..i1].to_vec();
+
+        // The mix bus for the file's mix track.
+        if self.mixer.is_some() {
+            if let Some(m) = self.mixer.as_mut() {
+                m.push(kind, out_s, rate, part.clone());
+            }
+            self.drain_mix(false);
+        }
+
+        // The source's own stem.
+        let target = match kind {
+            AudioKind::System => Target::System,
+            AudioKind::Mic => Target::Mic,
+        };
+        self.write_track(target, out_s, &part);
+        match kind {
+            AudioKind::System => self.stats.audio_sys_buffers += 1,
+            AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+        }
+    }
+
+    /// Pull finished mix frames into the mix track and the live encode.
+    fn drain_mix(&mut self, flush: bool) {
+        let mut chunks: Vec<(f64, Vec<[f32; 2]>)> = vec![];
+        let mut clipped = 0;
+        if let Some(m) = self.mixer.as_mut() {
+            while let Some((t, frames)) = m.pull_frames(flush) {
+                chunks.push((t, frames));
+            }
+            clipped = m.clipped;
+        }
+        for (t, frames) in chunks {
+            self.write_track(Target::Mix, t, &frames);
+            self.stats.audio_mix_buffers += 1;
+        }
+        if self.mixer.is_some() {
+            self.stats.audio_clipped_samples = clipped;
+        }
+    }
+
+    /// Offer the live mix to the shared encode.
+    fn drain_live(&mut self, flush: bool) {
+        let Some(live) = self.live.clone() else { return };
+        let mut chunks = vec![];
+        if let Some(m) = self.live_mixer.as_mut() {
+            while let Some(chunk) = m.pull_chunk(flush) {
+                chunks.push(chunk);
+            }
+        }
+        for chunk in chunks {
+            live.push_audio(&chunk);
+        }
+    }
+
+    /// Write 48 kHz stereo frames to the track that holds `target`, keeping it
+    /// on the output timeline (a gap becomes silence, an overlap is trimmed).
+    fn write_track(&mut self, target: Target, pts: f64, frames: &[[f32; 2]]) {
+        if frames.is_empty() {
+            return;
+        }
+        let limit_secs = self.limit.map(|l| l as f64 / self.spec.fps as f64);
+        let Some(sink) = self.sink.as_mut() else { return };
+        let Some(track) = sink.tracks.iter_mut().find(|t| t.target == target) else {
+            return;
+        };
+        let rate = mixer::RATE;
         // The track continues from the last buffer written: fill a gap (late
         // start, dropped device buffer) with silence and trim an overlap, both
         // sample-accurate. Error stays under SNAP_SECS.
         let start = track.next.unwrap_or(0.0);
-        let gap = out_s - start;
+        let gap = pts - start;
         let mut pad = 0usize;
+        let mut skip = 0usize;
         if gap > SNAP_SECS {
             pad = (gap * rate).round() as usize;
         } else if gap < -SNAP_SECS {
-            i0 += (-gap * rate).round() as usize;
-            if i0 >= i1 {
+            skip = (-gap * rate).round() as usize;
+            if skip >= frames.len() {
                 return;
             }
         }
+        let body = &frames[skip..];
         // `--duration` cuts every track at the same output time, so the file
         // ends where the video grid does.
-        let limit_secs = self.limit.map(|l| l as f64 / self.spec.fps as f64);
-        if let Some(limit) = limit_secs {
+        let mut pad = pad;
+        let body = if let Some(limit) = limit_secs {
             if start >= limit {
                 return;
             }
@@ -448,39 +837,26 @@ impl Writer {
                 return;
             }
             let room = ((limit - body_start) * rate).floor().max(0.0) as usize;
-            i1 = i1.min(i0 + room);
-            if i1 <= i0 {
-                return;
-            }
+            &body[..body.len().min(room)]
+        } else {
+            body
+        };
+        if body.is_empty() && pad == 0 {
+            return;
         }
-        track.next = Some(start + pad as f64 / rate + (i1 - i0) as f64 / rate);
         let body_start = start + pad as f64 / rate;
+        let mut ok = true;
         if pad > 0 {
-            if !push_track_samples(track, start, &vec![[0.0, 0.0]; pad]) {
-                self.stats.audio_drops += 1;
-                self.check_bus();
-                return;
-            }
+            ok &= push_track_samples(track, start, &vec![[0.0, 0.0]; pad], 2);
             self.stats.audio_gaps_filled += 1;
         }
-        let ok = push_track_samples(track, body_start, &frames[i0.min(n)..i1.min(n)]);
-        match kind {
-            AudioKind::System => {
-                if ok {
-                    self.stats.audio_sys_buffers += 1
-                } else {
-                    self.stats.audio_drops += 1
-                }
-            }
-            AudioKind::Mic => {
-                if ok {
-                    self.stats.audio_mic_buffers += 1
-                } else {
-                    self.stats.audio_drops += 1
-                }
-            }
+        if !body.is_empty() {
+            ok &= push_track_samples(track, body_start, body, track.channels as usize);
         }
-        if !ok {
+        if ok {
+            track.next = Some(body_start + body.len() as f64 / rate);
+        } else {
+            self.stats.audio_drops += 1;
             self.check_bus();
         }
     }
@@ -524,6 +900,20 @@ impl Writer {
         }
     }
 
+    /// True while the video queue has room (the GStreamer stand-in for
+    /// AVAssetWriterInput's `isReadyForMoreMediaData`).
+    fn video_ready(&self) -> bool {
+        let Some(sink) = self.sink.as_ref() else {
+            return true;
+        };
+        let value = sink.video_src.property_value("current-level-buffers");
+        let level = value
+            .get::<u64>()
+            .or_else(|_| value.get::<u32>().map(u64::from))
+            .unwrap_or(0);
+        level < 4
+    }
+
     /// Emit every grid slot whose time is at or before `until` (host seconds).
     pub fn emit_until(&mut self, until: f64) {
         let Some(t0) = self.t0 else { return };
@@ -539,60 +929,141 @@ impl Writer {
             if slot_t > until {
                 break;
             }
+            // Encoder busy (a GPU spike, a slow software encode): retry this
+            // slot on the next pacer pass unless it is already too far behind.
+            if !self.video_ready() && slot_t > until - MAX_BACKLOG_SECS {
+                self.stats.video_retries += 1;
+                break;
+            }
             let paused = self.pauses.offset_at(slot as f64).is_none();
             let past_limit = self.limit.is_some_and(|l| self.out_slot >= l);
             self.next_slot += 1;
-            if paused || past_limit {
-                self.stats.paused_slots += 1;
-                continue;
-            }
             let before = self.screen_q.len();
             Self::pick(&mut self.screen_q, &mut self.screen_last, slot_t + half);
             let fresh = self.screen_q.len() != before;
-            let Some(frame) = self.screen_last.clone() else {
+            Self::pick(&mut self.cam_q, &mut self.cam_last, slot_t + half);
+            let write = !paused && !past_limit;
+            if !write {
+                self.stats.paused_slots += 1;
+            }
+            // The preview and the live encode get every frame, paused or not.
+            let want_preview =
+                self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
+            let want_live = self.live.as_ref().is_some_and(|l| l.active());
+            if !write && !want_preview && !want_live {
+                continue;
+            }
+            let Some(frame) = self.compose(slot_t) else {
                 continue;
             };
-            let out_slot = self.out_slot;
-            self.out_slot += 1;
-            if self.push_video_buffer(out_slot, &frame) {
-                self.stats.video_frames_out += 1;
-                if !fresh {
-                    self.stats.video_dups += 1;
+            if write {
+                let out_slot = self.out_slot;
+                let refused = !self.video_ready();
+                self.out_slot += 1;
+                if !refused && self.push_video_buffer(out_slot, &frame) {
+                    self.stats.video_frames_out += 1;
+                    if !fresh {
+                        self.stats.video_dups += 1;
+                    }
+                } else {
+                    self.stats.video_drops += 1;
+                    self.check_bus();
                 }
-            } else {
-                self.stats.video_drops += 1;
+            }
+            if want_live && let Some(l) = self.live.clone() {
+                // The live encode places frames on the real grid, so a paused
+                // recording does not stall it.
+                let mut stamped = frame.as_ref().clone();
+                stamped.pts = slot_t;
+                l.push_video(&stamped);
+            }
+            if want_preview
+                && let Some(p) = self.preview.clone()
+            {
+                self.last_preview = slot_t;
+                p(frame.as_ref().clone());
             }
         }
     }
 
+    /// The output frame for a slot: the compositor's result when phase 1C is
+    /// available, else the current CPU path (the screen frame; the camera
+    /// frame for a camera-only scene).
+    fn compose(&mut self, slot_t: f64) -> Option<Arc<VideoFrame>> {
+        let screen = self.screen_last.clone();
+        let cam = self.cam_last.clone();
+        if self.renderer.is_some() {
+            let pts = slot_t;
+            let rendered = self
+                .renderer
+                .as_mut()
+                .unwrap()
+                .render(screen.as_deref(), cam.as_deref(), pts);
+            match rendered {
+                Ok(frame) => return Some(Arc::new(frame)),
+                Err(e) => {
+                    // A compositor failure must not stop the recording: fall
+                    // back to the CPU path and say so once.
+                    if !self.warned_overlay {
+                        self.warned_overlay = true;
+                        eprintln!("rec: warning: compositing failed ({e}); recording without the camera overlay");
+                    }
+                    self.renderer = None;
+                }
+            }
+        }
+        match self.scene {
+            Scene::Screen => screen,
+            Scene::Cam => cam.or(screen),
+            Scene::ScreenCam => {
+                if !self.warned_overlay && cam.is_some() {
+                    self.warned_overlay = true;
+                    eprintln!(
+                        "rec: warning: the camera overlay needs the GPU compositor (phase {}); \
+                         recording the screen alone",
+                        crate::gpu::PHASE
+                    );
+                }
+                screen.or(cam)
+            }
+        }
+    }
+
+    /// Announce the frame's size and format to the appsrc when they change.
+    ///
+    /// The pipeline pins the *output* size after the scaler, so a source that
+    /// delivers its native size (a 1440p display into a 1080p recording) is
+    /// accepted and scaled with Lanczos.
+    fn ensure_video_caps(&mut self, frame: &VideoFrame) {
+        let Some(sink) = self.sink.as_ref() else { return };
+        let key = (frame.width, frame.height, frame.format);
+        if self.caps_key == Some(key) {
+            return;
+        }
+        let format = match frame.format {
+            PixelFormat::Bgra => "BGRA",
+            PixelFormat::Rgba => "RGBA",
+            PixelFormat::Nv12 => "NV12",
+            PixelFormat::I420 => "I420",
+        };
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", format)
+            .field("width", frame.width as i32)
+            .field("height", frame.height as i32)
+            .field("framerate", gst::Fraction::new(self.spec.fps as i32, 1))
+            .build();
+        sink.video_src.set_caps(Some(&caps));
+        self.caps_key = Some(key);
+    }
+
     fn push_video_buffer(&mut self, out_slot: i64, frame: &VideoFrame) -> bool {
-        let Some(sink) = self.sink.as_ref() else {
+        if self.sink.is_none() {
             // Preview-only session: counted as written, nothing is encoded.
             return true;
-        };
-        let Some(plane) = frame.planes.first() else {
-            return false;
-        };
-        if !matches!(frame.format, PixelFormat::Bgra | PixelFormat::Rgba) {
-            self.failed = Some(format!(
-                "the encoder takes BGRA frames, not {}",
-                frame.format.label()
-            ));
-            return false;
         }
-        // One copy into the GStreamer buffer: the frame stays owned by the
-        // writer for repeats, so its memory cannot be handed over. (A shared
-        // allocator that wraps the same bytes is a phase 1C refinement.)
-        let bytes = if plane.stride == frame.width * 4 {
-            plane.data.to_vec()
-        } else {
-            let mut tight = Vec::with_capacity(frame.width * frame.height * 4);
-            for row in 0..frame.height {
-                let at = row * plane.stride;
-                tight.extend_from_slice(&plane.data[at..at + frame.width * 4]);
-            }
-            tight
-        };
+        self.ensure_video_caps(frame);
+        let bytes = tight_bytes(frame);
+        let Some(bytes) = bytes else { return false };
         let mut buffer = gst::Buffer::from_mut_slice(bytes);
         {
             let b = buffer.get_mut().unwrap();
@@ -602,6 +1073,7 @@ impl Writer {
                 slot_ns(out_slot + 1, self.spec.fps) - ns,
             ));
         }
+        let sink = self.sink.as_ref().unwrap();
         match sink.video_src.push_buffer(buffer) {
             Ok(_) => true,
             Err(e) => {
@@ -643,29 +1115,29 @@ impl Writer {
     /// Flush video up to `end` (host seconds), finalise the file and return the
     /// stats. Blocks until the movie is written.
     pub fn finish(mut self, end: f64) -> Result<Stats> {
-        if let Some(e) = self.failed.clone() {
-            self.abort();
-            bail!("writer failed: {e}");
-        }
+        let failed = self.failed.clone();
         if self.t0.is_none() {
             self.abort();
             bail!("no video frames were captured, nothing written");
         }
         self.emit_until(end);
-        let Some(sink) = self.sink.take() else {
+        // The last pieces of audio, then the end of the streams.
+        self.drain_mix(true);
+        self.drain_live(true);
+        let Some(mut sink) = self.sink.take() else {
             // Preview-only session.
             return Ok(self.stats.clone());
         };
-        let mut sink = sink;
         // A track that never got audio would make an empty track; give it a
         // moment of silence so the layout is intact.
         for t in &mut sink.tracks {
-            let written = match t.kind {
-                AudioKind::System => self.stats.audio_sys_buffers,
-                AudioKind::Mic => self.stats.audio_mic_buffers,
+            let written = match t.target {
+                Target::Mix => self.stats.audio_mix_buffers,
+                Target::System => self.stats.audio_sys_buffers,
+                Target::Mic => self.stats.audio_mic_buffers,
             };
             if written == 0 {
-                let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480]);
+                let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480], t.channels as usize);
             }
         }
         for t in &sink.tracks {
@@ -702,9 +1174,61 @@ impl Writer {
             }
         }
         let _ = sink.pipeline.set_state(gst::State::Null);
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&sink.path);
-            return Err(e);
+        if let Err(e) = &result {
+            // Keep the file: a fragmented recording is playable up to the last
+            // fragment even when the muxer or an encoder failed.
+            eprintln!("rec: warning: the movie could not be finalized: {e}");
+            eprintln!("rec: warning: {} is still playable", sink.path.display());
+            if let Some(e) = failed {
+                bail!("writer failed: {e}");
+            }
+            return Ok(self.stats.clone());
+        }
+        // The last step: a regular movie instead of fragments, plus the track
+        // layout (alternate group, enabled flags, AAC priming edit lists).
+        let crash = match std::env::var("REC_DEFRAG_CRASH").as_deref() {
+            Ok("before-flip") => mp4::CrashAt::BeforeFlip,
+            Ok("mid-flip") => mp4::CrashAt::MidFlip,
+            _ => mp4::CrashAt::None,
+        };
+        let keep = std::env::var_os("REC_DEFRAG_KEEP").map(PathBuf::from);
+        if std::env::var("REC_DEFRAG_OFF").is_ok_and(|v| v != "0") {
+            return Ok(self.stats.clone());
+        }
+        match mp4::finalize(&sink.path, &sink.layout, crash, keep.as_deref()) {
+            Ok(report) => {
+                self.stats.finalize_millis = report.millis;
+                self.stats.fragments = report.fragments;
+                if std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!(
+                        "rec: debug: finalise {} ({} fragments, {} samples, {} tracks, {} B in, moov {} B) in {} ms",
+                        if report.defragmented {
+                            "defragmented"
+                        } else {
+                            "patched"
+                        },
+                        report.fragments,
+                        report.samples,
+                        report.tracks,
+                        report.input_bytes,
+                        report.moov_bytes,
+                        report.millis
+                    );
+                }
+            }
+            Err(e) => {
+                // Never delete or truncate: the fragmented file still plays.
+                eprintln!(
+                    "rec: warning: could not turn the fragmented file into a regular movie ({e})"
+                );
+                eprintln!(
+                    "rec: warning: {} is complete up to its last fragment and still plays",
+                    sink.path.display()
+                );
+            }
+        }
+        if let Some(e) = failed {
+            bail!("writer failed: {e}");
         }
         Ok(self.stats.clone())
     }
@@ -727,12 +1251,59 @@ impl Drop for Writer {
     }
 }
 
-/// Push 48 kHz stereo frames to one track.
-fn push_track_samples(track: &mut AudioTrack, pts: f64, frames: &[[f32; 2]]) -> bool {
-    let mut bytes = Vec::with_capacity(frames.len() * 8);
+/// Multiply a fader envelope into stereo frames.
+///
+/// No clamping: upstream's float path lets a boosted stem exceed full scale
+/// (the encoder and the player decide what to do), and the mix bus has its own
+/// limiter. Clamping here would hard-clip a +dB stem that upstream leaves
+/// alone.
+fn apply_gain(frames: &mut [[f32; 2]], env: &[f32]) {
+    for (f, g) in frames.iter_mut().zip(env) {
+        f[0] *= g;
+        f[1] *= g;
+    }
+}
+
+/// The frame's planes as one tightly packed buffer, in the plane order the
+/// format defines (what GStreamer expects without a `GstVideoMeta`).
+fn tight_bytes(frame: &VideoFrame) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(frame.byte_len());
+    for (i, plane) in frame.planes.iter().enumerate() {
+        let rows = frame.format.plane_rows(i, frame.height);
+        let stride = frame.format.min_stride(i, frame.width);
+        if plane.stride == stride {
+            let len = stride * rows;
+            if plane.data.len() < len {
+                return None;
+            }
+            out.extend_from_slice(&plane.data[..len]);
+        } else {
+            if plane.stride == 0 || plane.data.len() < plane.stride * rows {
+                return None;
+            }
+            for row in 0..rows {
+                let at = row * plane.stride;
+                out.extend_from_slice(&plane.data[at..at + stride]);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Push 48 kHz frames to one track, interleaved with `channels` channels.
+/// A mono track keeps the first channel only (the microphone's own sample).
+fn push_track_samples(
+    track: &mut AudioTrack,
+    pts: f64,
+    frames: &[[f32; 2]],
+    channels: usize,
+) -> bool {
+    let mut bytes = Vec::with_capacity(frames.len() * 4 * channels);
     for f in frames {
         bytes.extend_from_slice(&f[0].to_le_bytes());
-        bytes.extend_from_slice(&f[1].to_le_bytes());
+        if channels > 1 {
+            bytes.extend_from_slice(&f[1].to_le_bytes());
+        }
     }
     let mut buffer = gst::Buffer::from_mut_slice(bytes);
     {
@@ -775,14 +1346,14 @@ pub fn video_encoder_candidates(codec: Codec) -> &'static [&'static str] {
 pub const AUDIO_ENCODER_CANDIDATES: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc", "faac"];
 
 /// Samples an AAC encoder holds back before it emits its first frame (its
-/// priming, the MDCT look-ahead). The frames it emits first decode to that many
-/// samples of pre-roll, which would push all audio this far behind the picture;
-/// the writer drops those frames and re-stamps the rest, so the file's audio
-/// starts at 0 like it does with AVFoundation's edit list upstream.
+/// priming, the MDCT look-ahead). The file keeps those frames and the finalise
+/// writes an edit list whose `media_time` is this many samples, so players
+/// start at the first real sample instead of 42.7 ms late (what AVFoundation
+/// does upstream).
 ///
 /// Measured for each element in dev/ELEMENTS.md's image (10 ms click at the
 /// start, decoded again and its onset read back): fdkaacenc 2048, avenc_aac
-/// 1024. `REC_AAC_PRIMING` overrides it (0 disables the trim).
+/// 1024. `REC_AAC_PRIMING` overrides it (0 disables the edit list).
 pub fn aac_priming(element: &str) -> u64 {
     match element {
         "fdkaacenc" => 2048,
@@ -791,9 +1362,6 @@ pub fn aac_priming(element: &str) -> u64 {
         _ => 1024,
     }
 }
-
-/// Samples in one AAC-LC frame, the unit the priming is emitted in.
-const AAC_FRAME: u64 = 1024;
 
 /// True when an element named `name` is installed.
 pub fn has_element(name: &str) -> bool {
@@ -807,6 +1375,25 @@ fn set(el: &gst::Element, name: &str, value: impl ToString) {
     if el.find_property(name).is_some() {
         el.set_property_from_str(name, &value.to_string());
     }
+}
+
+/// The audio tracks to write, in file order, per `--audio-tracks` and the
+/// sources the session has (upstream's rule).
+fn audio_plan(system: bool, mic: bool, layout: AudioLayout) -> Vec<(Target, u32, u64)> {
+    let both = system && mic;
+    let want_mix = both && layout != AudioLayout::Stems;
+    let want_stems = !both || layout != AudioLayout::Mix;
+    let mut plan = vec![];
+    if want_mix {
+        plan.push((Target::Mix, 2, 256_000));
+    }
+    if system && want_stems {
+        plan.push((Target::System, 2, 256_000));
+    }
+    if mic && want_stems {
+        plan.push((Target::Mic, 1, 192_000));
+    }
+    plan
 }
 
 /// Build the first installed encoder from `candidates` and set its properties.
@@ -893,6 +1480,9 @@ fn make_encoder(
             "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
                 el.set_property_from_str("rate-control", "cbr");
             }
+            // ffmpeg's ProRes encoder defaults to 422 HQ; upstream writes
+            // plain 422 ("standard"), and editors expect that.
+            "avenc_prores_ks" => set(&el, "profile", "standard"),
             _ => {}
         }
         if let Some(format) = probe_format
@@ -1020,7 +1610,6 @@ fn open_sink(
     system: bool,
     mic: bool,
     layout: AudioLayout,
-    volumes: [Volume; 2],
 ) -> Result<Sink> {
     let mp4 = matches!(
         path.extension().and_then(|e| e.to_str()),
@@ -1033,7 +1622,8 @@ fn open_sink(
     // The pixel layout handed to the encoder decides the H.264/HEVC profile:
     // x264enc with no constraint negotiates 4:4:4 and encodes "High 4:4:4
     // Predictive" instead of upstream's 4:2:0 High, and ProRes 422 needs 4:2:2
-    // 10-bit. An explicit capsfilter is what pins it.
+    // 10-bit. An explicit capsfilter is what pins it, and it carries the BT.709
+    // tags upstream writes (primaries, transfer, matrix, limited range).
     let enc_format = match spec.codec {
         Codec::H264 | Codec::Hevc => "I420",
         Codec::Prores => "I422_10LE",
@@ -1046,6 +1636,8 @@ fn open_sink(
         Some(enc_format),
     )?;
 
+    // The appsrc announces the source's own size (a display's native 1440p for
+    // a 1080p recording, the camera's size); the capsfilter pins the output.
     let video_caps = gst::Caps::builder("video/x-raw")
         .field("format", "BGRA")
         .field("width", spec.width as i32)
@@ -1060,7 +1652,20 @@ fn open_sink(
         .do_timestamp(false)
         .build();
     set(video_src.upcast_ref(), "max-buffers", 4);
+    set(video_src.upcast_ref(), "block", false);
     let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
+    let videoscale = gst::ElementFactory::make("videoscale").build()?;
+    set(&videoscale, "method", "lanczos");
+    let scale_caps = gst::ElementFactory::make("capsfilter").build()?;
+    scale_caps.set_property(
+        "caps",
+        gst::Caps::builder("video/x-raw")
+            .field("width", spec.width as i32)
+            .field("height", spec.height as i32)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build(),
+    );
+    let convert2 = gst::ElementFactory::make("videoconvert").build()?;
     let enc_capsfilter = gst::ElementFactory::make("capsfilter").build()?;
     enc_capsfilter.set_property(
         "caps",
@@ -1069,13 +1674,15 @@ fn open_sink(
             .field("width", spec.width as i32)
             .field("height", spec.height as i32)
             .field("framerate", gst::Fraction::new(spec.fps as i32, 1))
+            .field("colorimetry", "bt709")
             .build(),
     );
     let vqueue = gst::ElementFactory::make("queue").build()?;
-    // Bounded, and leaky downstream: a slow encoder loses old frames instead of
-    // stalling the capture thread.
+    // Bounded but not leaky: the writer retries a slot while the encoder is
+    // merely busy (upstream's `MAX_BACKLOG_SECS`) and drops only when it is
+    // more than half a second behind. A leaky queue here silently lost 20% of
+    // the frames in a non-fragmented muxer run.
     set(&vqueue, "max-size-buffers", 4);
-    set(&vqueue, "leaky", "downstream");
     // h264parse/h265parse turn whatever the encoder emits into the format the
     // muxer wants (avc/hvc1 with in-band parameter sets). ProRes is already
     // framed.
@@ -1091,8 +1698,10 @@ fn open_sink(
     }
     let mux = gst::ElementFactory::make(if mp4 { "mp4mux" } else { "qtmux" }).build()?;
     // Crash safety: a fragment every 2 s (one keyframe interval), so a crash
-    // leaves a playable file up to the last fragment. REC_FRAGMENT_SECS
-    // overrides it (0 = one regular movie) for comparison and debugging.
+    // leaves a playable file up to the last fragment. The fragments are turned
+    // into a regular movie at a normal stop (`media::mp4::finalize`).
+    // REC_FRAGMENT_SECS overrides it (0 = one regular movie) for comparison and
+    // debugging.
     let fragment: u64 = std::env::var("REC_FRAGMENT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1107,6 +1716,9 @@ fn open_sink(
     let mut chain: Vec<gst::Element> = vec![
         video_src.clone().upcast(),
         videoconvert,
+        videoscale,
+        scale_caps,
+        convert2,
         enc_capsfilter,
         venc,
     ];
@@ -1129,31 +1741,27 @@ fn open_sink(
     gst::Element::link(&mux, &filesink)?;
 
     // --- audio ------------------------------------------------------------
-    let both = system && mic;
-    let want_mix = both && layout != AudioLayout::Stems;
-    let want_stems = !both || layout != AudioLayout::Mix;
-    let mut kinds: Vec<AudioKind> = vec![];
-    if system && want_stems {
-        kinds.push(AudioKind::System);
-    }
-    if mic && want_stems {
-        kinds.push(AudioKind::Mic);
-    }
+    let plan = audio_plan(system, mic, layout);
     let mut tracks = vec![];
-    let mut audio_name = String::new();
-    if !kinds.is_empty() {
-        let audio_caps = gst::Caps::builder("audio/x-raw")
-            .field("format", "F32LE")
-            .field("layout", "interleaved")
-            .field("rate", mixer::RATE as i32)
-            .field("channels", 2i32)
-            .build();
-        for (n, kind) in kinds.iter().enumerate() {
+    let mut audio_names = vec![];
+    let mut priming = vec![];
+    if !plan.is_empty() {
+        for (n, (target, channels, bitrate)) in plan.iter().enumerate() {
+            let audio_caps = gst::Caps::builder("audio/x-raw")
+                .field("format", "F32LE")
+                .field("layout", "interleaved")
+                .field("rate", mixer::RATE as i32)
+                .field("channels", *channels as i32)
+                .build();
             // One encoder per track: a shared one would interleave the streams.
-            let (aenc, aname) = make_encoder(AUDIO_ENCODER_CANDIDATES, 256_000, None, "AAC", None)?;
-            audio_name = aname.clone();
+            let (aenc, aname) = make_encoder(AUDIO_ENCODER_CANDIDATES, *bitrate, None, "AAC", None)?;
+            audio_names.push(aname.clone());
+            let priming_override = std::env::var("REC_AAC_PRIMING")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            priming.push(priming_override.unwrap_or_else(|| aac_priming(&aname)));
             let src = gstreamer_app::AppSrc::builder()
-                .name(format!("audio-{}", kind.label()))
+                .name(format!("audio-{}", n))
                 .format(gst::Format::Time)
                 .caps(&audio_caps)
                 .is_live(false)
@@ -1178,65 +1786,28 @@ fn open_sink(
             let pad = mux
                 .request_pad_simple(&format!("audio_{n}"))
                 .with_context(|| format!("the muxer has no audio_{n} pad"))?;
-            let qsrc = q.static_pad("src").context("audio queue src pad")?;
-            qsrc.link(&pad)?;
-            // Drop the encoder's priming frames and move the rest back by the
-            // time they covered, so the track starts at 0 in sync with video.
-            let priming = std::env::var("REC_AAC_PRIMING")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or_else(|| aac_priming(&aname));
-            let drop = priming.div_ceil(AAC_FRAME);
-            // A pad probe is a Fn, so its state lives in atomics.
-            let seen = AtomicU64::new(0);
-            let shift = AtomicU64::new(u64::MAX); // unset
-            qsrc.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-                if seen.load(Ordering::Relaxed) < drop {
-                    seen.fetch_add(1, Ordering::Relaxed);
-                    return gst::PadProbeReturn::Drop;
-                }
-                if let Some(buf) = info.buffer_mut() {
-                    let pts = buf.pts().map(|p| p.nseconds()).unwrap_or(0);
-                    // The first kept frame's PTS is the priming exactly.
-                    let s = match shift.compare_exchange(
-                        u64::MAX,
-                        pts,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => pts,
-                        Err(v) => v,
-                    };
-                    if let Some(b) = buf.get_mut() {
-                        b.set_pts(gst::ClockTime::from_nseconds(pts.saturating_sub(s)));
-                        if let Some(dts) = b.dts() {
-                            b.set_dts(gst::ClockTime::from_nseconds(
-                                dts.nseconds().saturating_sub(s),
-                            ));
-                        }
-                    }
-                    seen.fetch_add(1, Ordering::Relaxed);
-                }
-                gst::PadProbeReturn::Ok
-            });
+            q.static_pad("src").context("audio queue src pad")?.link(&pad)?;
             tracks.push(AudioTrack {
-                kind: *kind,
+                target: *target,
                 appsrc: src,
-                source_rate: None,
-                resampler: None,
+                channels: *channels as u8,
                 next: None,
-                fader: Fader::new(volumes[kind.index()].gain()),
-                meter_gain: volumes[kind.index()].fader_gain(),
             });
         }
     }
-    if want_mix && !want_stems {
-        bail!("the system+mic mix track is not implemented yet (phase 1C)");
-    }
+    // The default track is the mix when it is there; with stems only, every
+    // track stays enabled.
+    let has_mix = plan.iter().any(|(t, _, _)| *t == Target::Mix);
+    let grouping = has_mix && plan.len() > 1;
+    let mp4_layout = mp4::Layout {
+        audio_alternate_group: grouping.then_some(1),
+        default_audio: grouping.then_some(0),
+        audio_priming: priming,
+    };
     let encoder = if tracks.is_empty() {
         vename
     } else {
-        format!("{vename} + {audio_name}")
+        format!("{vename} + {}", audio_names.join(", "))
     };
     let bus = pipeline.bus().context("pipeline bus")?;
     pipeline.set_state(gst::State::Paused)?;
@@ -1247,6 +1818,7 @@ fn open_sink(
         tracks,
         path: path.to_path_buf(),
         encoder,
+        layout: mp4_layout,
     })
 }
 
@@ -1257,26 +1829,26 @@ mod tests {
     #[test]
     fn queue_cap_never_shows_future_frames() {
         // Overflowing the frame queue while emission runs behind must never
-        // make a frame from the future the current one (shown early). The
-        // queue cap works on indices here, so the test needs no video buffers.
-        fn cap_index(q: &mut VecDeque<(f64, i32)>, last: &mut Option<i32>, max: usize, due: f64) {
-            while q.len() > max {
-                let (pts, frame) = q.pop_front().unwrap();
-                if pts <= due || last.is_none() {
-                    *last = Some(frame);
-                }
-            }
-        }
-        let mut q: VecDeque<(f64, i32)> = Default::default();
-        let mut last: Option<i32> = None;
+        // make a frame from the future the current one (shown early).
+        let mut q: VecDeque<(f64, Arc<VideoFrame>)> = Default::default();
+        let mut last: Option<Arc<VideoFrame>> = None;
+        let frame = |i: i32| {
+            Arc::new(VideoFrame::packed(
+                i as f64,
+                4,
+                2,
+                PixelFormat::Bgra,
+                vec![i as u8; 32],
+            ))
+        };
         for i in 0..12 {
-            q.push_back((i as f64, i));
+            q.push_back((i as f64, frame(i)));
             // Emission is at frame 2: nothing newer than 2.5 may become current.
-            cap_index(&mut q, &mut last, 4, 2.5);
+            Writer::cap(&mut q, &mut last, 4, 2.5);
         }
         assert_eq!(
-            last,
-            Some(2),
+            last.as_ref().unwrap().pts,
+            2.0,
             "current frame stays due, later ones are skipped"
         );
         assert_eq!(q.len(), 4);
@@ -1306,5 +1878,242 @@ mod tests {
         assert!(video_encoder_candidates(Codec::Hevc).contains(&"x265enc"));
         assert_eq!(video_encoder_candidates(Codec::Prores), ["avenc_prores_ks"]);
         assert_eq!(AUDIO_ENCODER_CANDIDATES[0], "fdkaacenc");
+    }
+
+    #[test]
+    fn audio_plan_matches_upstreams_track_layout() {
+        // Both sources, both layouts: mix first, then system, then mic.
+        let both = audio_plan(true, true, AudioLayout::Both);
+        assert_eq!(
+            both,
+            vec![
+                (Target::Mix, 2, 256_000),
+                (Target::System, 2, 256_000),
+                (Target::Mic, 1, 192_000)
+            ]
+        );
+        // Mix only.
+        assert_eq!(audio_plan(true, true, AudioLayout::Mix), vec![(Target::Mix, 2, 256_000)]);
+        // Stems only: no group, both enabled.
+        assert_eq!(
+            audio_plan(true, true, AudioLayout::Stems),
+            vec![(Target::System, 2, 256_000), (Target::Mic, 1, 192_000)]
+        );
+        // One source: that source's stem alone, whatever the layout says.
+        assert_eq!(audio_plan(true, false, AudioLayout::Both), vec![(Target::System, 2, 256_000)]);
+        assert_eq!(audio_plan(false, true, AudioLayout::Mix), vec![(Target::Mic, 1, 192_000)]);
+        assert!(audio_plan(false, false, AudioLayout::Both).is_empty());
+    }
+
+    #[test]
+    fn fader_gain_is_applied_without_clipping() {
+        // 0 dB is a pass-through: the fader returns no envelope, so the stem
+        // keeps the device's samples byte for byte.
+        let mut fader = Fader::new(1.0);
+        assert_eq!(fader.envelope(480, mixer::RATE), None);
+        // +6 dB multiplies without a clamp (upstream's float path); the mix
+        // limiter is what keeps the mix under −1 dBFS, not the fader.
+        let mut fader = Fader::new(1.0);
+        fader.set(10f32.powf(6.0 / 20.0));
+        // The ramp is 20 ms = 960 frames at 48 kHz.
+        let env = fader.envelope(960, mixer::RATE).unwrap();
+        let mut frames = vec![[0.6f32, -0.6f32]; 960];
+        apply_gain(&mut frames, &env);
+        assert!(
+            (frames[959][0] - 0.6 * 10f32.powf(0.3)).abs() < 1e-3,
+            "{}",
+            frames[959][0]
+        );
+        assert!((frames[959][1] + 0.6 * 10f32.powf(0.3)).abs() < 1e-3);
+        // At unity the samples are untouched, bit for bit.
+        let mut frames = vec![[0.123_456_79f32, -0.5f32]; 16];
+        apply_gain(&mut frames, &[1.0; 16]);
+        assert_eq!(frames[0], [0.123_456_79, -0.5]);
+    }
+
+    #[test]
+    fn a_muted_source_is_silent_but_still_metered() {
+        let v = Volume {
+            db: -6.0,
+            muted: true,
+        };
+        assert_eq!(v.gain(), 0.0);
+        assert!((v.fader_gain() - 0.501_187).abs() < 1e-5, "meters read before mute");
+    }
+
+    #[test]
+    fn camera_latency_widens_the_lag_and_decays() {
+        let mut w = test_writer();
+        assert_eq!(w.lag(), LAG_SECS, "no measured latency: the minimum");
+        // A webcam 90 ms behind: emission waits for it plus the margin.
+        w.note_latency(1, 0.09, 0.0);
+        assert!((w.lag() - 0.115).abs() < 1e-9, "{}", w.lag());
+        // A minute later the peak has decayed away.
+        w.note_latency(1, 0.0, 60.0);
+        assert_eq!(w.lag(), LAG_SECS);
+        // It never waits longer than MAX_LAG_SECS, even for a stalled device.
+        w.note_latency(0, 5.0, 61.0);
+        assert_eq!(w.lag(), MAX_LAG_SECS);
+    }
+
+    #[test]
+    fn the_camera_gate_holds_the_start_until_the_camera_settles() {
+        let mut w = test_writer();
+        // A cold camera settling for 2 s, giving up 3 s after that.
+        w.cam_gate = Some(CamGate {
+            settle: 2.0,
+            pending: None,
+            ready_at: None,
+            give_up: 10.0,
+        });
+        // Screen frames before the camera arrives are held (the newest wins).
+        w.push_video(frame(1.0));
+        w.push_video(frame(1.1));
+        assert!(!w.started(), "the file has not started yet");
+        assert!(w.cam_gate.is_some());
+        // The first camera frame sets the ready time; frames before it do not
+        // start the file.
+        w.push_cam(frame(1.2));
+        w.push_video(frame(1.3));
+        assert!(!w.started(), "the camera is still settling");
+        // A camera frame at the settle time starts the file at that instant.
+        w.push_cam(frame(3.2));
+        assert!(w.started());
+        let t0 = w.t0.unwrap();
+        assert!((t0 - 3.2).abs() < 1e-9, "{t0}");
+        assert!(w.cam_gate.is_none());
+    }
+
+    #[test]
+    fn the_camera_gate_gives_up_on_a_camera_that_never_delivers() {
+        let mut w = test_writer();
+        w.cam_gate = Some(CamGate {
+            settle: 2.0,
+            pending: None,
+            ready_at: None,
+            give_up: 5.0,
+        });
+        w.push_video(frame(1.0));
+        assert!(!w.started());
+        // A screen frame after the deadline starts the file without a camera.
+        w.push_video(frame(5.5));
+        assert!(w.started());
+        assert!(w.cam_gate.is_none());
+    }
+
+    #[test]
+    fn scenes_that_need_the_overlay_report_when_they_cannot_be_drawn() {
+        let mut w = test_writer();
+        // Screen always works; without a compositor or a camera, neither
+        // camera scene can be shown.
+        assert!(w.set_scene(Scene::Screen));
+        assert!(!w.set_scene(Scene::Cam));
+        assert!(!w.set_scene(Scene::ScreenCam));
+        // Once camera frames arrive, the full-frame camera scene works on the
+        // CPU path (the overlay still needs the compositor).
+        w.push_cam(frame(1.0));
+        assert!(w.set_scene(Scene::Cam));
+        assert_eq!(w.scene, Scene::Cam);
+        assert!((w.cam_aspect().unwrap() - 2.0).abs() < 1e-9, "4x2 frame");
+        assert!(!w.set_scene(Scene::ScreenCam));
+        assert_eq!(w.scene, Scene::Cam);
+    }
+
+    #[test]
+    fn a_camera_only_scene_emits_camera_frames() {
+        let mut w = test_writer();
+        w.set_camera_expected(true);
+        assert!(w.set_scene(Scene::Cam));
+        w.push_cam(frame(1.0));
+        assert!(w.started(), "the camera frame started the clock");
+        w.emit_until(1.0);
+        // No sink (preview-only), so emission counts slots: the run works and
+        // the camera frame became the current one.
+        assert!(w.cam_last.is_some());
+        assert_eq!(w.stats.video_frames_out, 1);
+    }
+
+    #[test]
+    fn pauses_keep_audio_cut_at_sample_boundaries() {
+        // The writer's audio cut uses the pause timeline; a buffer straddling
+        // a pause keeps only the part outside it (a unit-level check of the
+        // maths `push_audio` uses, with a 60 fps grid).
+        let mut p = Pauses::default();
+        p.pause(60);
+        p.resume(120);
+        // A buffer spanning slots 59.5..60.5 keeps the part before the pause.
+        let (a, b) = (59.5, 60.5);
+        let (x, y, _) = p.keep(a, b).unwrap();
+        assert_eq!((x, y), (59.5, 60.0));
+    }
+
+    #[test]
+    fn tight_bytes_pads_and_truncates_strides() {
+        // A BGRA frame whose rows carry padding: the encoder gets tight rows.
+        let padded = VideoFrame {
+            pts: 0.0,
+            width: 4,
+            height: 2,
+            format: PixelFormat::Bgra,
+            planes: vec![crate::media_types::Plane::new(
+                (0..24u8).collect::<Vec<u8>>(),
+                12, // 4 pixels = 16 bytes used, 12 stride is too small
+            )],
+        };
+        // A too-small stride is not "well formed", but the writer must reject
+        // it rather than read out of bounds.
+        assert!(!padded.is_well_formed());
+        let padded = VideoFrame {
+            pts: 0.0,
+            width: 4,
+            height: 2,
+            format: PixelFormat::Bgra,
+            planes: vec![crate::media_types::Plane::new(
+                (0..32u8).collect::<Vec<u8>>(),
+                16,
+            )],
+        };
+        assert_eq!(tight_bytes(&padded).unwrap(), (0..32u8).collect::<Vec<u8>>());
+        // I420: three planes, concatenated.
+        let i420 = VideoFrame {
+            pts: 0.0,
+            width: 4,
+            height: 4,
+            format: PixelFormat::I420,
+            planes: vec![
+                crate::media_types::Plane::new(vec![1u8; 16], 4),
+                crate::media_types::Plane::new(vec![2u8; 4], 2),
+                crate::media_types::Plane::new(vec![3u8; 4], 2),
+            ],
+        };
+        let bytes = tight_bytes(&i420).unwrap();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[..16], &[1u8; 16]);
+        assert_eq!(&bytes[16..20], &[2u8; 4]);
+        assert_eq!(&bytes[20..], &[3u8; 4]);
+    }
+
+    fn frame(pts: f64) -> VideoFrame {
+        VideoFrame::packed(pts, 4, 2, PixelFormat::Bgra, vec![0; 32])
+    }
+
+    fn test_writer() -> Writer {
+        Writer::new(
+            None,
+            &VideoSpec {
+                width: 320,
+                height: 180,
+                fps: 60,
+                codec: Codec::H264,
+                bitrate: 1_000_000,
+            },
+            true,
+            true,
+            AudioLayout::Both,
+            [Volume::UNITY; 2],
+            Scene::Screen,
+            PipSpec::default(),
+        )
+        .unwrap()
     }
 }
