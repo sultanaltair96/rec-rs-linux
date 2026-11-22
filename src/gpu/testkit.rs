@@ -210,6 +210,35 @@ pub fn solid_nv12(w: usize, h: usize, rgb: [u8; 3]) -> VideoFrame {
     }
 }
 
+/// The same colour as RGBA, for the unpacked upload path.
+pub fn solid_rgba(w: usize, h: usize, rgb: [u8; 3]) -> VideoFrame {
+    let mut px = vec![0u8; w * h * 4];
+    for p in px.chunks_exact_mut(4) {
+        p[0] = rgb[0];
+        p[1] = rgb[1];
+        p[2] = rgb[2];
+        p[3] = 255;
+    }
+    VideoFrame::packed(0.0, w, h, PixelFormat::Rgba, px)
+}
+
+/// The same colour as I420, BT.709 limited range.
+pub fn solid_i420(w: usize, h: usize, rgb: [u8; 3]) -> VideoFrame {
+    let (y, u, v) = super::yuv::rgb_to_yuv709_limited(rgb);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    VideoFrame {
+        pts: 0.0,
+        width: w,
+        height: h,
+        format: PixelFormat::I420,
+        planes: vec![
+            crate::media_types::Plane::new(vec![y; w * h], w),
+            crate::media_types::Plane::new(vec![u; cw * ch], cw),
+            crate::media_types::Plane::new(vec![v; cw * ch], cw),
+        ],
+    }
+}
+
 /// A rendered frame, as RGB, for looking at pixels.
 pub struct Image {
     pub width: usize,
@@ -258,9 +287,11 @@ impl Image {
         (max, sum / (self.rgb.len() * 3) as f64)
     }
 
-    /// Every pixel within `tol` of another image.
+    /// Every pixel within `tol` of another image, reporting the margin so the
+    /// numbers show up with `--nocapture`.
     pub fn assert_close(&self, other: &Image, tol: u8, what: &str) {
         let (max, mean) = self.diff(other);
+        println!("{what}: worst channel {max}/{tol}, mean {mean:.4}");
         assert!(
             max <= tol,
             "{what}: worst channel differs by {max} (allowed {tol}, mean {mean:.3})"

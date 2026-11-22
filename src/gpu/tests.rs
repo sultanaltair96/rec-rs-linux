@@ -545,6 +545,85 @@ fn a_small_screen_is_not_upscaled() {
     assert_eq!(img.at(32, 0), [0, 0, 0], "black bar on top");
 }
 
+/// Every input pixel format the contract allows goes through the same
+/// pipeline and comes out as the colour it went in as.
+#[test]
+fn every_input_format_is_uploaded_correctly() {
+    // A saturated colour and a mid grey, so a swapped channel or a wrong matrix
+    // shows up.
+    for rgb in [[255, 0, 0], [0, 200, 255], [128, 128, 128]] {
+        let Some(mut r) = renderer(32, 18, PipSpec::default(), Scene::Screen) else {
+            return;
+        };
+        let bgra = Image::bgra(
+            &r.render_now(Some(&solid(32, 18, rgb)), None, 0.0)
+                .expect("render"),
+        );
+        for (name, frame) in [
+            ("rgba", testkit::solid_rgba(32, 18, rgb)),
+            ("nv12", testkit::solid_nv12(32, 18, rgb)),
+            ("i420", testkit::solid_i420(32, 18, rgb)),
+        ] {
+            let got = Image::bgra(&r.render_now(Some(&frame), None, 0.0).expect("render"));
+            let (a, b) = (got.at(16, 9), bgra.at(16, 9));
+            for c in 0..3 {
+                // The YUV paths round through BT.709 and back: allow 3 codes.
+                assert!(
+                    a[c].abs_diff(b[c]) <= 3,
+                    "{name} {rgb:?}: {a:?} vs BGRA {b:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A camera frame in NV12 goes through the same upload path as a packed one.
+#[test]
+fn a_yuv_camera_is_uploaded_correctly() {
+    let pip = PipSpec {
+        shape: Shape::Square,
+        roundness: 0.0,
+        place: Place::At([0.5, 0.5]),
+        ..Default::default()
+    };
+    let Some(mut r) = renderer(320, 180, pip.clone(), Scene::ScreenCam) else {
+        return;
+    };
+    let black = solid(320, 180, [0, 0, 0]);
+    let cam = testkit::solid_nv12(160, 120, [0, 255, 0]);
+    let out = r.render_now(Some(&black), Some(&cam), 0.0).expect("render");
+    let img = Image::bgra(&out);
+    let [x, y, ow, oh] = overlay(&pip, 320, 180, r.cam_aspect());
+    let (x, y) = ((x + ow / 2.0) as usize, (y + oh / 2.0) as usize);
+    let [r_, g, b] = img.at(x, y);
+    assert!(
+        g > 250 && r_ < 6 && b < 6,
+        "NV12 green camera: {r_},{g},{b}"
+    );
+}
+
+/// A window resized mid-recording is re-fitted, not stretched.
+#[test]
+fn a_screen_that_changes_size_is_refitted() {
+    let Some(mut r) = renderer(64, 40, PipSpec::default(), Scene::Screen) else {
+        return;
+    };
+    let first = screen(64, 40);
+    let out = r.render_now(Some(&first), None, 0.0).expect("render");
+    assert_eq!(Image::bgra(&out).at(5, 5), Image::bgra(&first).at(5, 5));
+    // A 32x18 window into the same output: fitted, centred, bilinear-free (1:1).
+    let second = screen(32, 18);
+    let out = r.render_now(Some(&second), None, 0.033).expect("render");
+    let img = Image::bgra(&out);
+    let want = Image::bgra(&second);
+    assert_eq!(
+        img.at(16 + 5, 11 + 5),
+        want.at(5, 5),
+        "the new size lands centred"
+    );
+    assert_eq!(img.at(0, 0), [0, 0, 0], "with black around it");
+}
+
 /// An NV12 screen frame goes through the same pipeline as a BGRA one.
 #[test]
 fn yuv_screen_input_is_converted_before_scaling() {
@@ -739,6 +818,55 @@ fn the_readback_is_pipelined() {
     };
     let got = sync.render(Some(&frame), None, 7.0).expect("render");
     assert_eq!(got.map(|f| f.pts), Some(7.0));
+}
+
+/// The default constructor is the writer's: NV12 output at the size asked for,
+/// with the depth-2 pipeline.
+#[test]
+fn the_default_construction_is_the_writers() {
+    let _ = testkit::gpu();
+    let Some(r) = testkit::build(&Options::default()) else {
+        return;
+    };
+    assert_eq!(r.size(), (1920, 1080));
+    assert_eq!(r.output(), OutputFormat::Nv12);
+    assert_eq!(r.scene(), Scene::ScreenCam);
+    assert_eq!(r.options().pipeline_depth, 2);
+    assert_eq!(r.texture_format(), wgpu::TextureFormat::Bgra8Unorm);
+
+    // `Renderer::new` keeps the seam's signature and the same defaults.
+    let info = r.adapter_info().clone();
+    let (device, queue) = (r.device().clone(), r.queue().clone());
+    drop(r);
+    let Some(pip) = Some(PipSpec::default()) else {
+        return;
+    };
+    let r = Renderer::with_device(
+        device,
+        queue,
+        info,
+        &Options {
+            pip,
+            ..Default::default()
+        },
+    )
+    .expect("a renderer on the shared device");
+    assert_eq!(r.output(), OutputFormat::Nv12);
+}
+
+/// The preview gets the composited frame as a texture at the output size.
+#[test]
+fn the_composited_frame_is_exposed_for_the_preview() {
+    let Some(mut r) = renderer(64, 36, PipSpec::default(), Scene::Screen) else {
+        return;
+    };
+    assert!(r.texture().is_none(), "nothing rendered yet");
+    let frame = solid(64, 36, [1, 2, 3]);
+    let _ = r.render_now(Some(&frame), None, 0.0).expect("render");
+    let texture = r.texture().expect("the composited frame");
+    assert_eq!(texture.format(), wgpu::TextureFormat::Bgra8Unorm);
+    assert_eq!(texture.width(), 64);
+    assert_eq!(texture.height(), 36);
 }
 
 /// The compositor can move to the writer thread: the writer owns it there.
