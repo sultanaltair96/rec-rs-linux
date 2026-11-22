@@ -55,12 +55,12 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Live preview of what will be recorded | Rendered at preview size, composited | Same preview from the composited frames | 1E (with 1C) | todo | — |
 | Own windows excluded from capture | ScreenCaptureKit filter | Portal picks the window; own windows are excluded the same way | 1A | todo | — |
 | Preview low-power mode (half res, 15 fps) | Setting | Same setting, honoured by the preview | 1E | todo | — |
-| Scene: Screen | Full display or window | Same | 1A | todo | geometry: unit `compose::tests::fit_letterboxes_and_cover_crops` |
-| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, wgpu rendering | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::snapping`, `corners_and_free_positions`, `corner_placement_survives_resize` |
-| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU, drawn by wgpu | 0 (masks), 1C (GPU) | partial | unit `shape_coverage`, `pill_has_round_ends`, `border_inset_mask`, `shadow_spreads_beyond_the_shape`, `border_scales_with_the_output_height` |
-| Overlay changes live while recording, baked in, no extra encode | Yes | Yes: the compositor runs before the encoder | 1C | todo | — |
-| Scene: Camera full frame | AVCapture | V4L2 | 1B (source), 1C (composite) | todo | — |
-| Switch scenes live if recording started with the camera | Yes | Same rule | 1C/1E | todo | — |
+| Scene: Screen | Full display or window | Same, scaled to the output with Lanczos | 1C (composite), 1A (capture) | partial | unit `gpu::tests::a_screen_at_the_output_size_is_bit_exact`, `a_small_screen_is_not_upscaled`, `lanczos_matches_a_cpu_reference`; golden `screen`, `screen-4k-to-1080` |
+| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, drawn by wgpu | 0 (geometry), 1C (GPU) | done | unit `compose::tests::snapping`, `corners_and_free_positions`; `gpu::tests::renders_overlay_with_border_into_the_frame`, `placement_follows_the_geometry_for_corners_and_free_positions`, `mirroring_flips_the_camera`; goldens `screen-cam-rounded`, `screen-cam-pill` |
+| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU (u8 coverage), drawn by wgpu with the same blending order | 0 (masks), 1C (GPU) | done | unit `compose::tests::shape_coverage`, `pill_has_round_ends`, `shadow_spreads_beyond_the_shape`; `gpu::tests::every_shape_matches_the_mask_geometry`, `the_border_has_the_width_and_colour_of_the_spec`, `the_drop_shadow_falls_off_outside_the_overlay`, `mirroring_flips_the_camera`; goldens `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-squircle-shadow` |
+| Overlay changes live while recording, baked in, no extra encode | Yes | Yes: the compositor runs before the encoder, and the mask/border/shadow texture is cached per size and style so moving it only changes a transform | 1C | done | unit `gpu::tests::renders_overlay_with_border_into_the_frame` (moves it between frames), `gpu::decor::tests::the_key_ignores_the_position_but_not_the_style` |
+| Scene: Camera full frame | AVCapture | V4L2 into a cover-fitted, mirrored full frame | 1B (source), 1C (composite) | partial | unit `gpu::tests::the_camera_scene_covers_the_frame`, `mirroring_flips_the_camera`; golden `cam` |
+| Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app/CLI rule is 1E/1G | 1C/1E | partial | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame` |
 | Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2, PipeWire audio | 1A/1B | todo | — |
 | Record/Stop button and timer | Yes | App | 1E | todo | — |
 | Pause/Resume button | Yes | App (the session API exists) | 1E | todo | session API: selftest `pause-resume` |
@@ -95,7 +95,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
 | Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer: x264enc (H.264 High), x265enc (HEVC Main), `avenc_prores_ks` (ProRes 422); VA-API on a GPU host | 0 (software), 1C (hardware) | done | selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`, `h264-bitrate`; `ffprobe` reports h264/High and hevc/Main |
-| BT.709 tagging | Yes | `videoconvert` + encoder default (BT.709 for HD) | 1C (explicit tags) | todo | — |
+| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240, chroma averaged over each 2x2 block); the encoder declares the tags | 1C (conversion), 1G (caps) | partial | unit `gpu::tests::the_output_is_bt709_limited_range` (white 235, black 16, red 63/102/240); `gpu::yuv::tests::known_bars`, cross-checked against ffmpeg's swscale |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |
 | Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | Planned: AAC-LC 48 k stereo 256 kb/s | 1C | todo | — |
@@ -109,7 +109,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Webcam lag adaptation (emission waits for the slowest source) | Yes | Constant 50 ms lag in phase 0; adapts when the camera lands | 0 (lag), 1B (camera) | partial | writer `lag()`; frames on the grid (selftest) |
 | Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments | `mp4mux`/`qtmux` `fragment-duration=2000`; SIGKILL leaves a playable file | 0 | done | crash test: SIGKILL at 4.5 s → 4.0 s file that `ffmpeg -f null` decodes |
 | Edge to edge: frame has the source's aspect, no bars, never cropped | Yes | Same `fill`/`same_aspect` maths | 0 | done | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` |
-| Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a GPU clamp filter | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`) |
+| Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a clamp in the upload shader, compositing the window over the clamped edge | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`), `gpu::tests::the_corner_fill_replaces_transparent_window_corners` |
 | Camera settles 2 s before the file starts | Yes | Same 2 s gate | 1B | todo | — |
 | Audio quality: 48 kHz capture, windowed-sinc resampler continuous across buffers | Yes | Same resampler maths (ported) | 0 | done | unit `mixer::tests::resamples_seamlessly`, `resampler_removes_content_above_nyquist`, `small_jitter_snaps_to_continuous` |
 | Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter | 0 (maths), 1C (mix track) | partial | unit `mixer::tests::limiting` |
@@ -131,7 +131,7 @@ version that does it).
 | One shared live encode for replay + every stream | VideoToolbox/AudioConverter | GStreamer encode to appsink, fanned out | 1D | todo | — |
 | H.264 High / HEVC Main10, no B-frames, 2 s keyframes, CBR or ABR | Yes | Same via the live encoder | 1D | todo | preset maths: unit `live::tests::platform_presets` |
 | Enhanced RTMP HEVC (`hvc1`), fallback to H.264 | Yes | Same negotiation | 1D | todo | — |
-| Live size scaled from the recording size | Lanczos | wgpu Lanczos | 1C/1D | todo | — |
+| Live size scaled from the recording size | Lanczos | wgpu Lanczos, shared with the recording | 1C/1D | partial | scaler done: unit `gpu::tests::lanczos_matches_a_cpu_reference`; the live encode that will reuse it is 1D |
 | Replay buffer trims a GOP at a time, re-encodes audio, syncs in QuickTime and ffmpeg | Yes | Same on the packet buffer | 1D | todo | — |
 | RTMP/RTMPS client with TLS, drop a GOP when behind, reconnect with backoff | Built-in, Security.framework | Built-in port with rustls | 1D | todo | — |
 | WHIP (str0m, ICE/DTLS/SRTP, H.264+Opus, DELETE on stop, 5 s silence → reconnect) | Yes | str0m with a Linux crypto backend | 1D | todo | — |
@@ -147,11 +147,11 @@ version that does it).
 | Window capture | Yes | Portal window + X11 fallback | 1A | todo | — |
 | Region / crop | `--region` | `--region` | 1A | todo | parses today |
 | Application capture | No (known gap) | No | — | n-a | matches upstream |
-| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes | 1C/1E | todo | scene model: unit `tests::scene_option` |
+| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes, composited on the GPU | 1C/1E | partial | scene model: unit `tests::scene_option`; rendering: `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; goldens `screen`, `screen-cam-*`, `cam` |
 | Multiple displays/sources at once | No | No | — | n-a | matches upstream |
 | System audio | Yes | PipeWire sink monitor | 1B | todo | — |
 | Microphone | Yes | PipeWire capture | 1B | todo | — |
-| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | todo | geometry done: unit `compose::tests::corners_and_free_positions` |
+| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow` |
 | Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
 | Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | partial | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
@@ -163,7 +163,7 @@ version that does it).
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes (CLI done; app 1E) | 0 | done | selftest `pause-resume` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
-| Screen scaling: GPU Lanczos | Metal MPS | wgpu compute Lanczos | 1C | todo | — |
+| Screen scaling: GPU Lanczos | Metal MPS | wgpu Lanczos (a = 3), separable, per plane in the encoded domain, edge clamp, never upscaling | 1C | done | unit `gpu::tests::lanczos_matches_a_cpu_reference` (≤2/255 against an independent CPU implementation), `a_small_screen_is_not_upscaled`; golden `screen-4k-to-1080`; measured 48 ms/frame 4K→1080p on lavapipe (`tests/golden/README.md`) |
 | Live preview | Yes | wgpu preview | 1E | todo | — |
 | Level meters with peak hold, after the fader | Yes | Same | 1E | todo | unit `mixer::tests::volume_gain` (meter gain) |
 | Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | todo | — |
@@ -176,14 +176,14 @@ version that does it).
 
 | Gap | Upstream | Linux | Phase | Status |
 |---|---|---|---|---|
-| Scenes are three fixed ones, no layout editor, no transitions, live switch needs a camera start | Yes | Same | 1C/1E | todo |
+| Scenes are three fixed ones, no layout editor, no transitions, live switch needs a camera start | Yes | Same | 1C/1E | partial |
 | No application capture or multi-display capture | Yes | Same | — | n-a |
 | Region capture is CLI-only | Yes | Same (the app may add it later) | 1E | todo |
 | No audio filters, hotkeys not configurable | Yes | Same | — | n-a |
 | Streaming: no SRT/multitrack, same encode for all, live ≤ recording size, changing settings needs a restart | Yes | Same limitations (parity, not a gap to fix) | 1D | todo |
 | HEVC to YouTube tested only against a local server | Yes | Same testing honestly reported | 1D | todo |
 | 8-bit SDR only | Yes | Same | — | n-a |
-| Webcam overlay burned into the video | Yes | Same | 1C | todo |
+| Webcam overlay burned into the video | Yes | Same: the compositor runs before the encoder | 1C | partial | the compositor is done and pixel-tested; the writer calls it (1G) |
 | Output latency read once at start | Yes | Same | 1B | todo |
 | Mix track resamples a non-48 kHz mic linearly per buffer upstream | Yes | Linux: the mix uses the same windowed-sinc resampler as everything else (better) | 1C | todo |
 | Re-confirmation prompt for screen recording | macOS-only | n-a: the portal's restore token avoids it | — | n-a |
