@@ -21,6 +21,15 @@ serde_json = "1"
 libc = "0.2"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
+gstreamer-video = "0.24"
+# Live outputs (phase 1D): RTMPS through rustls (ring provider, so no cmake or
+# aws-lc build tools are needed), WHIP through str0m with its pure-Rust crypto
+# backend plus ureq's rustls client, and stream keys in the Secret Service.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
+ureq = "3"
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [profile.release]
 debug = 1
