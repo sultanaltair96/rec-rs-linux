@@ -53,10 +53,10 @@ pub fn caps() -> Caps {
 pub fn phase_note(feature: &str) -> String {
     match feature {
         "camera" => "camera capture is not implemented yet (phase 1B)".into(),
-        "pip" | "scene" => format!(
-            "the camera overlay and live scene switching need the compositor (phase {})",
-            crate::gpu::PHASE
-        ),
+        // Spelled out so a rename in `gpu` cannot break the app's hints.
+        "pip" | "scene" => {
+            "the camera overlay and live scene switching need the compositor (phase 1C)".into()
+        }
         "replay" | "stream" | "keys" => format!(
             "replay and streaming are not implemented yet (phase {})",
             live::PHASE
