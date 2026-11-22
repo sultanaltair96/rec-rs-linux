@@ -113,6 +113,20 @@ impl Live {
         bail!("the live encode is not implemented yet (phase {PHASE})")
     }
 
+    /// The writer's video tap: called after every emitted constant-frame-rate
+    /// frame with the composited output frame (host-clock pts), also while a
+    /// recording is paused and with `--no-record`. Must not block. Agreed API
+    /// between the writer (1G) and the live encode (1D); a no-op until 1D.
+    pub fn push_video(&self, frame: &crate::media_types::VideoFrame) {
+        let _ = frame;
+    }
+
+    /// The writer's audio tap: the post-fader mix, 48 kHz stereo, host-clock
+    /// pts. Same rules as [`push_video`](Live::push_video).
+    pub fn push_audio(&self, chunk: &crate::media_types::AudioChunk) {
+        let _ = chunk;
+    }
+
     /// Write the replay buffer to `path` (phase 1D).
     pub fn save_replay(&self, path: std::path::PathBuf) -> Result<()> {
         let _ = path;

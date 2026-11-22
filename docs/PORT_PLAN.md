@@ -54,10 +54,11 @@ The build host has no Rust toolchain or system dev libraries, but Docker works. 
 | 0 Foundation | Submodule, dev container, Cargo project, contract types, full CLI surface, settings, pause timeline, mixer, overlay geometry, test-pattern source, minimal GStreamer writer, ported unit tests, Linux self-test and sync/level scripts, CI, AGENTS.md, PARITY.md | everything (single writer) |
 | 1A Screen capture | portal + PipeWire display/window/region capture, cursor and clicks, restore token, devices listing | `src/capture/screen/**` |
 | 1B Audio + camera | PipeWire mic and system audio, device listing, latency, offsets; V4L2/portal camera, settle | `src/capture/audio/**`, `src/capture/camera/**` |
-| 1C GPU + writer | wgpu compositor and scaler, scenes and overlay, full writer (HW/SW encoders, ProRes, track layout, fragments, CFR grid, pause), probe | `src/gpu/**`, `src/media/**` |
+| 1C GPU | wgpu compositor and scaler, scenes and overlay, window corner fill | `src/gpu/**`, `src/compose.rs`, `tests/golden/**` |
+| 1G Writer | full writer (HW/SW encoders, ProRes, track layout, alternate groups, edit list, fragments, CFR grid, pause, camera timing), probe, camera/renderer/live-tap wiring in `record.rs` | `src/media/**`, delimited parts of `src/record.rs` |
 | 1D Live | live encode, replay buffer, RTMP/RTMPS, WHIP, keyring, stream-key, multi-destination, reconnect | `src/live/**` |
 | 1E App | egui main + settings windows, preview, mixer widgets, tray, hotkeys, control, single instance | `src/app/**`, `src/hotkey.rs` |
-| 1F Packaging | Flatpak manifest, AppImage build, desktop file, metainfo, icons, release workflow | `packaging/**`, `.github/workflows/release.yml` |
+| 1F Packaging (starts after phase 1 dependencies settle) | Flatpak manifest, AppImage build, desktop file, metainfo, icons, release workflow | `packaging/**`, `.github/workflows/release.yml` |
 | 2 Integration | wire everything through `record.rs`, cross-module fixes, self-test on the real pipeline | coordinated by the parent |
 | 3 Parity audit | read-only review of PARITY.md against upstream, real-desktop test pass | reviewer, no writes |
 
