@@ -17,9 +17,9 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 |---|---|---|---|---|---|
 | `record` command | Records screen + system audio + mic + webcam | Same, through PipeWire/V4L2 sources and the GStreamer writer | 0 (CLI), 1A/1B (sources) | partial | unit `tests::goal_command_line_parses`; selftest `pattern-1080-h264` (test-pattern source) |
 | `-o/--out/--output` | Output file, `.mov` or `.mp4`, default `~/Movies/rec-<ts>.mov` | Same flags; default `$XDG_VIDEOS_DIR`/`~/Videos/rec-<ts>.mov` | 0 | done | unit `tests::default_output_is_under_the_videos_dir`, `util::tests::timestamps_are_safe_file_names` |
-| `-d/--display N` | Display number from `devices`, default 1 | Same, resolved by the ScreenCast portal | 1A | todo | parses: unit `tests::goal_command_line_parses` |
-| `--window W` | Window id or app/title substring | Same via portal window selection, X11 fallback | 1A | todo | parses: unit `tests::goal_command_line_parses` |
-| `--region X,Y,W,H` | Crop a display region (points) | Same, in logical units | 1A | todo | parses + conflicts with `--window`: unit `tests::bad_arguments_are_rejected` |
+| `-d/--display N` | Display number from `devices`, default 1 | 1-based among RandR monitors on X11 (1 = primary, even when the server names none). On Wayland the portal's picker decides and a note says so; the picked display is named in the log when XWayland's monitor list identifies it | 1A | partial | unit `x11::tests::a_monitor_and_a_window_are_enumerated`; selftest `screen-x11` (`devices` lists `[1] id screen`); why not exact on Wayland: see the phase 1A notes |
+| `--window W` | Window id or app/title substring | X11: EWMH `_NET_CLIENT_LIST` + `_NET_WM_NAME`/`WM_CLASS`, id or case-insensitive app/title substring, largest match wins (upstream's rule), captured with `GetImage`. Wayland: the portal's window source where the desktop offers one (xdg-desktop-portal-wlr offers none and says so); substring matching is a hint for the picker | 1A | partial | unit `selector::tests::*`, `x11::tests::a_window_is_captured_with_its_own_pixels`; selftest `screen-window` (400x300 client surface, 117 distinct frames) |
+| `--region X,Y,W,H` | Crop a display region (points) | Same, in logical units: mapped to stream pixels with the display's scale, cropped on the CPU frame, even and inside the stream | 1A | done | unit `format::tests::a_region_scales_with_the_display`, `regions_are_even_and_stay_inside`; selftest `screen-region` (640x480 native pixels out of a 1280x720 stream) |
 | `-r/--resolution` | 720p/1080p/1440p/4k/native/WxH, source aspect, never upscaled | Identical maths (ported) | 0 | done | unit `tests::sizes` (incl. portrait, odd sizes, 16:10 examples) |
 | `-f/--fps` | 24/25/30/50/60/120 (divisors of 60000) | Same validation and grid | 0 | done | unit `tests::bad_arguments_are_rejected`; selftest CFR check |
 | `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection and same automatic rule | 0 | done | selftest `pattern-prores`, `pattern-hevc`, `pattern-4k-hevc` (`-r 4k` picks HEVC by itself) |
@@ -32,7 +32,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values; phase 0 writes stems only (mix is 1C) | 0 (parse), 1C (mix) | partial | parses: unit `settings::tests::record_args_parse_with_the_cli`; writer warns when a mix is requested |
 | `--system-gain`, `--mic-gain` | dB per source, −60 = silence, +24 max, in every track | Same fader maths applied in the writer | 0 | done | selftest `gain` (`--ref=-6 --expect=-12`); unit `mixer::tests::volume_gain`, `fader_glides_and_passes_unity_through` |
 | `--system-audio-offset-ms`, `--mic-offset-ms` | Sync shifts; system default = output latency | Same; latency read from PipeWire in 1B | 0 (shift), 1B (latency) | partial | unit (offsets applied in `push_audio`); selftest `sync` |
-| `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes (embedded/metadata) | 1A | todo | parse |
+| `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes: embedded (drawn by the compositor), hidden, metadata (we composite the bitmap). X11: the cursor is composited from XFixes and clicks are the button bits of `QueryPointer`, drawn as a ring that grows and fades | 1A | partial | unit `cursor::tests::a_ring_is_a_ring_not_a_disc`, `ring_grows_fades_and_expires`, `cursor_is_composited_at_its_hotspot`; `x11::tests::a_click_draws_a_ring_at_the_pointer` (real X server, XTEST click). Wayland: no button events through a portal, so `--clicks` warns and records the cursor only |
 | `-t/--duration` | Exact, counted in output frames; pauses don't count | Identical: grid slots + `reached_limit` | 0 | done | selftest `sync` (300 frames for `-t 5`), selftest `pause-resume` (300 frames with a 2 s pause) |
 | `--mic-backend` | `sck` or `avcapture` (macOS) | `pipewire` (default) or `pulse`; `sck`/`avcapture` map with a message | 0 | done | unit `record::tests::mic_backend_maps_upstream_values` |
 | `--test-pattern [--noise]` | Flash + beep source for self-tests | Same, CPU frames, BGRA/I420 | 0 | done | unit `synth::tests::pattern_timeline`, `beep_starts_on_each_second`, `source_emits_on_the_grid`; selftest `pattern-1080-h264` |
@@ -40,9 +40,9 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--stream DEST` (repeatable) | RTMP(S)/WHIP, platform shortcuts | Same URLs and presets, built-in clients | 1D | todo | unit `live::tests::services_expand_and_are_recognized`, `shared_preset_fits_every_destination` |
 | `--no-record` | Replay/stream only | Same rule (needs replay or stream) | 1D | todo | unit `tests::bad_arguments_are_rejected` |
 | `--live-resolution/--stream-bitrate/--stream-codec/--keyframe/--vbr/--audio-bitrate` | Live encode controls | Same parsing, presets and clamping | 0 (parse/config), 1D (encode) | partial | unit `settings::tests::live_encode_fits_every_enabled_destination` |
-| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout; each list reports its phase until the source lands | 0 (shape), 1A/1B | partial | `rec-rs devices` output in the phase report |
+| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout. Displays and windows come from RandR/EWMH (also under XWayland); a Wayland session without X11 prints that the system picker chooses instead of an empty list. Cameras and microphones report phase 1B | 0 (shape), 1A/1B | partial | selftest `screen-x11` runs `devices` and matches `[1] id`; live tests `a_monitor_and_a_window_are_enumerated` |
 | `probe FILE` command | AVFoundation: playable, tracks, codecs, full sample decode, non-zero exit on error | GStreamer: qtdemux structure + `uridecodebin` decode of every sample | 0 | done | selftest uses it on every case (`.probe` files); `ffmpeg -v error -f null` cross-check |
-| `permissions [--request]` | TCC status and prompts | Portal/PipeWire/camera/secret-service availability | 1A | todo | prints "unknown (not implemented yet, phase 1A/1B)" |
+| `permissions [--request]` | TCC status and prompts | ScreenCast version, source types, cursor modes, whether a grant is stored, whether PipeWire runs. `--request` runs the portal dialog once and stores the restore token (0600, `$XDG_STATE_HOME/rec-rs/portal-token`). Mic/camera lines report phase 1B | 1A | partial | unit `portal::tests::cursor_modes_fall_back_to_what_the_portal_offers`; selftest `screen-token` (`permissions --request` → granted, token 0600, a corrupted token is recovered) |
 | `stop` / `pause` / `resume` | pidfile + SIGUSR1/SIGUSR2/SIGTERM | pidfile in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`), SIGINT to stop | 0 | done | unit `record::tests::pidfile_lives_in_the_runtime_dir`, `no_recorder_means_a_clear_error`; selftest `pause-resume` runs `pause`/`resume`; `stop` demo in the phase report |
 | `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux); buffer is 1D | 0 (signal), 1D (buffer) | partial | unit `record::tests::save_replay_signal_is_a_real_time_signal` |
 | `stream-key DEST [--delete]` | Keychain | Secret Service (`secret-service` crate), `REC_STREAM_KEY` meanwhile | 1D | todo | the command fails with phase 1D and names the env override |
@@ -53,7 +53,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
 | Live preview of what will be recorded | Rendered at preview size, composited | Same preview from the composited frames | 1E (with 1C) | todo | — |
-| Own windows excluded from capture | ScreenCaptureKit filter | Portal picks the window; own windows are excluded the same way | 1A | todo | — |
+| Own windows excluded from capture | ScreenCaptureKit filter | Not possible through the portal: the compositor owns the stream and a portal client cannot name windows to exclude. On X11 the recorder is an ordinary client, so its own windows are captured like any other | 1A | n-a | documented in the phase 1A notes; the app (1E) should hide its own preview windows while recording, as upstream does by excluding them |
 | Preview low-power mode (half res, 15 fps) | Setting | Same setting, honoured by the preview | 1E | todo | — |
 | Scene: Screen | Full display or window | Same | 1A | todo | geometry: unit `compose::tests::fit_letterboxes_and_cover_crops` |
 | Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, wgpu rendering | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::snapping`, `corners_and_free_positions`, `corner_placement_survives_resize` |
@@ -143,12 +143,15 @@ version that does it).
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Display capture | ScreenCaptureKit, zero copy | Portal + PipeWire, dmabuf where available | 1A | todo | — |
-| Window capture | Yes | Portal window + X11 fallback | 1A | todo | — |
-| Region / crop | `--region` | `--region` | 1A | todo | parses today |
+| Display capture | ScreenCaptureKit, zero copy | Portal + PipeWire (packed BGRx/BGRA on the CPU) on Wayland, `GetImage` on X11. dmabuf/zero-copy needs phase 1C's GPU importer | 1A | done | selftest `pattern-screen`: 1280x720 @ 60/1, 180 frames, 180 distinct, `probe` + full ffmpeg decode |
+| Window capture | Yes | X11 captures the client's own drawable; Wayland uses the portal's window source when the desktop offers one (GNOME/KDE yes, wlr no) | 1A | partial | selftest `screen-window`; live test `a_window_is_captured_with_its_own_pixels` |
+| Region / crop | `--region` | `--region` | 1A | done | selftest `screen-region`; unit `format::tests::*` |
 | Application capture | No (known gap) | No | — | n-a | matches upstream |
+| Cursor shown (default) | Yes, embedded by ScreenCaptureKit | Embedded by the compositor (portal) or composited from XFixes (X11) | 1A | done | live test `a_window_is_captured_with_its_own_pixels` (XFixes path); cursor modes chosen from the portal's `AvailableCursorModes` |
+| Click highlight (`--clicks`) | Yes | Ring drawn into the CPU frame; X11 only, because desktop portals do not report mouse buttons | 1A | partial | live test `a_click_draws_a_ring_at_the_pointer` (XTEST); `--clicks` warns on Wayland |
+| One-time screen permission | TCC grant | ScreenCast restore token in `$XDG_STATE_HOME/rec-rs/portal-token`, replayed through `SelectSources` | 1A | done | selftest `screen-token`; unit `token::tests::*` |
 | Scenes | Three fixed scenes, switchable live, cut only | Same three scenes | 1C/1E | todo | scene model: unit `tests::scene_option` |
-| Multiple displays/sources at once | No | No | — | n-a | matches upstream |
+| Multiple displays/sources at once | No | No (a portal session may hand over several streams; the first is used) | — | n-a | matches upstream |
 | System audio | Yes | PipeWire sink monitor | 1B | todo | — |
 | Microphone | Yes | PipeWire capture | 1B | todo | — |
 | Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | todo | geometry done: unit `compose::tests::corners_and_free_positions` |
@@ -205,3 +208,77 @@ first beep, 0.0 ms after), and the self-test's sync threshold is 20 ms rather th
 for that reason.
 
 Todo (phase 1): all capture, the GPU compositor, the app, replay/streaming, packaging.
+
+## Screen capture (phase 1A)
+
+Two backends, chosen by the session type: xdg-desktop-portal's ScreenCast plus PipeWire on Wayland
+(`src/capture/screen/portal.rs`, `pipewire.rs`), and X11 directly on an X11 session (`x11.rs`).
+`REC_SCREEN_BACKEND=portal|x11` overrides the choice.
+
+What runs headless in the dev container, on every `scripts/selftest.sh` run:
+
+| Case | Session | Proves |
+|---|---|---|
+| `pattern-screen` | sway (wlroots, headless 1280x720) + xdg-desktop-portal-wlr + PipeWire | the whole Wayland pipeline: picker → PipeWire node → 1280x720 BGRA frames at a constant 60 fps, all 180 frames different (a terminal scrolling in the capture), `probe` and a full ffmpeg decode clean, and a 0600 restore token stored |
+| `screen-region` | same | `--region` crops the shared monitor to 640x480 native pixels (not a scaled 16:9 frame) |
+| `screen-token` | same | `permissions --request` runs the dialog and stores the grant; a corrupted token is ignored with a message and the recording still happens |
+| `screen-x11` | Xvfb 1280x800 | RandR enumeration (`devices` lists `[1]`), a root-window capture at the native size with motion, no portal involved |
+| `screen-window` | Xvfb + a GStreamer window | `--window gstreamer` captures that client's own 400x300 drawable, with motion |
+| `cargo test` under `scripts/screen/xvfb.sh` | Xvfb | `x11::tests::a_monitor_and_a_window_are_enumerated`, `a_window_is_captured_with_its_own_pixels`, `a_click_draws_a_ring_at_the_pointer` (XTEST motion + click, ring found in the frames), `a_region_crops_a_monitor` |
+
+### Needs a real desktop
+
+The container has no GPU, no output attached to a real compositor, no pointer hardware and no
+desktop portal other than xdg-desktop-portal-wlr. These are the checks to run on a real machine,
+in order, on **GNOME Wayland** and **KDE Plasma Wayland** (and once on an X11 session):
+
+1. `rec-rs permissions` → `not granted yet - ScreenCast vX; monitors + windows; cursor ...; PipeWire running`.
+   Run `rec-rs permissions --request`: the desktop's own dialog appears once, the line says `granted`, and
+   `$XDG_STATE_HOME/rec-rs/portal-token` exists with mode 600.
+2. `rec-rs devices` on Wayland: the display list either comes from XWayland's RandR (then the pixel
+   sizes are the logical sizes) or says the picker chooses. Window list: same.
+3. `rec-rs record -t 5 -o /tmp/display.mp4`: the picker appears (first run only), a monitor is shared,
+   the start line names it, `rec-rs probe /tmp/display.mp4` is clean and the file is not black. Record
+   again: **no picker** (the token was reused).
+4. `--no-cursor`: the pointer is absent from the file, and only from the file.
+5. `--clicks`: on GNOME/KDE the run warns that portals send no button state and the cursor is recorded
+   without highlights; on an X11 session clicks draw a ring.
+6. `--window <app substring>` on GNOME/KDE: the picker offers windows, `--window` is only a hint;
+   check that the recorded size is the window's and that resizing the window mid-recording is
+   followed (the stream renegotiates; the writer's 1G scaler keeps the output size).
+7. `--region 100,100,800,600`: the recorded size is 800x600 (× the desktop scale), and the content is
+   that part of the screen.
+8. `--display 2` with two monitors: the picker still decides; the log names the monitor that was
+   picked. On X11, `--display 2` records the second monitor without a picker.
+9. X11 session, `--window firefox`: the window is captured even while partially covered by another
+   window (a compositor redirects it; without one, obscured content is undefined and the file shows
+   garbage where the covering window is — see the gaps below).
+10. Revoke the grant in the desktop's settings (GNOME: Settings → Privacy → Screen), then record
+    again: the picker appears with `the saved screen-capture grant was refused ...` and the recording
+    still happens.
+
+### Known gaps, with the reason
+
+- **dmabuf/zero copy.** Frames are copied to the CPU (`BGRx`/`BGRA`, or X11's `GetImage`). A
+  compositor that offers only dmabuf is an error that names phase 1C; the GPU importer is 1C's work,
+  and it is also what removes the per-frame copy.
+- **Click highlighting on Wayland.** No portal reports mouse buttons (`spa_meta_cursor` carries a
+  position and a bitmap, never a button state). `--clicks` warns and records the cursor only. X11
+  highlights clicks.
+- **`--display N` on Wayland.** The picker owns the choice; a portal has no "monitor 2" parameter.
+  The log names the monitor that was picked when XWayland's monitor list identifies it.
+- **Window substring matching on Wayland.** The same: the picker owns it, and
+  xdg-desktop-portal-wlr does not offer window sources at all (it says so and suggests `--region`).
+- **Own windows in the picture.** A portal client cannot exclude windows from a compositor's stream.
+  The app (1E) must hide its own windows while recording, as upstream's preview-window exclusion
+  did automatically.
+- **Cursor motion on a still screen.** PipeWire streams deliver frames on damage. With the cursor
+  embedded the compositor damages the stream, so the pointer is recorded; in metadata mode a pointer
+  that moves over an unchanged screen may not produce a frame, and the cursor in the file lags. X11
+  polls the pointer, so it always produces a new frame when the cursor moves.
+- **X11 `GetImage`.** One round trip and one copy per frame (no MIT-SHM, no XDamage); a 4K screen at
+  60 fps costs ~2 GB/s. Acceptable at 1080p, and the portal path is the default on Wayland anyway.
+  An SHM/Damage version is a later optimisation, not a parity gap.
+- **Obscured windows on X11 without a compositor.** `GetImage` of a window that another window covers
+  returns the server's undefined content for that area (black under Xvfb). With a compositor the
+  window is redirected and correct.

@@ -541,6 +541,10 @@ impl Source {
             if let Err(e) = run(spec, opts, sink, stop, &error) {
                 let mut slot = error.lock().unwrap();
                 if slot.is_none() {
+                    // Say it now: the session only learns about `stop()` at the
+                    // very end, and a dead capture should not look like an
+                    // empty recording.
+                    eprintln!("rec: error: screen capture stopped: {e:#}");
                     *slot = Some(format!("{e:#}"));
                 }
             }

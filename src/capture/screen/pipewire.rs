@@ -191,6 +191,9 @@ impl Stream {
             if let Err(e) = r {
                 let mut slot = error2.lock().unwrap();
                 if slot.is_none() {
+                    // Say it now: the session only learns about `stop()` at the
+                    // very end.
+                    eprintln!("rec: error: screen capture stopped: {e:#}");
                     *slot = Some(format!("{e:#}"));
                 }
             }
@@ -623,16 +626,24 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
     // A compositor that never offers a format must not hang the recorder
     // before it even starts.
     let raw = main.as_raw_ptr() as usize;
+    let finished = Arc::new(AtomicBool::new(false));
+    let watcher_done = finished.clone();
     let watcher = std::thread::spawn(move || {
         let deadline = Instant::now() + PROBE_TIMEOUT;
-        while Instant::now() < deadline {
+        // Stop as soon as the format arrived (or the deadline passed): a
+        // watcher that kept sleeping would hold the whole recorder for the
+        // timeout even though the answer is already in.
+        while !watcher_done.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        // `pw_main_loop_quit` is documented thread safe, and a raw pointer is
-        // the only `Send` handle to a `!Send` main loop.
-        unsafe { pw::sys::pw_main_loop_quit(raw as *mut _) };
+        if !watcher_done.load(Ordering::SeqCst) {
+            // `pw_main_loop_quit` is documented thread safe, and a raw pointer
+            // is the only `Send` handle to a `!Send` main loop.
+            unsafe { pw::sys::pw_main_loop_quit(raw as *mut _) };
+        }
     });
     main.run();
+    finished.store(true, Ordering::SeqCst);
     drop(listener);
     let _ = stream.disconnect();
     drop(stream);

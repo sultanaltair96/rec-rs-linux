@@ -57,7 +57,7 @@ pub struct Region {
 }
 
 /// What `record` asked for on the command line.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScreenRequest {
     /// 1-based display number (`--display`).
     pub display: usize,
@@ -65,6 +65,17 @@ pub struct ScreenRequest {
     pub window: Option<String>,
     /// Region of the display (`--region`), which excludes `window`.
     pub region: Option<Region>,
+}
+
+impl Default for ScreenRequest {
+    /// The primary display, like the command line's `--display 1`.
+    fn default() -> ScreenRequest {
+        ScreenRequest {
+            display: 1,
+            window: None,
+            region: None,
+        }
+    }
 }
 
 /// How the session wants the capture to look.
@@ -134,21 +145,6 @@ impl Target {
                 pixels.0,
                 pixels.1
             ),
-        }
-    }
-
-    /// The native pixel size of what is being captured.
-    pub fn pixels(&self) -> (usize, usize) {
-        match self {
-            // A region's native size is its size in pixels, which the caller
-            // computed with the display's scale.
-            Target::Display(_, Some(r)) => (
-                r.width.max(2.0) as usize & !1,
-                r.height.max(2.0) as usize & !1,
-            ),
-            Target::Display(d, None) => (d.pixels.0 & !1, d.pixels.1 & !1),
-            Target::Window(w) => (w.size.0 & !1, w.size.1 & !1),
-            Target::Picked { pixels, .. } => (pixels.0 & !1, pixels.1 & !1),
         }
     }
 }
@@ -313,7 +309,29 @@ fn resolve_portal(req: &ScreenRequest) -> Result<(Target, (usize, usize))> {
             req.window.as_deref().unwrap_or("")
         );
     }
-    if req.display > 1 {
+    // XWayland usually knows the monitor layout, which is enough to reject a
+    // display number that cannot exist (upstream's message) even though the
+    // picker still makes the choice.
+    let known = x11::Server::connect()
+        .map(|s| s.monitors())
+        .unwrap_or_default();
+    if !known.is_empty() && (req.display == 0 || req.display > known.len()) {
+        bail!(
+            "display {} not found: displays are numbered 1..={} (see `rec-rs devices`)",
+            req.display,
+            known.len()
+        );
+    }
+    if req.display > 1 && !known.is_empty() {
+        eprintln!(
+            "rec: note: on Wayland the system picker chooses which monitor is shared, so \
+             --display {} is not enforced (display {} is {}x{}, but the picker decides)",
+            req.display,
+            req.display,
+            known[req.display - 1].0.pixels.0,
+            known[req.display - 1].0.pixels.1
+        );
+    } else if req.display > 1 {
         eprintln!(
             "rec: note: on Wayland the system picker chooses which monitor is shared, so \
              --display {} is not enforced",
@@ -381,7 +399,7 @@ fn target_from_portal(
                     };
                     (rect.width, rect.height)
                 }
-                None => Target::Display(d.clone(), None).pixels(),
+                None => (d.pixels.0 & !1, d.pixels.1 & !1),
             };
             Ok((Target::Display(d, req.region), native))
         }
@@ -438,7 +456,12 @@ impl PortalSource {
         if let Some(note) = &prepared.cursor_note {
             warn_once(note);
         }
-        let crop = match &req.region {
+        // `--region` is a display crop; a window stream is already the window.
+        let region = match prepared.want {
+            Want::Monitor => req.region.as_ref(),
+            Want::Window => None,
+        };
+        let crop = match region {
             Some(r) => {
                 let Some(rect) = format::region_to_pixels(r, prepared.pixels, prepared.points)
                 else {
@@ -616,14 +639,8 @@ mod tests {
 
     #[test]
     fn the_default_request_is_the_primary_display() {
+        // The same default as the command line: --display 1.
         let req = ScreenRequest::default();
-        assert_eq!(req.display, 0);
-        // cli.rs always sets --display (default 1); a Default request is only a
-        // placeholder for the app's preview.
-        let req = ScreenRequest {
-            display: 1,
-            ..Default::default()
-        };
         assert_eq!(req.display, 1);
         assert!(req.window.is_none() && req.region.is_none());
     }
@@ -658,33 +675,36 @@ mod tests {
     }
 
     #[test]
-    fn targets_report_their_native_size() {
+    fn targets_describe_what_is_captured() {
         let d = DisplayInfo {
             index: 2,
             id: "HDMI-1".into(),
             name: "HDMI-1".into(),
-            pixels: (2560, 1441),
+            pixels: (2560, 1440),
             points: (1280, 720),
             primary: false,
         };
-        // Whole display, rounded to even for the encoder.
-        assert_eq!(Target::Display(d.clone(), None).pixels(), (2560, 1440));
-        // A region's native size is its own.
+        assert_eq!(
+            Target::Display(d.clone(), None).describe(),
+            "display 2 (2560x1440 pixels)"
+        );
         let r = Region {
-            x: 0.0,
-            y: 0.0,
+            x: 10.0,
+            y: 20.0,
             width: 800.0,
             height: 600.0,
         };
-        assert_eq!(Target::Display(d, Some(r)).pixels(), (800, 600));
+        assert_eq!(
+            Target::Display(d, Some(r)).describe(),
+            "display 2 region 800x600 at 10,20"
+        );
         let w = WindowInfo {
             id: 7,
             app: "foot".into(),
             title: "shell".into(),
             size: (801, 599),
         };
-        assert_eq!(Target::Window(w.clone()).pixels(), (800, 598));
-        assert!(Target::Window(w).describe().contains("801x599"));
+        assert_eq!(Target::Window(w).describe(), "window 7 (foot — 801x599)");
     }
 
     #[test]
@@ -697,7 +717,6 @@ mod tests {
             t.describe(),
             "the monitor the system picker chose (1920x1080 pixels)"
         );
-        assert_eq!(t.pixels(), (1920, 1080));
     }
 
     #[test]
