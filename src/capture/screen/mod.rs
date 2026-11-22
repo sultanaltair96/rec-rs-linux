@@ -544,10 +544,13 @@ pub fn permission_status(request: bool, wait: u64) -> Result<String> {
 }
 
 /// Run the ScreenCast dialog once and keep the grant.
+///
+/// `wait` bounds the dialog. What the picker chose goes to stderr; the status
+/// line `permissions` prints is the answer on stdout.
 pub fn request_permission(wait: u64) -> Result<()> {
     let timeout = Duration::from_secs(wait.max(5));
     let prepared = portal::prepare(Want::Monitor, CaptureOptions::default(), timeout)?;
-    println!("screen recording : granted for {}", prepared.picked);
+    eprintln!("rec: screen-capture grant for {}", prepared.picked);
     prepared.close();
     Ok(())
 }
@@ -561,10 +564,11 @@ fn status_line() -> String {
         "PipeWire NOT running"
     };
     let Ok(a) = portal else {
-        return format!(
-            "unavailable - {}{pipewire}",
-            portal_error_line(portal.err())
-        );
+        let reason = match portal.err() {
+            Some(e) => format!("{e:#}"),
+            None => "the screen-cast portal is unavailable".to_string(),
+        };
+        return format!("unavailable - {reason}; {pipewire}");
     };
     let mut bits = vec![format!("ScreenCast v{}", a.version)];
     let mut what = vec![];
@@ -591,13 +595,6 @@ fn status_line() -> String {
             "not granted yet - {what}; the picker appears once, at the first recording \
              (or run `rec-rs permissions --request`)"
         ),
-    }
-}
-
-fn portal_error_line(e: Option<anyhow::Error>) -> String {
-    match e {
-        Some(e) => format!("; {e:#}"),
-        None => String::new(),
     }
 }
 

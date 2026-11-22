@@ -600,6 +600,7 @@ fn run(
     let mut clicks: Vec<Click> = Vec::new();
     let mut buttons = 0u16;
     let mut cursor = None;
+    let mut cursor_fetched = Instant::now();
     let mut last = Instant::now();
     // Where the pointer was when the last frame was made: a cursor that moves
     // over an otherwise static screen is a new frame, because the cursor is
@@ -661,13 +662,24 @@ fn run(
             let mut data = data;
             if opts.cursor || opts.clicks {
                 let (px, py) = pointer.map(|(x, y, _)| (x, y)).unwrap_or((0, 0));
+                // XFixes hands over the whole bitmap on every call, so fetch it
+                // when the pointer moved (the usual reason the cursor changed)
+                // and otherwise twice a second, which catches a theme or shape
+                // change without a round trip per frame.
+                let moved = pointer_at.is_some_and(|p| Some(p) != drawn_pointer);
                 if opts.cursor
+                    && (moved
+                        || cursor.is_none()
+                        || cursor_fetched.elapsed() > Duration::from_millis(500))
                     && let Some((serial, image)) = server.cursor()
-                    && cursor
+                {
+                    cursor_fetched = Instant::now();
+                    if cursor
                         .as_ref()
                         .is_none_or(|(s, _): &(u32, CursorImage)| *s != serial)
-                {
-                    cursor = Some((serial, image));
+                    {
+                        cursor = Some((serial, image));
+                    }
                 }
                 let mut frame = Frame {
                     data: &mut data,

@@ -74,9 +74,11 @@ pub fn available() -> Result<Availability> {
     let sources = runtime()
         .block_on(async { screencast.available_source_types().await })
         .map_err(portal_error)?;
+    // `AvailableCursorModes` needs portal v2; a v1 portal can still cast, it
+    // just cannot tell us which modes it has, so assume the two v1 ones.
     let modes = runtime()
         .block_on(async { screencast.available_cursor_modes().await })
-        .map_err(portal_error)?;
+        .unwrap_or(CursorMode::Hidden | CursorMode::Embedded);
     let mut cursor_modes = vec![];
     for (mode, name) in [
         (CursorMode::Hidden, "hidden"),

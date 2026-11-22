@@ -21,6 +21,12 @@
 //! A resolution change is followed (the format callback updates the size), which
 //! is what a window resize looks like on a portal stream.
 //!
+//! `spa_meta_region` (a compositor's "only this part changed" hint) is ignored:
+//! every buffer is copied whole and `--region` is cropped out of it here, so a
+//! damage hint would only double-crop. `spa_meta_header.pts` is used as the
+//! capture stamp when the compositor sends one, otherwise the frame is stamped
+//! on arrival — the same `CLOCK_MONOTONIC`, off by the transport delay.
+//!
 //! Adapted from rec-rs src/screen.rs (MIT OR Apache-2.0), which gets its frames
 //! from ScreenCaptureKit instead of a PipeWire node.
 
@@ -56,6 +62,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest cursor bitmap edge we accept. A cursor is 24-64 px.
 const MAX_CURSOR: usize = 256;
+
+/// Largest metadata area we will read a cursor bitmap out of.
+const MAX_META: usize = 1 << 22;
 
 /// PipeWire's `spa_meta_cursor`: where the pointer is, and optionally its
 /// bitmap, sent when the portal session asked for `CursorMode::Metadata`.
@@ -499,9 +508,21 @@ fn cursor_bitmap(meta: &SpaMetaCursor) -> Option<CursorImage> {
     // The metadata lives in the mapped buffer; `bitmap_offset` is relative to
     // the metadata's start and the bitmap's own `offset` likewise.
     let base = meta as *const SpaMetaCursor as *const u8;
+    if meta.bitmap_offset as usize + std::mem::size_of::<SpaMetaBitmap>() > MAX_META {
+        return None;
+    }
     let bitmap = unsafe { &*(base.add(meta.bitmap_offset as usize) as *const SpaMetaBitmap) };
     let (w, h, stride) = (bitmap.width as usize, bitmap.height as usize, bitmap.stride);
-    if w == 0 || h == 0 || w > MAX_CURSOR || h > MAX_CURSOR || stride < (w * 4) as i32 {
+    // The bitmap lives inside a buffer the compositor sized: bound every field
+    // before reading past the cursor struct.
+    if w == 0
+        || h == 0
+        || w > MAX_CURSOR
+        || h > MAX_CURSOR
+        || stride < (w * 4) as i32
+        || stride as usize > w * 4 + 4096
+        || bitmap.offset as usize + stride as usize * h > MAX_META
+    {
         return None;
     }
     // BGRA is what wlr and mutter send; anything else falls back to no cursor
