@@ -224,7 +224,7 @@ What runs headless in the dev container, on every `scripts/selftest.sh` run:
 | `screen-token` | same | `permissions --request` runs the dialog and stores the grant; a corrupted token is ignored with a message and the recording still happens |
 | `screen-x11` | Xvfb 1280x800 | RandR enumeration (`devices` lists `[1]`), a root-window capture at the native size with motion, no portal involved |
 | `screen-window` | Xvfb + a GStreamer window | `--window gstreamer` captures that client's own 400x300 drawable, with motion |
-| `cargo test` under `scripts/screen/xvfb.sh` | Xvfb | `x11::tests::a_monitor_and_a_window_are_enumerated`, `a_window_is_captured_with_its_own_pixels`, `a_click_draws_a_ring_at_the_pointer` (XTEST motion + click, ring found in the frames), `a_region_crops_a_monitor` |
+| `cargo test` under `scripts/screen/xvfb.sh` | Xvfb | 8 X11 unit tests, 5 of them against the live server: monitor/window enumeration, a window captured with its own pixels, `--region` capturing the pixels it names (red/blue halves), a click ring from a real XTEST click, and the region geometry |
 
 ### Needs a real desktop
 
