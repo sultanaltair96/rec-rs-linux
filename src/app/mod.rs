@@ -425,6 +425,9 @@ struct App {
     main: Option<Win>,
     settings_win: Option<Win>,
     main_visible: bool,
+    /// Quit is in progress: the windows are gone and the loop is ending, so no
+    /// event may touch them.
+    quitting: bool,
     st: State,
     tray: Option<ksni::blocking::Handle<tray::Tray>>,
     /// The tray starts on a thread: registering the status item talks to D-Bus,
@@ -472,6 +475,7 @@ impl App {
             main: None,
             settings_win: None,
             main_visible: true,
+            quitting: false,
             st,
             tray: None,
             tray_rx: None,
@@ -963,6 +967,14 @@ impl App {
     }
 
     fn quit(&mut self, el: &ActiveEventLoop) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        let debug = std::env::var_os("REC_DEBUG").is_some();
+        if debug {
+            eprintln!("rec: debug: quit: finalizing");
+        }
         if let Some(s) = self.st.recording.take() {
             let file = s.output.clone();
             let r = s.finish();
@@ -983,6 +995,11 @@ impl App {
         }
         session::stop_all(&self.st.live);
         self.tray = None;
+        // Before the loop ends: see `close_windows`.
+        self.close_windows();
+        if debug {
+            eprintln!("rec: debug: quit: exiting the event loop");
+        }
         el.exit();
     }
 
@@ -1021,6 +1038,9 @@ impl App {
     /// Periodic work: commands, signals, finished recordings, failures, tray,
     /// meters.
     fn tick(&mut self, el: &ActiveEventLoop) {
+        if self.quitting {
+            return;
+        }
         if SIG_QUIT.swap(false, Ordering::SeqCst) {
             self.quit(el);
             return;
@@ -1189,6 +1209,9 @@ impl App {
     }
 
     fn redraw(&mut self, which: WindowId) {
+        if self.quitting {
+            return;
+        }
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == which);
         if self.gpu.is_none() {
             return;
@@ -1372,6 +1395,9 @@ impl ApplicationHandler for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
+        if self.quitting {
+            return;
+        }
         self.tick(el);
         if let Some(w) = &self.main
             && self.main_visible
@@ -1438,6 +1464,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.quitting {
+            el.exit();
+            return;
+        }
         if self.last_tick.elapsed() >= Duration::from_millis(100) {
             self.last_tick = Instant::now();
             self.tick(el);
@@ -1469,6 +1499,27 @@ impl ApplicationHandler for App {
             }
         }
         el.set_control_flow(ControlFlow::WaitUntil(next));
+    }
+}
+
+impl App {
+    /// Destroy the windows (their surfaces, renderers and egui contexts) while
+    /// the event loop is still running: a Wayland surface must not outlive it.
+    fn close_windows(&mut self) {
+        self.preview_texture = None;
+        self.st.preview_tex = None;
+        self.st.preview_px = [0, 0];
+        self.settings_win = None;
+        self.main = None;
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Idempotent: `quit` already closed them; this covers a panic path, and
+        // keeps the windows (which were created from the device) ahead of the
+        // GPU instance in the drop order.
+        self.close_windows();
     }
 }
 
@@ -1542,7 +1593,14 @@ pub fn run(
         listener,
     );
     event_loop.run_app(&mut app)?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: event loop finished");
+    }
     let _ = std::fs::remove_file(record::pidfile_path());
+    drop(app);
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: app dropped");
+    }
     Ok(())
 }
 

@@ -186,7 +186,8 @@ sleep 1
 "$REC" gui --start-recording --test-pattern >>"$d/second.log" 2>&1 || true
 sleep 5
 kill -TERM \$app 2>/dev/null || true
-wait \$app 2>/dev/null || true
+wait \$app
+echo "app exit=\$?" >"$d/exit"
 kill -TERM \$sway_pid 2>/dev/null || true
 sleep 0.5; kill -KILL \$sway_pid 2>/dev/null || true
 exit 0
@@ -215,8 +216,9 @@ INNER
            grep -q "resumed" "$d/controls.log" 2>/dev/null &&
            grep -q "app running" "$d/app.log" 2>/dev/null &&
            grep -q "preview frame" "$d/app.log" 2>/dev/null &&
+           grep -q "app exit=0" "$d/exit" 2>/dev/null &&
            [ ! -e "$d/rt/rec-rs.pid" ]; then
-            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, pause/resume/stop via the CLI)"
+            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, pause/resume/stop via the CLI, clean exit)"
             pass=$((pass+1))
         else
             echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"
