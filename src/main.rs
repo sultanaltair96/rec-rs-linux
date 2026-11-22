@@ -216,18 +216,12 @@ fn devices() -> Result<()> {
 }
 
 fn permissions(request: bool, wait: u64) -> Result<()> {
-    let _ = wait;
-    if request {
-        bail!(
-            "requesting permissions is not implemented yet (phase {})",
-            capture::screen::PHASE
-        );
+    // The screen line is phase 1A's (the ScreenCast portal and its restore
+    // token); microphone and camera report their phases until 1B fills them in.
+    match capture::screen::permission_status(request, wait) {
+        Ok(s) => println!("screen recording : {s}"),
+        Err(e) => println!("screen recording : unavailable - {e:#}"),
     }
-    // Be explicit rather than printing a status that is not known yet.
-    println!(
-        "screen recording : unknown (not implemented yet, phase {})",
-        capture::screen::PHASE
-    );
     println!(
         "microphone       : unknown (not implemented yet, phase {})",
         capture::audio::PHASE
@@ -297,10 +291,10 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             )
         }
         Cmd::Permissions { request, wait } => permissions(request, wait),
-        Cmd::RequestScreen => Err(anyhow::anyhow!(
-            "requesting permissions is not implemented yet (phase {})",
-            capture::screen::PHASE
-        )),
+        // macOS re-execs itself with responsibility disclaimed; on Linux the
+        // request is a plain portal dialog, so this is the same thing
+        // `permissions --request` does.
+        Cmd::RequestScreen => capture::screen::request_permission(60),
         Cmd::Probe { file } => media::probe::probe(&file),
         Cmd::Play { file, secs, size } => {
             let _ = (file, secs, size);
@@ -451,11 +445,22 @@ mod tests {
     }
 
     #[test]
-    fn screen_capture_fails_with_the_phase() {
+    fn screen_capture_without_a_display_explains_itself() {
+        // No display server, no portal: `prepare` must fail with something a
+        // person can act on (this test environment has neither).
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+            return;
+        }
         let err = cli::prepare(parse_record_args(&["-o", "/tmp/x.mov"]).unwrap())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not implemented yet (phase 1A)"), "{err}");
+        assert!(
+            err.contains("portal")
+                || err.contains("Wayland")
+                || err.contains("DISPLAY")
+                || err.contains("X11"),
+            "{err}"
+        );
     }
 
     #[test]

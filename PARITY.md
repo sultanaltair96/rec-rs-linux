@@ -17,9 +17,9 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 |---|---|---|---|---|---|
 | `record` command | Records screen + system audio + mic + webcam | Same, through PipeWire/V4L2 sources and the GStreamer writer | 0 (CLI), 1A/1B (sources) | partial | unit `tests::goal_command_line_parses`; selftest `pattern-1080-h264` (test-pattern source) |
 | `-o/--out/--output` | Output file, `.mov` or `.mp4`, default `~/Movies/rec-<ts>.mov` | Same flags; default `$XDG_VIDEOS_DIR`/`~/Videos/rec-<ts>.mov` | 0 | done | unit `tests::default_output_is_under_the_videos_dir`, `util::tests::timestamps_are_safe_file_names` |
-| `-d/--display N` | Display number from `devices`, default 1 | Same, resolved by the ScreenCast portal | 1A | todo | parses: unit `tests::goal_command_line_parses` |
-| `--window W` | Window id or app/title substring | Same via portal window selection, X11 fallback | 1A | todo | parses: unit `tests::goal_command_line_parses` |
-| `--region X,Y,W,H` | Crop a display region (points) | Same, in logical units | 1A | todo | parses + conflicts with `--window`: unit `tests::bad_arguments_are_rejected` |
+| `-d/--display N` | Display number from `devices`, default 1 | 1-based among RandR monitors on X11 (1 = primary, even when the server names none). On Wayland the portal's picker decides and a note says so; the picked display is named in the log when XWayland's monitor list identifies it | 1A | partial | unit `x11::tests::a_monitor_and_a_window_are_enumerated`; selftest `screen-x11` (`devices` lists `[1] id screen`); why not exact on Wayland: see the phase 1A notes |
+| `--window W` | Window id or app/title substring | X11: EWMH `_NET_CLIENT_LIST` + `_NET_WM_NAME`/`WM_CLASS`, id or case-insensitive app/title substring, largest match wins (upstream's rule), captured with `GetImage`. Wayland: the portal's window source where the desktop offers one (xdg-desktop-portal-wlr offers none and says so); substring matching is a hint for the picker | 1A | partial | unit `selector::tests::*`, `x11::tests::a_window_is_captured_with_its_own_pixels`; selftest `screen-window` (400x300 client surface, 117 distinct frames) |
+| `--region X,Y,W,H` | Crop a display region (points) | Same, in logical units: mapped to stream pixels with the display's scale, cropped on the CPU frame, even and inside the stream | 1A | done | unit `format::tests::a_region_scales_with_the_display`, `regions_are_even_and_stay_inside`; selftest `screen-region` (640x480 native pixels out of a 1280x720 stream) |
 | `-r/--resolution` | 720p/1080p/1440p/4k/native/WxH, source aspect, never upscaled | Identical maths (ported) | 0 | done | unit `tests::sizes` (incl. portrait, odd sizes, 16:10 examples) |
 | `-f/--fps` | 24/25/30/50/60/120 (divisors of 60000) | Same validation and grid | 0 | done | unit `tests::bad_arguments_are_rejected`; selftest CFR check |
 | `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection and same automatic rule | 0 | done | selftest `pattern-prores`, `pattern-hevc`, `pattern-4k-hevc` (`-r 4k` picks HEVC by itself) |
@@ -32,7 +32,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values; phase 0 writes stems only (mix is 1C) | 0 (parse), 1C (mix) | partial | parses: unit `settings::tests::record_args_parse_with_the_cli`; writer warns when a mix is requested |
 | `--system-gain`, `--mic-gain` | dB per source, −60 = silence, +24 max, in every track | Same fader maths applied in the writer | 0 | done | selftest `gain` (`--ref=-6 --expect=-12`); unit `mixer::tests::volume_gain`, `fader_glides_and_passes_unity_through` |
 | `--system-audio-offset-ms`, `--mic-offset-ms` | Sync shifts; system default = output latency | Same; latency read from PipeWire in 1B | 0 (shift), 1B (latency) | partial | unit (offsets applied in `push_audio`); selftest `sync` |
-| `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes (embedded/metadata) | 1A | todo | parse |
+| `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes: embedded (drawn by the compositor), hidden, metadata (we composite the bitmap). X11: the cursor is composited from XFixes and clicks are the button bits of `QueryPointer`, drawn as a ring that grows and fades | 1A | partial | unit `cursor::tests::a_ring_is_a_ring_not_a_disc`, `ring_grows_fades_and_expires`, `cursor_is_composited_at_its_hotspot`; `x11::tests::a_click_draws_a_ring_at_the_pointer` (real X server, XTEST click). Wayland: no button events through a portal, so `--clicks` warns and records the cursor only |
 | `-t/--duration` | Exact, counted in output frames; pauses don't count | Identical: grid slots + `reached_limit` | 0 | done | selftest `sync` (300 frames for `-t 5`), selftest `pause-resume` (300 frames with a 2 s pause) |
 | `--mic-backend` | `sck` or `avcapture` (macOS) | `pipewire` (default) or `pulse`; `sck`/`avcapture` map with a message | 0 | done | unit `record::tests::mic_backend_maps_upstream_values` |
 | `--test-pattern [--noise]` | Flash + beep source for self-tests | Same, CPU frames, BGRA/I420 | 0 | done | unit `synth::tests::pattern_timeline`, `beep_starts_on_each_second`, `source_emits_on_the_grid`; selftest `pattern-1080-h264` |
@@ -40,9 +40,9 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--stream DEST` (repeatable) | RTMP(S)/WHIP, platform shortcuts | Same URLs and presets, built-in clients | 1D | todo | unit `live::tests::services_expand_and_are_recognized`, `shared_preset_fits_every_destination` |
 | `--no-record` | Replay/stream only | Same rule (needs replay or stream) | 1D | todo | unit `tests::bad_arguments_are_rejected` |
 | `--live-resolution/--stream-bitrate/--stream-codec/--keyframe/--vbr/--audio-bitrate` | Live encode controls | Same parsing, presets and clamping | 0 (parse/config), 1D (encode) | partial | unit `settings::tests::live_encode_fits_every_enabled_destination` |
-| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout; each list reports its phase until the source lands | 0 (shape), 1A/1B | partial | `rec-rs devices` output in the phase report |
+| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout. Displays and windows come from RandR/EWMH (also under XWayland); a Wayland session without X11 prints that the system picker chooses instead of an empty list. Cameras and microphones report phase 1B | 0 (shape), 1A/1B | partial | selftest `screen-x11` runs `devices` and matches `[1] id`; live tests `a_monitor_and_a_window_are_enumerated` |
 | `probe FILE` command | AVFoundation: playable, tracks, codecs, full sample decode, non-zero exit on error | GStreamer: qtdemux structure + `uridecodebin` decode of every sample | 0 | done | selftest uses it on every case (`.probe` files); `ffmpeg -v error -f null` cross-check |
-| `permissions [--request]` | TCC status and prompts | Portal/PipeWire/camera/secret-service availability | 1A | todo | prints "unknown (not implemented yet, phase 1A/1B)" |
+| `permissions [--request]` | TCC status and prompts | ScreenCast version, source types, cursor modes, whether a grant is stored, whether PipeWire runs. `--request` runs the portal dialog once and stores the restore token (0600, `$XDG_STATE_HOME/rec-rs/portal-token`). Mic/camera lines report phase 1B | 1A | partial | unit `portal::tests::cursor_modes_fall_back_to_what_the_portal_offers`; selftest `screen-token` (`permissions --request` → granted, token 0600, a corrupted token is recovered) |
 | `stop` / `pause` / `resume` | pidfile + SIGUSR1/SIGUSR2/SIGTERM | pidfile in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`), SIGINT to stop | 0 | done | unit `record::tests::pidfile_lives_in_the_runtime_dir`, `no_recorder_means_a_clear_error`; selftest `pause-resume` runs `pause`/`resume`; `stop` demo in the phase report |
 | `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux); buffer is 1D | 0 (signal), 1D (buffer) | partial | unit `record::tests::save_replay_signal_is_a_real_time_signal` |
 | `stream-key DEST [--delete]` | Keychain | Secret Service (`secret-service` crate), `REC_STREAM_KEY` meanwhile | 1D | todo | the command fails with phase 1D and names the env override |
@@ -52,25 +52,25 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) converted on the CPU to an egui texture at the preview's pixel size; the compositor hands over a GPU frame in 1C (same `record::Options::preview` tap) | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
-| Own windows excluded from capture | ScreenCaptureKit filter | Portal picks the window; own windows are excluded the same way | 1A | todo | — |
-| Preview low-power mode (half res, 15 fps) | Setting | Same: half resolution and a 15 fps wake rate | 1E | done | unit `app::preview::tests::the_preview_target_is_the_area_in_pixels`; setting round-trip in `app::ui_tests::the_settings_window_round_trips_to_settings_json` |
-| Scene: Screen | Full display or window | Same | 1A | todo | picker: unit `app::ui_tests::main_window_shows_every_card` |
-| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, wgpu rendering; the preview drag uses `compose::overlay_rect`/`snap_corner` | 0 (geometry), 1E (drag), 1C (GPU) | partial | unit `compose::tests::snapping`, `app::ui_tests::main_window_shows_every_card` |
-| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU, drawn by wgpu; all controls in the sidebar and settings | 0 (masks), 1E (controls), 1C (GPU) | partial | unit `shape_coverage`, `pill_has_round_ends`, `border_inset_mask`, snapshot `main-window.png` (overlay card) |
-| Overlay changes live while recording, baked in, no extra encode | Yes | Sent to the running session (`set_pip`); the compositor applies them in 1C | 1C | todo | the seam and its phase note: unit `app::session::tests::session_ext_names_the_compositor` |
-| Scene: Camera full frame | AVCapture | V4L2 | 1B (source), 1C (composite) | todo | — |
-| Switch scenes live if recording started with the camera | Yes | Same rule: only camera scenes are selectable while recording without a camera | 1C/1E | partial | unit `app::ui_tests::main_window_shows_every_card`; `State::can_switch_live` |
-| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2, PipeWire audio | 1A/1B | todo | the sidebar and its combos: unit `app::ui_tests::main_window_shows_every_card` |
-| Record/Stop button and timer | Yes | App | 1E | done | unit `app::tests::state_shows_the_recording_clock_and_pause`; selftest `gui` (two recordings through the app) |
-| Pause/Resume button | Yes | App (the session API exists) | 1E | done | selftest `gui` drives `rec-rs pause`/`resume` against the running app; unit `app::ui_tests::main_window_shows_every_card` |
-| Audio mixer: meter with peak hold, fader, mute, dB | Yes, after the fader | Same widgets on the same session API | 1E | done | unit `app::tests::meters_decay_and_hold_peaks`, `app::ui_tests::a_muted_channel_greys_its_meter`, `the_mute_button_toggles` |
-| Fader range −∞..+24 dB, drag/click/scroll/double-click/type | Yes | Same | 1E | done | unit `app::widgets::tests::fader_*`, `app::ui_tests::fader_follows_drag_click_scroll_and_double_click`, `the_level_can_be_typed` |
-| Level changes apply live to every track (and replay/streams) | Yes, ≤20 ms ramp | Writer follows live (`set_volumes`); ≤20 ms envelope | 0 (ramp), 1E (widget) | partial | unit `fader_glides_and_passes_unity_through`; the app sends on every fader move (`State::apply_volumes`) |
-| Reveal last / open folder | Yes | `xdg-open`; FileManager1 `ShowItems` selects the file when the file manager offers it | 1E | partial | unit `app::linux_desktop::tests::file_uris_are_escaped`, `reveal_asks_file_manager1_for_the_file`; selecting the file needs a real desktop (below) |
-| Replay buffer 15–300 s with memory use, Save Replay | Yes | Planned on the live encode; the card shows the length, memory, Save Replay and names phase 1D until then | 1D (buffer), 1E (card) | partial | unit `app::ui_tests::main_window_shows_every_card`; `app::session::tests::live_adapter_says_which_phase_owes_the_feature` |
-| Stream to YouTube/Twitch/Kick + custom servers, Go Live all-at-once, all-or-nothing | Yes | Same destinations and presets, built-in RTMP/WHIP; the card blocks Go Live without a key | 1D (clients), 1E (card) | partial | unit `app::ui_tests::go_live_needs_a_stream_key`; `app::session::tests::stream_keys_come_from_the_environment_for_now` |
-| Per-destination live status (duration, bitrate, drops, reconnect) and LIVE 2/3 | Yes | Same from the output status | 1D | todo | the card renders the status shape: `ui::stream_status`; LIVE badge in `app::ui_tests::main_window_shows_every_card` |
+| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) becomes an egui texture at the preview's pixel size, sampled in one pass on the CPU; 1C's compositor `Renderer::texture()` on the shared wgpu device replaces that copy in phase 2, and the `record::Options::preview` tap moves to the composited frame in 1G/2 | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
+| Own windows excluded from capture | ScreenCaptureKit filter | Not possible through the portal: the compositor owns the stream and a portal client cannot name windows to exclude. On X11 the recorder is an ordinary client, so its own windows are captured like any other | 1A | n-a | documented in the phase 1A notes; the app cannot exclude its window either, so on X11 a visible Rec window is in the picture (hide it with Ctrl+W); the tray keeps the recording running |
+| Preview low-power mode (half res, 15 fps) | Setting | Same setting, honoured by the preview | 1E | todo | — |
+| Scene: Screen | Full display or window | Same, scaled to the output with Lanczos | 1C (composite), 1A (capture) | partial | unit `gpu::tests::a_screen_at_the_output_size_is_bit_exact`, `a_small_screen_is_not_upscaled`, `lanczos_matches_a_cpu_reference`; golden `screen`, `screen-4k-to-1080` |
+| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, drawn by wgpu; the preview drag uses `compose::overlay_rect`/`snap_corner` and the session seam | 0 (geometry), 1C (GPU), 1E (drag) | done | unit `compose::tests::snapping`, `corners_and_free_positions`; `gpu::tests::renders_overlay_with_border_into_the_frame`, `placement_follows_the_geometry_for_corners_and_free_positions`, `mirroring_flips_the_camera`; goldens `screen-cam-rounded`, `screen-cam-pill`; drag: unit `app::ui_tests::main_window_shows_every_card` |
+| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU, drawn by wgpu; every control is in the sidebar and the settings window | 0 (masks), 1C (GPU), 1E (controls) | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow`; snapshot `main-window.png` (overlay card) |
+| Overlay changes live while recording, baked in, no extra encode | Yes | The compositor restyles from the next frame; the app sends the spec through the session seam (`set_pip`), which the writer exposes to the session in 1G | 1C (compositor), 1G/1E (session seam) | partial | `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; the seam is unit tested (`app::session::tests::session_ext_names_the_compositor`) |
+| Scene: Camera full frame | AVCapture | V4L2 into a cover-fitted, mirrored full frame | 1B (source), 1C (composite) | partial | unit `gpu::tests::the_camera_scene_covers_the_frame`, `mirroring_flips_the_camera`; golden `cam` |
+| Switch scenes live if recording started with the camera | Yes | Same rule: only camera scenes are selectable while recording without a camera; the compositor switches scenes, the writer exposes it to the session in 1G | 1C/1G/1E | partial | unit `app::ui_tests::main_window_shows_every_card`, `State::can_switch_live`; `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame` |
+| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window/region capture (1A, done), V4L2 camera and PipeWire mic (1B, todo); the sidebar lists them and passes the choice through `settings` | 1A (done), 1B (todo), 1E (UI) | partial | selftest `pattern-screen`, `screen-region`, `screen-window`, `screen-token`; unit `app::ui_tests::main_window_shows_every_card` |
+| Record/Stop button and timer | Yes | App | 1E | todo | — |
+| Pause/Resume button | Yes | App (the session API exists) | 1E | todo | session API: selftest `pause-resume` |
+| Audio mixer: meter with peak hold, fader, mute, dB | Yes, after the fader | Same widgets on the same session API | 1E | todo | levels in the status line; unit `mixer::tests::volume_gain` |
+| Fader range −∞..+24 dB, drag/click/scroll/double-click/type | Yes | Same | 1E | todo | unit `mixer::tests::volume_gain` (range and silence) |
+| Level changes apply live to every track (and replay/streams) | Yes, ≤20 ms ramp | Writer follows live (`set_volumes`); ≤20 ms envelope | 0 (ramp), 1E (widget) | partial | unit `fader_glides_and_passes_unity_through` |
+| Reveal last / open folder | Yes | `xdg-open` on the output folder | 1E | todo | — |
+| Replay buffer 15–300 s with memory use, Save Replay | Yes | Planned on the live encode | 1D | todo | — |
+| Stream to YouTube/Twitch/Kick + custom servers, Go Live all-at-once, all-or-nothing | Yes | Same destinations and presets, built-in RTMP/WHIP | 1D | todo | unit `live::tests::shared_preset_fits_every_destination` |
+| Per-destination live status (duration, bitrate, drops, reconnect) and LIVE 2/3 | Yes | Same from the output status | 1D | todo | — |
 | One encode for every destination, within all limits | Yes | Same `shared_preset` logic | 0 (choice), 1D (encode) | partial | unit `shared_preset_fits_every_destination`, `settings::tests::live_encode_fits_every_enabled_destination` |
 | Replay/stream run with or without a recording, survive recording start/stop, gaps bridged | Yes | Same design: the live encode is attached to every capture session and keeps the capture alive with the window closed | 1D | todo | the lifecycle is in place: `App::live_wanted`, `sync_preview`, `toggle_stream` |
 | Settings window: folder, container | Yes | Same, persisted as JSON; folder picker via `rfd` on the XDG portal | 0 (model), 1E (window) | done | unit `app::ui_tests::the_settings_window_round_trips_to_settings_json` |
@@ -170,8 +170,8 @@ images, so this is a description of the diff from the code and sizes):
 - Different: the top-right carries the ⋯ app menu (Settings, Check for Updates, Reveal, Open
   Folder, Quit) because Linux has no menu bar, plus the "Ctrl+Shift+R unavailable" note when the
   hotkey failed; upstream uses Dock/menu-bar items.
-- Different: no camera overlay is visible in the main snapshot (the test host has no camera and
-  the compositor is phase 1C); the overlay card and shape picker are there.
+- Different: no camera overlay is visible in the main snapshot (the test host has no camera); the
+  overlay card and shape picker are there.
 - Settings: same sections and macOS-style pop-up buttons, sliders and switch; ours adds the
   "Levels" hint row and the live-encode "up to WxH codec at N Mb/s" line. The snapshot is the light
   fallback (headless), while a desktop's appearance selects light or dark.
@@ -181,7 +181,7 @@ images, so this is a description of the diff from the code and sizes):
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
 | Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer: x264enc (H.264 High), x265enc (HEVC Main), `avenc_prores_ks` (ProRes 422); VA-API on a GPU host | 0 (software), 1C (hardware) | done | selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`, `h264-bitrate`; `ffprobe` reports h264/High and hevc/Main |
-| BT.709 tagging | Yes | `videoconvert` + encoder default (BT.709 for HD) | 1C (explicit tags) | todo | — |
+| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240, chroma averaged over each 2x2 block); the encoder declares the tags | 1C (conversion), 1G (caps) | partial | unit `gpu::tests::the_output_is_bt709_limited_range` (white 235, black 16, red 63/102/240); `gpu::yuv::tests::known_bars`, cross-checked against ffmpeg's swscale |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |
 | Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | Planned: AAC-LC 48 k stereo 256 kb/s | 1C | todo | — |
@@ -195,7 +195,7 @@ images, so this is a description of the diff from the code and sizes):
 | Webcam lag adaptation (emission waits for the slowest source) | Yes | Constant 50 ms lag in phase 0; adapts when the camera lands | 0 (lag), 1B (camera) | partial | writer `lag()`; frames on the grid (selftest) |
 | Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments | `mp4mux`/`qtmux` `fragment-duration=2000`; SIGKILL leaves a playable file | 0 | done | crash test: SIGKILL at 4.5 s → 4.0 s file that `ffmpeg -f null` decodes |
 | Edge to edge: frame has the source's aspect, no bars, never cropped | Yes | Same `fill`/`same_aspect` maths | 0 | done | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` |
-| Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a GPU clamp filter | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`) |
+| Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a clamp in the upload shader, compositing the window over the clamped edge | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`), `gpu::tests::the_corner_fill_replaces_transparent_window_corners` |
 | Camera settles 2 s before the file starts | Yes | Same 2 s gate | 1B | todo | — |
 | Audio quality: 48 kHz capture, windowed-sinc resampler continuous across buffers | Yes | Same resampler maths (ported) | 0 | done | unit `mixer::tests::resamples_seamlessly`, `resampler_removes_content_above_nyquist`, `small_jitter_snaps_to_continuous` |
 | Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter | 0 (maths), 1C (mix track) | partial | unit `mixer::tests::limiting` |
@@ -217,7 +217,7 @@ version that does it).
 | One shared live encode for replay + every stream | VideoToolbox/AudioConverter | GStreamer encode to appsink, fanned out | 1D | todo | — |
 | H.264 High / HEVC Main10, no B-frames, 2 s keyframes, CBR or ABR | Yes | Same via the live encoder | 1D | todo | preset maths: unit `live::tests::platform_presets` |
 | Enhanced RTMP HEVC (`hvc1`), fallback to H.264 | Yes | Same negotiation | 1D | todo | — |
-| Live size scaled from the recording size | Lanczos | wgpu Lanczos | 1C/1D | todo | — |
+| Live size scaled from the recording size | Lanczos | wgpu Lanczos, shared with the recording | 1C/1D | partial | scaler done: unit `gpu::tests::lanczos_matches_a_cpu_reference`; the live encode that will reuse it is 1D |
 | Replay buffer trims a GOP at a time, re-encodes audio, syncs in QuickTime and ffmpeg | Yes | Same on the packet buffer | 1D | todo | — |
 | RTMP/RTMPS client with TLS, drop a GOP when behind, reconnect with backoff | Built-in, Security.framework | Built-in port with rustls | 1D | todo | — |
 | WHIP (str0m, ICE/DTLS/SRTP, H.264+Opus, DELETE on stop, 5 s silence → reconnect) | Yes | str0m with a Linux crypto backend | 1D | todo | — |
@@ -229,15 +229,18 @@ version that does it).
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Display capture | ScreenCaptureKit, zero copy | Portal + PipeWire, dmabuf where available | 1A | todo | — |
-| Window capture | Yes | Portal window + X11 fallback | 1A | todo | — |
-| Region / crop | `--region` | `--region` | 1A | todo | parses today |
+| Display capture | ScreenCaptureKit, zero copy | Portal + PipeWire (packed BGRx/BGRA on the CPU) on Wayland, `GetImage` on X11. dmabuf/zero-copy needs phase 1C's GPU importer | 1A | done | selftest `pattern-screen`: 1280x720 @ 60/1, 180 frames, 180 distinct, `probe` + full ffmpeg decode |
+| Window capture | Yes | X11 captures the client's own drawable; Wayland uses the portal's window source when the desktop offers one (GNOME/KDE yes, wlr no) | 1A | partial | selftest `screen-window`; live test `a_window_is_captured_with_its_own_pixels` |
+| Region / crop | `--region` | `--region` | 1A | done | selftest `screen-region`; unit `format::tests::*` |
 | Application capture | No (known gap) | No | — | n-a | matches upstream |
-| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes; the picker enforces the camera rule while recording | 1C/1E | partial | unit `tests::scene_option`, `app::ui_tests::main_window_shows_every_card` |
-| Multiple displays/sources at once | No | No | — | n-a | matches upstream |
+| Cursor shown (default) | Yes, embedded by ScreenCaptureKit | Embedded by the compositor (portal) or composited from XFixes (X11) | 1A | done | live test `a_window_is_captured_with_its_own_pixels` (XFixes path); cursor modes chosen from the portal's `AvailableCursorModes` |
+| Click highlight (`--clicks`) | Yes | Ring drawn into the CPU frame; X11 only, because desktop portals do not report mouse buttons | 1A | partial | live test `a_click_draws_a_ring_at_the_pointer` (XTEST); `--clicks` warns on Wayland |
+| One-time screen permission | TCC grant | ScreenCast restore token in `$XDG_STATE_HOME/rec-rs/portal-token`, replayed through `SelectSources` | 1A | done | selftest `screen-token`; unit `token::tests::*` |
+| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes, composited on the GPU; the picker enforces the camera rule while recording | 1C/1E | partial | scene model: unit `tests::scene_option`; rendering: `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; goldens `screen`, `screen-cam-*`, `cam`; unit `app::ui_tests::main_window_shows_every_card` |
+| Multiple displays/sources at once | No | No (a portal session may hand over several streams; the first is used) | — | n-a | matches upstream |
 | System audio | Yes | PipeWire sink monitor | 1B | todo | — |
 | Microphone | Yes | PipeWire capture | 1B | todo | — |
-| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | todo | geometry done: unit `compose::tests::corners_and_free_positions` |
+| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow` |
 | Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
 | Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | done | selftest `gain`; unit `fader_glides_and_passes_unity_through`, `app::ui_tests::the_level_can_be_typed`, `a_muted_channel_greys_its_meter` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
@@ -249,8 +252,8 @@ version that does it).
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes; the app's button and `rec-rs pause`/`resume` hit the same session | 0 (CLI), 1E (app) | done | selftest `pause-resume`, `gui` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
-| Screen scaling: GPU Lanczos | Metal MPS | wgpu compute Lanczos | 1C | todo | — |
-| Live preview | Yes | CPU texture upload now, the compositor's frame in 1C | 1E | done | unit `app::preview::tests::*`; snapshot `main-window.png` |
+| Screen scaling: GPU Lanczos | Metal MPS, which antialiases a downscale | wgpu Lanczos (a = 3), separable, per plane in the encoded domain, **stretched by the reduction factor** so a downscale antialiases, edge clamp, never upscaling | 1C | done | unit `gpu::tests::lanczos_matches_a_cpu_reference` (≤2/255 against an independent CPU implementation), `downscaling_a_one_pixel_pattern_leaves_only_its_mean` (a 1-px 5K pattern leaves 0.7/255 ripple inside the frame, against 121.7 for an unstretched kernel; ffmpeg's own swscale/zimg reach 22.6/29.7 at the replicated edge against our 22.7), `the_scaler_matches_ffmpeg_lanczos` (PSNR 50.3 dB 4K→1080p, 51.4 dB 5K→1080p against swscale's Lanczos; 58.1/57.0 dB against zimg), `a_small_screen_is_not_upscaled`; golden `screen-4k-to-1080`; measured 77 ms/frame 4K→1080p and 116 ms 5K→1080p on lavapipe (`tests/golden/README.md`) |
+| Live preview | Yes | The captured frame as an egui texture now (CPU resample); 1C's compositor texture (`Renderer::texture()`) removes the copy in phase 2 | 1E (1C for the texture) | done | unit `app::preview::tests::*`; selftest `gui` (`preview frame 704x396`); snapshot `main-window.png` |
 | Level meters with peak hold, after the fader | Yes | Same | 1E | done | unit `app::tests::meters_decay_and_hold_peaks`, `app::ui_tests::a_muted_channel_greys_its_meter` |
 | Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | partial | unit `hotkey::tests::*`; needs a real desktop (below) |
 | Menu bar control | StatusItem | StatusNotifierItem | 1E | partial | unit `app::tray::tests::*`; needs a real desktop (below) |
@@ -269,7 +272,7 @@ version that does it).
 | Streaming: no SRT/multitrack, same encode for all, live ≤ recording size, changing settings needs a restart | Yes | Same limitations (parity, not a gap to fix) | 1D | todo |
 | HEVC to YouTube tested only against a local server | Yes | Same testing honestly reported | 1D | todo |
 | 8-bit SDR only | Yes | Same | — | n-a |
-| Webcam overlay burned into the video | Yes | Same | 1C | todo |
+| Webcam overlay burned into the video | Yes | Same: the compositor runs before the encoder | 1C | partial | the compositor is done and pixel-tested; the writer calls it (1G) |
 | Output latency read once at start | Yes | Same | 1B | todo |
 | Mix track resamples a non-48 kHz mic linearly per buffer upstream | Yes | Linux: the mix uses the same windowed-sinc resampler as everything else (better) | 1C | todo |
 | Re-confirmation prompt for screen recording | macOS-only | n-a: the portal's restore token avoids it | — | n-a |
@@ -292,6 +295,80 @@ for that reason.
 
 Todo (phase 1): all capture, the GPU compositor, the app, replay/streaming, packaging.
 
+## Screen capture (phase 1A)
+
+Two backends, chosen by the session type: xdg-desktop-portal's ScreenCast plus PipeWire on Wayland
+(`src/capture/screen/portal.rs`, `pipewire.rs`), and X11 directly on an X11 session (`x11.rs`).
+`REC_SCREEN_BACKEND=portal|x11` overrides the choice.
+
+What runs headless in the dev container, on every `scripts/selftest.sh` run:
+
+| Case | Session | Proves |
+|---|---|---|
+| `pattern-screen` | sway (wlroots, headless 1280x720) + xdg-desktop-portal-wlr + PipeWire | the whole Wayland pipeline: picker → PipeWire node → 1280x720 BGRA frames at a constant 60 fps, all 180 frames different (a terminal scrolling in the capture), `probe` and a full ffmpeg decode clean, and a 0600 restore token stored |
+| `screen-region` | same | `--region` crops the shared monitor to 640x480 native pixels (not a scaled 16:9 frame) |
+| `screen-token` | same | `permissions --request` runs the dialog and stores the grant; a corrupted token is ignored with a message and the recording still happens |
+| `screen-x11` | Xvfb 1280x800 | RandR enumeration (`devices` lists `[1]`), a root-window capture at the native size with motion, no portal involved |
+| `screen-window` | Xvfb + a GStreamer window | `--window gstreamer` captures that client's own 400x300 drawable, with motion |
+| `cargo test` under `scripts/screen/xvfb.sh` | Xvfb | 8 X11 unit tests, 5 of them against the live server: monitor/window enumeration, a window captured with its own pixels, `--region` capturing the pixels it names (red/blue halves), a click ring from a real XTEST click, and the region geometry |
+
+### Needs a real desktop
+
+The container has no GPU, no output attached to a real compositor, no pointer hardware and no
+desktop portal other than xdg-desktop-portal-wlr. These are the checks to run on a real machine,
+in order, on **GNOME Wayland** and **KDE Plasma Wayland** (and once on an X11 session):
+
+1. `rec-rs permissions` → `not granted yet - ScreenCast vX; monitors + windows; cursor ...; PipeWire running`.
+   Run `rec-rs permissions --request`: the desktop's own dialog appears once, the line says `granted`, and
+   `$XDG_STATE_HOME/rec-rs/portal-token` exists with mode 600.
+2. `rec-rs devices` on Wayland: the display list either comes from XWayland's RandR (then the pixel
+   sizes are the logical sizes) or says the picker chooses. Window list: same.
+3. `rec-rs record -t 5 -o /tmp/display.mp4`: the picker appears (first run only), a monitor is shared,
+   the start line names it, `rec-rs probe /tmp/display.mp4` is clean and the file is not black. Record
+   again: **no picker** (the token was reused).
+4. `--no-cursor`: the pointer is absent from the file, and only from the file.
+5. `--clicks`: on GNOME/KDE the run warns that portals send no button state and the cursor is recorded
+   without highlights; on an X11 session clicks draw a ring.
+6. `--window <app substring>` on GNOME/KDE: the picker offers windows, `--window` is only a hint;
+   check that the recorded size is the window's and that resizing the window mid-recording is
+   followed (the stream renegotiates; the writer's 1G scaler keeps the output size).
+7. `--region 100,100,800,600`: the recorded size is 800x600 (× the desktop scale), and the content is
+   that part of the screen.
+8. `--display 2` with two monitors: the picker still decides; the log names the monitor that was
+   picked. On X11, `--display 2` records the second monitor without a picker.
+9. X11 session, `--window firefox`: the window is captured even while partially covered by another
+   window (a compositor redirects it; without one, obscured content is undefined and the file shows
+   garbage where the covering window is — see the gaps below).
+10. Revoke the grant in the desktop's settings (GNOME: Settings → Privacy → Screen), then record
+    again: the picker appears with `the saved screen-capture grant was refused ...` and the recording
+    still happens.
+
+### Known gaps, with the reason
+
+- **dmabuf/zero copy.** Frames are copied to the CPU (`BGRx`/`BGRA`, or X11's `GetImage`). A
+  compositor that offers only dmabuf is an error that names phase 1C; the GPU importer is 1C's work,
+  and it is also what removes the per-frame copy.
+- **Click highlighting on Wayland.** No portal reports mouse buttons (`spa_meta_cursor` carries a
+  position and a bitmap, never a button state). `--clicks` warns and records the cursor only. X11
+  highlights clicks.
+- **`--display N` on Wayland.** The picker owns the choice; a portal has no "monitor 2" parameter.
+  The log names the monitor that was picked when XWayland's monitor list identifies it.
+- **Window substring matching on Wayland.** The same: the picker owns it, and
+  xdg-desktop-portal-wlr does not offer window sources at all (it says so and suggests `--region`).
+- **Own windows in the picture.** A portal client cannot exclude windows from a compositor's stream.
+  The app (1E) must hide its own windows while recording, as upstream's preview-window exclusion
+  did automatically.
+- **Cursor motion on a still screen.** PipeWire streams deliver frames on damage. With the cursor
+  embedded the compositor damages the stream, so the pointer is recorded; in metadata mode a pointer
+  that moves over an unchanged screen may not produce a frame, and the cursor in the file lags. X11
+  polls the pointer, so it always produces a new frame when the cursor moves.
+- **X11 `GetImage`.** One round trip and one copy per frame (no MIT-SHM, no XDamage); a 4K screen at
+  60 fps costs ~2 GB/s. Acceptable at 1080p, and the portal path is the default on Wayland anyway.
+  An SHM/Damage version is a later optimisation, not a parity gap.
+- **Obscured windows on X11 without a compositor.** `GetImage` of a window that another window covers
+  returns the server's undefined content for that area (black under Xvfb). With a compositor the
+  window is redirected and correct.
+
 ## Phase 1E summary
 
 Done (proved by tests or the self-test): the main window and settings window on egui 0.36/wgpu 30
@@ -304,8 +381,10 @@ socket, the pidfile/signal controls against the running app, quitting that final
 case that runs the real app.
 
 Partial (a named part is missing, listed per row): the preview shows the captured frame rather than
-the composited one until 1C lands; overlay restyling, scene switching at run time and the camera
-need 1B/1C; the replay buffer and streaming are 1D (the cards and their gating are here); "Reveal
+the composited one until 1G moves the `record::Options::preview` tap into the writer's emission loop
+(the compositor itself, and the shared-device texture the app will switch to, are 1C and done);
+overlay restyling and scene switching at run time wait for the session seam that 1G adds; the camera
+needs 1B; the replay buffer and streaming are 1D (the cards and their gating are here); "Reveal
 Last" selects the file only where FileManager1 exists; the tray and the global hotkeys are complete
 in code but their visibility and the portal dialog need a real desktop (manual list above).
 
@@ -313,3 +392,4 @@ Known gaps: SNI hosts disagree about title text (the tooltip carries the state e
 X11 fallback cannot be exercised under a Wayland-only session and vice versa; the update check
 opens the release page rather than replacing the binary (Flatpak and AppImage packaging own that,
 phase 1F). No audio filters and no configurable hotkeys, matching upstream.
+

@@ -366,7 +366,7 @@ mod portal {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
     use futures_util::StreamExt;
 
-    type Session = ashpd::desktop::Session<GlobalShortcuts>;
+    type Session = ashpd::desktop::Session<'static, GlobalShortcuts<'static>>;
 
     pub fn start() -> Result<tokio::sync::mpsc::UnboundedSender<Msg>, String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -390,7 +390,10 @@ mod portal {
         };
         rt.block_on(async move {
             let (gs, reason) = match GlobalShortcuts::new().await {
-                Ok(gs) => (Some(gs), String::new()),
+                // The proxy lives as long as the hotkey thread; leaking it (a
+                // few bytes, once) gives the sessions a 'static borrow, which
+                // is what ashpd's `Session<'a, T>` wants to be storable.
+                Ok(gs) => (Some(&*Box::leak(Box::new(gs))), String::new()),
                 Err(e) => (
                     None,
                     format!("the GlobalShortcuts portal is unavailable: {e}"),
@@ -399,7 +402,7 @@ mod portal {
             let mut held: HashMap<Shortcut, (Session, tokio::task::JoinHandle<()>)> =
                 HashMap::new();
             while let Some(msg) = rx.recv().await {
-                match (gs.as_ref(), msg) {
+                match (gs, msg) {
                     (Some(gs), Msg::Bind(which)) => {
                         if let Some((session, task)) = held.remove(&which) {
                             task.abort();
@@ -430,17 +433,17 @@ mod portal {
     }
 
     async fn bind(
-        gs: &GlobalShortcuts,
+        gs: &'static GlobalShortcuts<'static>,
         which: Shortcut,
     ) -> Result<(Session, tokio::task::JoinHandle<()>), String> {
         let session = gs
-            .create_session(Default::default())
+            .create_session()
             .await
             .map_err(|e| format!("the portal refused a shortcut session: {e}"))?;
         let shortcut = NewShortcut::new(which.id(), which.description())
             .preferred_trigger(Some(which.trigger()));
         let request = gs
-            .bind_shortcuts(&session, &[shortcut], None, Default::default())
+            .bind_shortcuts(&session, &[shortcut], None)
             .await
             .map_err(|e| format!("the portal refused {}: {e}", which.label()))?;
         let bound = request
