@@ -11,6 +11,16 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::widgets::{self as w};
+
+/// wgpu device creation and teardown on Mesa's lavapipe is not safe to run on
+/// several threads at once (the test binary crashed with SIGSEGV every few
+/// runs). Every test that builds a harness holds this, so one GPU context
+/// exists at a time; the whole suite still takes about a second.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu() -> std::sync::MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
 use super::{Cmd, Device, Meter, State, ui};
 use crate::settings::{Settings, StreamDest};
 
@@ -72,6 +82,7 @@ fn settings_harness(st: State) -> Harness<'static, State> {
 
 #[test]
 fn main_window_shows_every_card() {
+    let _gpu_guard = gpu();
     // Tall enough that no card is clipped: egui hides clipped widgets from the
     // accessibility tree, and the sidebar's cards would otherwise be below the
     // fold.
@@ -129,6 +140,7 @@ fn main_window_shows_every_card() {
 
 #[test]
 fn error_banner_shows_a_backend_error_and_can_be_dismissed() {
+    let _gpu_guard = gpu();
     let mut st = full_state(crate::compose::Scene::Screen);
     st.error =
         Some("Preview unavailable: the live encode is not implemented yet (phase 1D)".into());
@@ -187,6 +199,7 @@ fn x_of(s: &FaderState, db: f32) -> f32 {
 
 #[test]
 fn fader_follows_drag_click_scroll_and_double_click() {
+    let _gpu_guard = gpu();
     let mut h = fader_harness(-10.0);
     let r = h.state().rect;
 
@@ -320,6 +333,7 @@ fn channel_harness(db: f32, muted: bool) -> Harness<'static, Chan> {
 
 #[test]
 fn a_muted_channel_greys_its_meter() {
+    let _gpu_guard = gpu();
     // The meter's green zone is unique in the UI, so count its pixels.
     let green = |h: &mut Harness<'_, Chan>| {
         let img = h.render().expect("render");
@@ -348,6 +362,7 @@ fn a_muted_channel_greys_its_meter() {
 
 #[test]
 fn the_level_can_be_typed() {
+    let _gpu_guard = gpu();
     let mut h = channel_harness(-6.0, false);
     // The level field is the only text-editable value in the channel.
     h.get_by_role(egui::accesskit::Role::SpinButton).focus();
@@ -373,6 +388,7 @@ fn the_level_can_be_typed() {
 
 #[test]
 fn the_mute_button_toggles() {
+    let _gpu_guard = gpu();
     let mut h = channel_harness(0.0, false);
     // The mute button's accessibility label is its hover text.
     let mute = h.get_by_label_contains("Mute System");
@@ -386,6 +402,7 @@ static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn the_settings_window_round_trips_to_settings_json() {
+    let _gpu_guard = gpu();
     let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("rec-ui-settings-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -421,6 +438,7 @@ fn the_settings_window_round_trips_to_settings_json() {
 
 #[test]
 fn go_live_needs_a_stream_key() {
+    let _gpu_guard = gpu();
     let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { std::env::remove_var("REC_STREAM_KEY") };
     let settings = Settings {
@@ -466,6 +484,7 @@ fn go_live_needs_a_stream_key() {
 
 #[test]
 fn the_app_menu_has_updates_unless_flatpak() {
+    let _gpu_guard = gpu();
     let mut st = State::new(Settings::default());
     st.updates = true;
     let mut h = main_harness(st);
@@ -492,6 +511,7 @@ fn the_app_menu_has_updates_unless_flatpak() {
 
 #[test]
 fn the_live_encode_section_is_locked_while_streaming() {
+    let _gpu_guard = gpu();
     let st = full_state(crate::compose::Scene::Screen);
     let mut h = settings_harness(st);
     // Not streaming: the "Platform preset" checkbox toggles.
@@ -522,6 +542,7 @@ fn the_live_encode_section_is_locked_while_streaming() {
 
 #[test]
 fn snapshots_of_the_main_and_settings_windows() {
+    let _gpu_guard = gpu();
     // The reference images live in tests/snapshots; UPDATE_SNAPSHOTS=1 rewrites
     // them (the layout is compared pixel by pixel). Two harnesses in one test
     // have to report through one SnapshotResults.

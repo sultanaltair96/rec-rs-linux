@@ -124,7 +124,9 @@ assertions; the rest say why not):
 
 New app tests beyond those: `app::theme` (3), `app::preview` (6), `app::control` (4), `app::tray`
 (3), `app::install` (10), `app::updater` (3), `app::linux_desktop` (2), `app::session` (4),
-`app::mod` (4), `app::ui` (3), `hotkey` (5), and the 11 `egui_kittest` UI tests.
+`app::mod` (4), `app::ui` (3), `hotkey` (5), and the 11 `egui_kittest` UI tests. Those 11 create a wgpu device each; they hold a test-wide
+mutex because concurrent device creation on Mesa's lavapipe crashed the test binary every few runs
+(the whole suite still takes about 3 s).
 
 ### Needs a real desktop (manual checks, phase 1E)
 
