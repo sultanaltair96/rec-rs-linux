@@ -1136,7 +1136,6 @@ impl Renderer {
     /// at full resolution and a chroma pass at half resolution.
     fn yuv(&self, device: &wgpu::Device, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder) {
         let (w, h) = (self.width, self.height);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let src = self.tex.frame.as_ref().expect("ensured").view.clone();
         let mut uni = Uni::new();
         uni.vec4(&[w as f32, h as f32, 0.0, 0.0]);
@@ -1171,7 +1170,6 @@ impl Renderer {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            (w, h),
         );
         // Chroma: one fragment per 2x2 block.
         match self.output {
@@ -1203,7 +1201,6 @@ impl Renderer {
                             },
                         }),
                     ],
-                    (cw, ch),
                 );
             }
             _ => {
@@ -1222,7 +1219,6 @@ impl Renderer {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    (cw, ch),
                 );
             }
         }
@@ -1237,9 +1233,7 @@ impl Renderer {
         pipeline: &wgpu::RenderPipeline,
         bind: &wgpu::BindGroup,
         attachments: &[Option<wgpu::RenderPassColorAttachment<'_>>],
-        size: (u32, u32),
     ) {
-        let _ = size;
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: attachments,
