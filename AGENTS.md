@@ -132,6 +132,7 @@ PR or merge unless the parent says so.
 | `REC_SYNTH_DROP_AUDIO=N` | The test pattern drops every Nth audio buffer, like a glitching device |
 | `REC_AAC_PRIMING=N` | Override the encoder priming the writer trims (0 disables it) |
 | `REC_FRAGMENT_SECS=N` | Fragment interval for the muxer (0 = one regular movie, for comparison) |
+| `REC_PATTERN_SYSTEM_AUDIO=pipewire` | Test hook: with `--test-pattern`, capture real system audio instead of the pattern's beeps |
 | `REC_STREAM_KEY` | Stream key override until the Secret Service lands (phase 1D) |
 
 ## Testing philosophy
