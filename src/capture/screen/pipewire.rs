@@ -282,6 +282,14 @@ fn run(
         let main = main.clone();
         move |_| main.quit()
     });
+    // Test hook: leave `run()` with the loop created and immediately freed, so
+    // a test can stop a capture whose loop is already gone without waiting for
+    // a compositor to drop a stream at the right moment. `cfg(test)` removes it
+    // from every real build.
+    #[cfg(test)]
+    if EXIT_BEFORE_RUN.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
     if stop.load(Ordering::SeqCst) {
         main.quit();
     }
@@ -810,6 +818,10 @@ fn process_frames(
 #[cfg(test)]
 static LOOPS_EXITED: AtomicUsize = AtomicUsize::new(0);
 
+/// Makes the next `run()` return as soon as its loop exists (see the tests).
+#[cfg(test)]
+static EXIT_BEFORE_RUN: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 fn loops_exited() -> usize {
     LOOPS_EXITED.load(Ordering::SeqCst)
@@ -853,6 +865,47 @@ mod tests {
         assert_eq!(pods.len(), 2, "BGRx and BGRA");
         for pod in &pods {
             assert!(Pod::from_bytes(pod).is_some());
+        }
+    }
+
+    /// Stop a capture whose PipeWire loop is already gone.
+    ///
+    /// The hook makes the capture thread leave `run()` the instant its loop
+    /// exists, so the loop is created and freed before `halt` is called: the
+    /// ordering that used to call `pw_main_loop_quit` on freed memory. This
+    /// needs no portal, so it runs on every `cargo test`.
+    #[test]
+    fn stopping_a_capture_whose_loop_already_exited_is_safe() {
+        // A regular file is not a PipeWire socket; with the hook returning
+        // first, it is never even used as one.
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let sink: FrameSink = Arc::new(|_| {});
+        for i in 0..50 {
+            let before = loops_exited();
+            let mut stream = Stream::new(
+                1,
+                fd.try_clone().unwrap(),
+                None,
+                CaptureOptions::default(),
+                format!("dead-loop-{i}"),
+            );
+            EXIT_BEFORE_RUN.store(true, Ordering::SeqCst);
+            stream.begin(sink.clone()).unwrap();
+            // Wait until the thread has left `run()` *and dropped the loop*, so
+            // the ordering is fixed rather than raced.
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while loops_exited() == before && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                loops_exited() > before,
+                "the capture loop never left run() (cycle {i})"
+            );
+            // Stopping a capture that is already gone is a no-op: not a hang,
+            // and not a quit through a pointer into freed memory.
+            stream
+                .halt()
+                .unwrap_or_else(|e| panic!("stop after the loop exited failed: {e:#}"));
         }
     }
 
