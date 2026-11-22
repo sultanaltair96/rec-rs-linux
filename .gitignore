@@ -1,0 +1,17 @@
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local tooling and artifacts
+.hermes/
+.bb/
+.DS_Store
+*.log
+/target/
+/dist/
+/build/
