@@ -335,3 +335,17 @@ Flatpak portal host. These are the exact checks to run on a real machine:
    case).
 6. **Bluetooth microphone.** `--mic <headset>` must select it, and `--mic-offset-ms N` must move the
    mic track against the video flash the way upstream's mic offset does.
+
+### Known gaps (phase 1B)
+
+- **Default sink changes mid-recording are not followed.** System audio is linked to the sink that
+  was the default when the source opened (a target-pinned PipeWire stream is not moved by
+  WirePlumber), so switching outputs needs a new session. Upstream reads the output latency once at
+  start too; the app (1E) or the writer's restart path (1G) can reopen the source later.
+- **The camera is not wired into `record` yet.** `Session::start_sources` is 1G's: it will call
+  `camera::open_source`, feed the compositor and pass `settle_remaining()` to the writer's camera
+  gate. Until then `record --webcam` still says phase 1B.
+- **The camera portal path is untested at run time.** It compiles and its matching logic is unit
+  tested, but this host has no Flatpak portal camera; the manual checklist above is the proof.
+- **MJPEG decoding is on the CPU** (zune-jpeg). Fine for a 720p/1080p webcam on one core; a 4K MJPEG
+  camera would want the GPU path, which is not claimed.
