@@ -11,7 +11,11 @@
 #
 # Everything is headless: no display server, no GPU, no audio hardware. The
 # GStreamer test sources and the synthetic test pattern stand in for a desktop
-# until phase 1 capture lands.
+# until phase 1 capture lands. The image does carry the *software* versions of
+# those pieces — a headless sway + portal session, llvmpipe Vulkan, pipewire,
+# a keyring and V4L2 tools — so phase 1 workers can test against them, and it
+# enables RPM Fusion so the encoder story matches upstream (H.264 High with
+# bitrate control, HEVC). Packaging (Flatpak/AppImage) is a separate decision.
 FROM fedora:43
 
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -36,19 +40,51 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         libX11-devel libxcb-devel dbus-devel libv4l-devel openssl-devel \
     && dnf -y clean all
 
+# --- RPM Fusion -----------------------------------------------------------
+# Fedora's free repositories have no x264enc, no x265enc, no VA-API encoder
+# and a gst-libav built from ffmpeg-free, so an unmodified image can only
+# record H.264 Constrained Baseline at an unbounded bitrate and cannot record
+# HEVC at all. A recorder's *dev* image may use RPM Fusion: it provides
+# x264enc, x265enc, a full ffmpeg (and so avdec_h264/avdec_h265 for gst-libav)
+# and the VA-API plugin packages. Whether the shipped Flatpak/AppImage may do
+# the same is a packaging question for phase 1F.
+RUN dnf -y install \
+        https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-43.noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-43.noarch.rpm \
+    && dnf -y makecache && dnf -y clean all
+
 # --- runtime: GStreamer plugins, PipeWire, ffmpeg (ffprobe in tests) -------
-# Fedora's free repositories have no x264enc, no x265enc and no VA-API H.264
-# encoder, and gst-libav is built from ffmpeg-free (no libx264/libx265), so
-# the only H.264 encoder here is openh264enc. AAC comes from fdkaacenc or
-# avenc_aac, ProRes 422 from avenc_prores_ks. dev/ELEMENTS.md records what
-# this image actually has (generated from gst-inspect-1.0).
+# Encoders: x264enc (H.264, profile High, rate control honoured), x265enc
+# (HEVC), openh264enc (fallback), avenc_prores_ks (ProRes 422), fdkaacenc and
+# avenc_aac (AAC). The VA-API elements (vah264enc/vaapih265enc and the older
+# vaapih264enc) come from gstreamer1-vaapi, but GStreamer registers no VA
+# factory without a working VA display: with no GPU the elements are present in
+# the packages and NOT in gst-inspect's list. dev/ELEMENTS.md records exactly
+# what this image has, and the writer probes an encoder before using it, so a
+# GPU-less host records with x264enc.
+#
+# Test harness for the phase 1 workers (one image, so nobody rebuilds later):
+#   - sway + foot + xdg-desktop-portal(-wlr) + dbus + Xvfb: a headless desktop
+#     for screen capture (1A) and the app (1E)
+#   - mesa-vulkan-drivers (lavapipe) + vulkan-tools: a software Vulkan device
+#     for wgpu (1C)
+#   - pipewire-gstreamer + pipewire-pulseaudio + pulseaudio-utils: attempt to
+#     check pipewiresrc/pipewiresink and pactl against a session
+#   - gnome-keyring + libsecret: the Secret Service (1D)
+#   - v4l-utils: camera device inspection (1B)
 RUN dnf -y install --setopt=install_weak_deps=False \
         gstreamer1 gstreamer1-plugins-base \
         gstreamer1-plugins-good gstreamer1-plugins-bad-free \
-        gstreamer1-plugins-bad-free-extras gstreamer1-plugins-ugly-free \
-        gstreamer1-plugin-openh264 gstreamer1-plugin-libav \
+        gstreamer1-plugins-bad-free-extras \
+        gstreamer1-plugins-ugly gstreamer1-plugins-bad-freeworld \
+        gstreamer1-vaapi gstreamer1-plugin-openh264 gstreamer1-plugin-libav \
         pipewire pipewire-utils wireplumber \
-        ffmpeg-free python3 \
+        pipewire-gstreamer pipewire-pulseaudio pulseaudio-utils \
+        ffmpeg python3 \
+        sway foot xdg-desktop-portal xdg-desktop-portal-wlr \
+        dbus-daemon dbus-tools dbus-broker xorg-x11-server-Xvfb \
+        mesa-vulkan-drivers mesa-dri-drivers vulkan-loader vulkan-tools \
+        gnome-keyring libsecret v4l-utils \
     && dnf -y clean all
 
 # --- Rust: rustup stable (>= 1.85 for edition 2024) + clippy + rustfmt -----

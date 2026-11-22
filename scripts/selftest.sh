@@ -33,9 +33,10 @@ wanted() { [ -z "$(echo "$only" | tr -d ' ')" ] || [ "${only#* $1 }" != "$only" 
 
 case "${1:-}" in
     --list)
-        echo "pattern-1080-h264 pattern-mp4 pattern-prores sync audio-gaps pause-resume gain"
-        echo "skipped: pattern-4k-hevc pattern-hevc pattern-screen pattern-webcam pattern-mic"
-        echo "         stream-rtmp stream-whip replay gui"
+        echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
+        echo "h264-bitrate sync audio-gaps pause-resume gain"
+        echo "skipped: pattern-screen pattern-webcam pattern-mic stream-rtmp stream-whip"
+        echo "         replay gui"
         exit 0 ;;
 esac
 
@@ -61,14 +62,31 @@ check pattern-1080-h264 --test-pattern -t 3 --no-mic
 check pattern-mp4 --test-pattern -t 2 --no-mic
 # ProRes 422 (avenc_prores_ks; needs .mov).
 check pattern-prores --test-pattern -t 2 --codec prores --no-mic
+# HEVC Main (x265enc, RPM Fusion's gst-plugins-bad-freeworld).
+check pattern-hevc --test-pattern -t 2 --codec hevc --no-mic
+# 4K60 through the automatic codec choice: hevc above 1080p, upstream's rule.
+check pattern-4k-hevc --test-pattern --noise -r 4k -t 2 --no-mic
 
-# H.264 costs few bits and the encoder is openh264enc in Fedora's free repos;
-# there is no HEVC encoder there at all (dev/ELEMENTS.md).
-if wanted pattern-hevc; then
-    echo "SKIP  pattern-hevc  (phase 1C: no HEVC encoder in Fedora's free repos; dev/ELEMENTS.md)"; skip=$((skip+1))
-fi
-if wanted pattern-4k-hevc; then
-    echo "SKIP  pattern-4k-hevc  (phase 1C: no HEVC encoder in Fedora's free repos; dev/ELEMENTS.md)"; skip=$((skip+1))
+# Bitrate and profile: a 1080p60 H.264 recording asked for 8 Mb/s must land
+# within 25% of it, at profile High (upstream's H.264 profile; the
+# free-repository fallback openh264enc can only do Constrained Baseline, and
+# dev/ELEMENTS.md records that x265enc needs its VBV to stay on budget).
+if wanted h264-bitrate; then
+    f="$OUT/h264-bitrate.mp4"
+    profile=""
+    rate=0
+    if timeout "$TIMEOUT" "$REC" record -q --test-pattern --noise --bitrate 8 -t 5 --no-mic -o "$f" \
+           >/dev/null 2>"$OUT/h264-bitrate.log"; then
+        profile=$(ffprobe -v error -select_streams v -show_entries stream=profile -of csv=p=0 "$f")
+        rate=$(ffprobe -v error -select_streams v -show_entries stream=bit_rate -of csv=p=0 "$f")
+    fi
+    if [ "$profile" = High ] && awk -v r="$rate" 'BEGIN { exit !(r >= 6000000 && r <= 10000000) }'; then
+        echo "PASS  h264-bitrate  (profile $profile, $(awk -v r="$rate" 'BEGIN { printf "%.2f", r / 1e6 }') Mb/s for --bitrate 8)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  h264-bitrate  (profile '$profile', ${rate} b/s; see $OUT/h264-bitrate.log)"
+        fail=$((fail+1))
+    fi
 fi
 
 # A/V sync: the test pattern flashes white and beeps at the same instant. The

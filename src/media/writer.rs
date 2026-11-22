@@ -757,9 +757,16 @@ pub fn video_encoder_candidates(codec: Codec) -> &'static [&'static str] {
             "vaapih264enc",
             "x264enc",
             "openh264enc",
+            "avenc_libx264",
             "avenc_h264",
         ],
-        Codec::Hevc => &["vah265enc", "vaapih265enc", "x265enc", "avenc_hevc"],
+        Codec::Hevc => &[
+            "vah265enc",
+            "vaapih265enc",
+            "x265enc",
+            "avenc_libx265",
+            "avenc_hevc",
+        ],
         Codec::Prores => &["avenc_prores_ks"],
     }
 }
@@ -808,8 +815,17 @@ fn make_encoder(
     bitrate_bps: u64,
     fps: Option<u32>,
     label: &str,
+    probe_format: Option<&str>,
 ) -> Result<(gst::Element, String)> {
     for name in candidates {
+        // VA-API needs a render node: without /dev/dri the plugin registers no
+        // elements at all (dev/ELEMENTS.md), and with a node but a broken driver
+        // the trial encode below fails and the next candidate is used.
+        if (name.starts_with("vah") || name.starts_with("vaapi"))
+            && !std::path::Path::new("/dev/dri").exists()
+        {
+            continue;
+        }
         if !has_element(name) {
             continue;
         }
@@ -859,18 +875,142 @@ fn make_encoder(
                     el.set_property_from_str("speed-preset", "veryfast");
                 }
             }
+            "x265enc" => {
+                // x265's zerolatency tune also disables B-frames, which keeps the
+                // frame grid simple (upstream writes no B-frames either).
+                set(&el, "tune", "zerolatency");
+                set(&el, "speed-preset", "veryfast");
+                // ABR alone lets x265 run away on very noisy frames (83 Mb/s
+                // for a requested 8 Mb/s was measured); a half-second VBV pins
+                // it to the budget (8.7-9.7 Mb/s, dev/ELEMENTS.md).
+                let kbps = (bitrate_bps / 1000).max(1);
+                set(
+                    &el,
+                    "option-string",
+                    format!("vbv-maxrate={kbps}:vbv-bufsize={}", (kbps / 2).max(1)),
+                );
+            }
             "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
                 el.set_property_from_str("rate-control", "cbr");
             }
             _ => {}
         }
+        if let Some(format) = probe_format
+            && (name.starts_with("vah") || name.starts_with("vaapi"))
+            && !trial_encode(&el, format)
+        {
+            continue;
+        }
+        if std::env::var_os("REC_DEBUG").is_some() {
+            // x265 prints its banner (rate control, bitrate) at info level.
+            if *name == "x265enc" {
+                set(&el, "log-level", 4);
+            }
+            let mut dump = vec![];
+            for prop in [
+                "bitrate",
+                "tune",
+                "speed-preset",
+                "key-int-max",
+                "gop-size",
+                "qp",
+            ] {
+                if el.find_property(prop).is_some() {
+                    dump.push(format!("{prop}={:?}", el.property_value(prop)));
+                }
+            }
+            eprintln!("rec: debug: encoder {name}: {}", dump.join(" "));
+        }
         return Ok((el, name.to_string()));
     }
     bail!(
-        "no {label} encoder is installed: tried {}. Install one (x264enc comes with gst-plugins-ugly; Fedora's \
-         free repositories only have openh264enc for H.264 and no HEVC encoder at all)",
+        "no {label} encoder is installed: tried {}. Install one (x264enc comes with RPM Fusion's \
+         gst-plugins-ugly, x265enc with gst-plugins-bad-freeworld; openh264enc is the free-repository \
+         fallback for H.264 and there is no HEVC encoder without RPM Fusion)",
         candidates.join(", ")
     )
+}
+
+/// Encode a couple of test frames through a candidate element, to prove it can
+/// actually run. A VA-API encoder whose driver cannot open a display fails here
+/// instead of failing the recording.
+///
+/// Returns false on any error or after 3 seconds.
+fn trial_encode(el: &gst::Element, format: &str) -> bool {
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", format)
+        .field("width", 320i32)
+        .field("height", 240i32)
+        .field("framerate", gst::Fraction::new(30, 1))
+        .build();
+    let pipeline = gst::Pipeline::new();
+    let Ok(src) = gst::ElementFactory::make("videotestsrc").build() else {
+        return false;
+    };
+    set(&src, "num-buffers", 3);
+    let Ok(convert) = gst::ElementFactory::make("videoconvert").build() else {
+        return false;
+    };
+    let Ok(filter) = gst::ElementFactory::make("capsfilter").build() else {
+        return false;
+    };
+    filter.set_property("caps", &caps);
+    let Ok(sink) = gst::ElementFactory::make("fakesink").build() else {
+        return false;
+    };
+    set(&sink, "sync", "false");
+    if pipeline
+        .add_many([&src, &convert, &filter, el, &sink])
+        .is_err()
+    {
+        return false;
+    }
+    if gst::Element::link_many([&src, &convert, &filter, el, &sink]).is_err() {
+        return false;
+    }
+    if pipeline.set_state(gst::State::Playing).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return false;
+    }
+    let Some(bus) = pipeline.bus() else {
+        let _ = pipeline.set_state(gst::State::Null);
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut ok = false;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_nseconds(left.as_nanos() as u64),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        ) else {
+            continue;
+        };
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(_) => {
+                ok = true;
+                break;
+            }
+            MessageView::Error(err) => {
+                if std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!("rec: debug: {} cannot encode: {}", el.name(), err.error());
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    if !ok {
+        // Take the element out of the pipeline it was tested in, so it can be
+        // added to the real one.
+        let _ = el.set_state(gst::State::Null);
+    }
+    ok
 }
 
 /// Build the pipeline and the muxed output file.
@@ -890,11 +1030,20 @@ fn open_sink(
         bail!("ProRes needs a .mov output");
     }
     let pipeline = gst::Pipeline::new();
+    // The pixel layout handed to the encoder decides the H.264/HEVC profile:
+    // x264enc with no constraint negotiates 4:4:4 and encodes "High 4:4:4
+    // Predictive" instead of upstream's 4:2:0 High, and ProRes 422 needs 4:2:2
+    // 10-bit. An explicit capsfilter is what pins it.
+    let enc_format = match spec.codec {
+        Codec::H264 | Codec::Hevc => "I420",
+        Codec::Prores => "I422_10LE",
+    };
     let (venc, vename) = make_encoder(
         video_encoder_candidates(spec.codec),
         spec.bitrate,
         Some(spec.fps),
         "video",
+        Some(enc_format),
     )?;
 
     let video_caps = gst::Caps::builder("video/x-raw")
@@ -912,6 +1061,16 @@ fn open_sink(
         .build();
     set(video_src.upcast_ref(), "max-buffers", 4);
     let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
+    let enc_capsfilter = gst::ElementFactory::make("capsfilter").build()?;
+    enc_capsfilter.set_property(
+        "caps",
+        gst::Caps::builder("video/x-raw")
+            .field("format", enc_format)
+            .field("width", spec.width as i32)
+            .field("height", spec.height as i32)
+            .field("framerate", gst::Fraction::new(spec.fps as i32, 1))
+            .build(),
+    );
     let vqueue = gst::ElementFactory::make("queue").build()?;
     // Bounded, and leaky downstream: a slow encoder loses old frames instead of
     // stalling the capture thread.
@@ -945,7 +1104,12 @@ fn open_sink(
     filesink.set_property("location", path.to_string_lossy().to_string());
     filesink.set_property("sync", false);
 
-    let mut chain: Vec<gst::Element> = vec![video_src.clone().upcast(), videoconvert, venc];
+    let mut chain: Vec<gst::Element> = vec![
+        video_src.clone().upcast(),
+        videoconvert,
+        enc_capsfilter,
+        venc,
+    ];
     if let Some(p) = parser {
         chain.push(p);
     }
@@ -986,7 +1150,7 @@ fn open_sink(
             .build();
         for (n, kind) in kinds.iter().enumerate() {
             // One encoder per track: a shared one would interleave the streams.
-            let (aenc, aname) = make_encoder(AUDIO_ENCODER_CANDIDATES, 256_000, None, "AAC")?;
+            let (aenc, aname) = make_encoder(AUDIO_ENCODER_CANDIDATES, 256_000, None, "AAC", None)?;
             audio_name = aname.clone();
             let src = gstreamer_app::AppSrc::builder()
                 .name(format!("audio-{}", kind.label()))

@@ -22,8 +22,8 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--region X,Y,W,H` | Crop a display region (points) | Same, in logical units | 1A | todo | parses + conflicts with `--window`: unit `tests::bad_arguments_are_rejected` |
 | `-r/--resolution` | 720p/1080p/1440p/4k/native/WxH, source aspect, never upscaled | Identical maths (ported) | 0 | done | unit `tests::sizes` (incl. portrait, odd sizes, 16:10 examples) |
 | `-f/--fps` | 24/25/30/50/60/120 (divisors of 60000) | Same validation and grid | 0 | done | unit `tests::bad_arguments_are_rejected`; selftest CFR check |
-| `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection; HEVC/ProRes need an encoder the host has | 0 (choice), 1C (encoders) | partial | selftest `pattern-prores`; `pattern-hevc` skipped with the element reason |
-| `--bitrate` | Mb/s, else bits/pixel heuristic | Same heuristic (ported); the encoder honours it where the element supports rate control (x264, VA-API) | 0 (heuristic), 1C (encoders) | partial | unit `tests::test_pattern_prepares_without_a_display` (4K ≥ 30 Mb/s); openh264enc ignores it (dev/ELEMENTS.md) |
+| `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection and same automatic rule | 0 | done | selftest `pattern-prores`, `pattern-hevc`, `pattern-4k-hevc` (`-r 4k` picks HEVC by itself) |
+| `--bitrate` | Mb/s, else bits/pixel heuristic | Same heuristic (ported); x264enc/x265enc honour it | 0 | done | unit `tests::test_pattern_prepares_without_a_display` (4K ≥ 30 Mb/s); selftest `h264-bitrate`: 8 Mb/s requested → 8.10 Mb/s at profile High |
 | `--system-audio` / `--no-system-audio` | On by default, flags override each other | Same | 0 | done | unit `tests::system_audio_flags_override_each_other`; selftest `gain` (system track) |
 | `--mic DEVICE` / `--no-mic` | Default mic, id or name substring | PipeWire node by id/name | 1B | todo | parses: unit `tests::goal_command_line_parses`; unavailable mic warns and continues |
 | `-w/--cam/--webcam [DEVICE]` | Webcam overlay, default or device | V4L2 (or camera portal in Flatpak) | 1B | todo | parses: unit `tests::goal_command_line_parses` |
@@ -94,7 +94,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer (openh264enc / x264 / VA-API; ProRes via `avenc_prores_ks`). In the dev image openh264enc gives Constrained Baseline; x264/VA-API on a desktop give High | 0 (H.264, ProRes), 1C (HW/HEVC, profile) | partial | selftest `pattern-1080-h264`, `pattern-mp4`, `pattern-prores`; `ffprobe` reports h264 / prores, profile Constrained Baseline (dev/ELEMENTS.md) |
+| Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer: x264enc (H.264 High), x265enc (HEVC Main), `avenc_prores_ks` (ProRes 422); VA-API on a GPU host | 0 (software), 1C (hardware) | done | selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`, `h264-bitrate`; `ffprobe` reports h264/High and hevc/Main |
 | BT.709 tagging | Yes | `videoconvert` + encoder default (BT.709 for HD) | 1C (explicit tags) | todo | — |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |
@@ -155,7 +155,7 @@ version that does it).
 | Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
 | Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | partial | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
-| Hardware H.264/HEVC | VideoToolbox | VA-API on desktops; none in the dev image | 1C | todo | dev/ELEMENTS.md |
+| Hardware H.264/HEVC | VideoToolbox | VA-API on a GPU host; the container has no GPU, so it records with x264enc/x265enc (the writer skips VA without /dev/dri and trial-encodes it otherwise) | 1C | todo | dev/ELEMENTS.md |
 | ProRes | 422 | `avenc_prores_ks` 422 | 0 | done | selftest `pattern-prores` |
 | 10-bit / HDR | No | No | — | n-a | matches upstream |
 | Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
@@ -197,6 +197,11 @@ ProRes writer with an AAC system track and crash-safe fragments, `probe`, the pl
 the pidfile/signal control, and the sync/level/self-test scripts.
 
 Partial (a named part is missing, listed per row): mix and mic tracks, BT.709 colour tagging,
-webcam lag adaptation, GPU compositing, system-audio latency, HEVC.
+webcam lag adaptation, GPU compositing, system-audio latency, hardware encoding.
+
+Known items owned by phase 1C (not fixed here): the first ~10 ms of audio in a file fades in
+because the AAC priming frames are dropped instead of trimmed with an MP4 edit list (+9.9 ms on the
+first beep, 0.0 ms after), and the self-test's sync threshold is 20 ms rather than upstream's 1 ms
+for that reason.
 
 Todo (phase 1): all capture, the GPU compositor, the app, replay/streaming, packaging.

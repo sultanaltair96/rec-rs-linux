@@ -33,9 +33,18 @@ volume `rec-rs-linux-cache`, and sets `CARGO_TARGET_DIR` to
 worktrees never wait on each other's build lock. The release binary is therefore at
 `$CARGO_TARGET_DIR/release/rec-rs` in the container, which `scripts/selftest.sh` finds by itself.
 
-What GStreamer elements the image has — and which are missing from Fedora's free repositories — is
-measured in [`dev/ELEMENTS.md`](dev/ELEMENTS.md). `--codec hevc` genuinely has no encoder there;
-that is a packaging item (phase 1C/1F), not a bug in the writer.
+The image enables **RPM Fusion** (free + nonfree), so it records like upstream: `x264enc` gives
+H.264 High with a bitrate that is honoured, `x265enc` gives HEVC Main, and `-r 4k` picks HEVC by
+itself. It also carries the phase 1 test harness — headless sway + xdg-desktop-portal, llvmpipe
+Vulkan for wgpu, PipeWire with its GStreamer plugin, gnome-keyring, V4L2 tools. What is actually
+installed, measured with `gst-inspect-1.0` and real encodes, is in
+[`dev/ELEMENTS.md`](dev/ELEMENTS.md); VA-API elements need a GPU and are absent in the container
+(the writer skips VA candidates without `/dev/dri` and falls back to x264/x265).
+
+The GStreamer registry is per image tag inside the shared cache volume
+(`GST_REGISTRY=.../registry-<Dockerfile hash>.bin`), because a registry built by an older image
+hides elements a newer image added. If an element you just installed is not listed, that path (or
+`scripts/dev.sh --clean`) is the first thing to check.
 
 ## Ownership
 

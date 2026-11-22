@@ -94,7 +94,10 @@ target="/home/dev/.cache/rec-rs-linux/target-$hash"
 
 # Pass the REC_* knobs the scripts use (test dir, synth failures, debug) and a
 # normal terminal environment through to the container.
-envs="-e CARGO_TARGET_DIR=$target -e REC_REPO=$REPO"
+# One GStreamer registry per image content: the shared volume otherwise keeps a
+# registry built by an older image, which hides elements the newer image has
+# (a stale registry reported no avdec_h264 after ffmpeg-free was replaced).
+envs="-e CARGO_TARGET_DIR=$target -e REC_REPO=$REPO -e GST_REGISTRY=/home/dev/.cache/gstreamer-1.0/registry-$content.bin"
 for name in $(env | sed -n 's/^\(REC_[A-Za-z0-9_]*\)=.*/\1/p'); do
     eval "value=\${$name}"
     envs="$envs -e $name=$value"
@@ -113,11 +116,21 @@ if [ -t 0 ] && [ -t 1 ]; then
     args="-it"
 fi
 
+# sway's binary carries cap_sys_nice=ep; executing it needs that capability in
+# the container's bounding set or every sway invocation fails with EPERM.
+caps="--cap-add SYS_NICE"
+# A GPU host gives the VA-API plugin (and a future hardware test) a real device;
+# without /dev/dri the VA elements simply are not registered (dev/ELEMENTS.md).
+if [ -d /dev/dri ]; then
+    caps="$caps --device /dev/dri:/dev/dri"
+fi
+
 # shellcheck disable=SC2086 # $envs is a list of -e NAME=value pairs
 status=0
 docker run --rm --init $args \
     --name "$NAME" \
     --label rec-rs-dev=1 \
+    $caps \
     --user "$UID_HOST:$GID_HOST" \
     --workdir "$REPO" \
     -v "$REPO:$REPO" \
