@@ -51,6 +51,7 @@ token)
     grep -q granted "$OUT/screen-token.request"
     token="$XDG_STATE_HOME/rec-rs/portal-token"
     test -s "$token"
+    test "$(stat -c %a "$token")" = 600
     echo garbage >"$token"
     REC_PORTAL_TIMEOUT=30 "$B" record -q -t 1 --no-mic --no-system-audio \
         -o "$OUT/screen-token.mp4" 2>"$OUT/screen-token.log"
