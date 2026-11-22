@@ -854,6 +854,38 @@ mod tests {
         (sink, frames)
     }
 
+    /// Fill `rect` of a window with `pixel` (0x00RRGGBB on a TrueColor
+    /// visual), so a capture can be told apart pixel by pixel.
+    fn fill(window: &TestWindow, x: i16, y: i16, w: u16, h: u16, pixel: u32) {
+        let gc = window.server.conn.generate_id().unwrap();
+        window
+            .server
+            .conn
+            .create_gc(
+                gc,
+                window.win,
+                &x11rb::protocol::xproto::CreateGCAux::new().foreground(pixel),
+            )
+            .unwrap();
+        window
+            .server
+            .conn
+            .poly_fill_rectangle(
+                window.win,
+                gc,
+                &[x11rb::protocol::xproto::Rectangle {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                }],
+            )
+            .unwrap();
+        window.server.conn.free_gc(gc).unwrap();
+        window.server.conn.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     fn red_of(frame: &VideoFrame, x: usize, y: usize) -> u8 {
         let p = &frame.planes[0];
         p.data[y * p.stride + x * 4 + 2]
@@ -916,6 +948,69 @@ mod tests {
         assert_eq!(green_of(f, 150, 100), 0);
         // The pointer was never over it, so nothing was drawn over the middle.
         assert_eq!(red_of(f, 150, 100), 255);
+    }
+
+    #[test]
+    fn a_region_captures_the_pixels_it_names() {
+        // A window split red | blue, captured through --region twice: each
+        // region must contain only its own half. This is the check that a
+        // region's *offset* is applied, which a size alone cannot tell.
+        let Some(server) = live_server() else {
+            return;
+        };
+        let window = TestWindow::open(server, "region-test", 900, 400, 200, 100);
+        // The right half (100 px on) blue: 0x000000ff in X's RGB masks.
+        fill(&window, 100, 0, 100, 100, 0x000000ff);
+        let left = super::super::Region {
+            x: 900.0,
+            y: 400.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let right = super::super::Region { x: 1000.0, ..left };
+        let mut captured = vec![];
+        for region in [left, right] {
+            let (spec, _) = resolve_display(&window.server, 1, Some(&region)).unwrap();
+            assert_eq!(
+                spec.rect,
+                Rect::new(region.x as usize, region.y as usize, 100, 100)
+            );
+            let mut source = Source::new(
+                spec,
+                CaptureOptions {
+                    cursor: false,
+                    clicks: false,
+                },
+            );
+            let (sink, frames) = collector();
+            VideoSource::start(&mut source, sink).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            VideoSource::stop(&mut source).unwrap();
+            let frames = frames.lock().unwrap();
+            let f = frames.last().expect("a frame").clone();
+            assert_eq!((f.width, f.height), (100, 100));
+            captured.push(f);
+        }
+        // The left region is the window's red half, the right one its blue.
+        for (f, what) in captured.iter().zip(["red", "blue"]) {
+            for (x, y) in [(0, 0), (50, 50), (99, 99)] {
+                let (r, g, b) = (
+                    red_of(f, x, y),
+                    green_of(f, x, y),
+                    f.planes[0].data[y * 400 + x * 4],
+                );
+                match what {
+                    "blue" => assert!(
+                        b > 200 && r < 60 && g < 60,
+                        "blue half at {x},{y}: {r},{g},{b}"
+                    ),
+                    _ => assert!(
+                        r > 200 && b < 60 && g < 60,
+                        "red half at {x},{y}: {r},{g},{b}"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
