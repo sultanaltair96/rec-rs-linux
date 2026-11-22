@@ -198,6 +198,20 @@ if wanted missing; then
     fi
 fi
 
+# Every chunk must be stamped within a second of the host clock: a value from
+# another clock (ns, a stream-relative time) would make the writer fill an
+# enormous silence gap. The test prints the worst |pts - arrival| it saw.
+if wanted clock; then
+    name=clock
+    if cargo test --quiet live_chunk_timestamps_are_on_the_host_clock -- --ignored --nocapture \
+           >"$OUT/$name.check" 2>&1 \
+       && grep -q '^clock:' "$OUT/$name.check"; then
+        ok "$name" "$(grep '^clock:' "$OUT/$name.check" | sed 's/^clock: //')"
+    else
+        bad "$name" "a chunk timestamp was not on the host clock" "$OUT/$name.check"
+    fi
+fi
+
 # Capture latency: the test spawns pw-play itself and reports the offset from
 # the spawn to the first captured chunk's pts (pw-play start-up and the graph's
 # buffering included).

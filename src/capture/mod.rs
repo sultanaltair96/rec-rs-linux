@@ -10,16 +10,8 @@
 //!
 //! Sources never call each other: the factories here return a source, the
 //! session in `record.rs` starts it with a sink, and everything they produce
-//! crosses in [`crate::media_types`]. Phase 0 ships the factory signatures and
-//! device descriptions (so `devices`, `--display`, `--window`, `--mic` and
-//! `--webcam` already parse and report) and a clear error for the capture
-//! itself.
+//! crosses in [`crate::media_types`].
 
 pub mod audio;
 pub mod camera;
 pub mod screen;
-
-/// The error a phase 1 stub returns.
-pub(crate) fn not_implemented(what: &str, phase: &str) -> anyhow::Error {
-    anyhow::anyhow!("{what} is not implemented yet (phase {phase})")
-}

@@ -60,6 +60,10 @@ use crate::media_types::{AudioChunk, AudioKind, AudioSink, AudioSource, MicInfo,
 
 /// How long a source may take to negotiate its format and reach `Paused`.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+/// PipeWire buffer times are `CLOCK_MONOTONIC` seconds; a value further than
+/// this from the host clock is another clock (or a corrupted field), and using
+/// it would make the writer fill a huge silence gap.
+const MAX_CLOCK_SKEW: f64 = 2.0;
 /// How long `devices` waits for the graph to answer.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Safety net for the discovery loop (it quits itself on the third round trip).
@@ -535,16 +539,25 @@ struct Stamp {
 
 impl Stamp {
     /// `buffer_time_ns` is `pw_buffer.time` (graph clock, nanoseconds); 0 means
-    /// the build did not fill it and the arrival time is used.
+    /// the build did not fill it and the arrival time is used. A value from
+    /// another clock is replaced by the arrival time: it must never reach the
+    /// writer as a timestamp far from now, because the writer fills a gap
+    /// between buffers with silence, sample by sample.
     fn stamp(&mut self, buffer_time_ns: u64) -> f64 {
-        let t = if buffer_time_ns > 0 {
+        let now = now();
+        let candidate = if buffer_time_ns > 0 {
             buffer_time_ns as f64 / 1e9
         } else {
-            now()
+            now
+        };
+        let candidate = if (candidate - now).abs() > MAX_CLOCK_SKEW {
+            now
+        } else {
+            candidate
         };
         let out = match self.last {
-            Some(prev) if t < prev => prev,
-            _ => t,
+            Some(prev) if candidate < prev => prev,
+            _ => candidate,
         };
         self.last = Some(out);
         out
@@ -1211,15 +1224,84 @@ mod tests {
     #[test]
     fn buffer_times_become_monotonic_seconds() {
         let mut s = Stamp::default();
-        assert!((s.stamp(1_500_000_000) - 1.5).abs() < 1e-9);
-        assert!((s.stamp(1_510_000_000) - 1.51).abs() < 1e-9);
-        // A driver/build that goes backwards: hold the previous time.
-        assert!((s.stamp(1_505_000_000) - 1.51).abs() < 1e-9);
+        let base = now();
+        // A buffer 20 ms ago: the graph time is passed through as seconds.
+        let t0 = s.stamp(((base - 0.020) * 1e9) as u64);
+        assert!((t0 - (base - 0.020)).abs() < 1e-6, "{t0} vs {base}");
+        assert!((t0 - base).abs() < 0.1, "not on the host clock: {t0}");
         // 0 means unknown: arrival time, which is on the same clock.
-        let before = now();
-        let t = s.stamp(0);
-        assert!(t >= before, "{t} !>= {before}");
-        assert!(t >= 1.51);
+        let t1 = s.stamp(0);
+        assert!(t1 >= t0);
+        assert!((t1 - now()).abs() < 0.1);
+        // A buffer stamped slightly backwards holds the previous time.
+        let t2 = s.stamp(((base - 0.100) * 1e9) as u64);
+        assert!(t2 >= t1, "{t2} !>= {t1}");
+    }
+
+    #[test]
+    fn timestamps_from_another_clock_fall_back_to_now() {
+        let mut s = Stamp::default();
+        // Minutes from now, epoch nanoseconds, or a corrupted huge field: all
+        // of them would make the writer allocate a silence gap measured in
+        // hours, so none may pass.
+        for bogus in [
+            u64::MAX,
+            1_700_000_000_000_000_000, // wall clock in ns
+            1_000,                     // 1 microsecond "since boot"
+        ] {
+            let before = now();
+            let t = s.stamp(bogus);
+            assert!(
+                (t - before).abs() < 1.0,
+                "bogus buffer time {bogus} became {t}, now {before}"
+            );
+        }
+        // A future graph time inside the skew window is still accepted (the
+        // graph can schedule a cycle a little ahead).
+        let ahead = now() + 0.5;
+        let t = s.stamp((ahead * 1e9) as u64);
+        assert!((t - ahead).abs() < 0.01, "{t} vs {ahead}");
+    }
+
+    /// The same check as `timestamps_from_another_clock_fall_back_to_now`, on a
+    /// live stream: every chunk the sink receives must be stamped within a
+    /// second of the host clock, or the writer will misplace it.
+    #[test]
+    #[ignore = "needs a live PipeWire session (scripts/audio/harness.sh)"]
+    fn live_chunk_timestamps_are_on_the_host_clock() {
+        let mut src = open_capture(AudioKind::System, None).expect("opening system audio");
+        let seen = Arc::new(Mutex::new(Vec::<(f64, f64)>::new())); // (pts, arrival)
+        let sink = {
+            let seen = seen.clone();
+            Arc::new(move |_kind: AudioKind, chunk: AudioChunk| {
+                seen.lock().unwrap().push((chunk.pts, now()));
+            }) as AudioSink
+        };
+        src.start(sink).expect("starting system audio");
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = src.stop();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "no audio buffers in 1.5 s");
+        let worst = seen
+            .iter()
+            .map(|(pts, arrival)| (pts - arrival).abs())
+            .fold(0.0f64, f64::max);
+        for (pts, arrival) in seen.iter() {
+            assert!(
+                (pts - arrival).abs() < 1.0,
+                "chunk pts {pts} vs arrival {arrival} ({} ms)",
+                (pts - arrival) * 1000.0
+            );
+        }
+        eprintln!(
+            "clock: {} chunks, worst |pts - arrival| {:.1} ms",
+            seen.len(),
+            worst * 1000.0
+        );
+        // Monotonic, too.
+        for pair in seen.windows(2) {
+            assert!(pair[1].0 >= pair[0].0, "{:?} then {:?}", pair[0], pair[1]);
+        }
     }
 
     /// End-to-end capture latency, measured the only way that does not need a
