@@ -15,3 +15,7 @@
 /target/
 /dist/
 /build/
+
+# CI artifacts
+selftest-results/
+__pycache__/
