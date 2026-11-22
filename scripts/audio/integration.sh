@@ -198,6 +198,22 @@ if wanted missing; then
     fi
 fi
 
+# Capture latency: the test spawns pw-play itself and reports the offset from
+# the spawn to the first captured chunk's pts (pw-play start-up and the graph's
+# buffering included).
+if wanted latency; then
+    name=latency
+    mkwav "$OUT/tone.wav" --rate 48000 --secs 4 --level -6 --beep 0 >/dev/null
+    if REC_AUDIO_TEST_WAV="$OUT/tone.wav" REC_AUDIO_TEST_TARGET=rec_test_sink \
+           cargo test --quiet system_audio_capture_latency -- --ignored --nocapture \
+           >"$OUT/$name.check" 2>&1 \
+       && grep -q 'latency: first captured tone' "$OUT/$name.check"; then
+        ok "$name" "$(grep 'latency: first captured tone' "$OUT/$name.check" | sed 's/^latency: //')"
+    else
+        bad "$name" "the latency test failed" "$OUT/$name.check"
+    fi
+fi
+
 # The device disappearing mid-recording: the stream errors, the session keeps
 # recording video and finalizes the file, and the warning says what happened.
 if wanted unplug; then

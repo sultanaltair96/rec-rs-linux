@@ -153,7 +153,7 @@ fn snapshot_thread(with_latency: bool) -> Result<Snapshot> {
         .map_err(|e| anyhow!("creating a PipeWire context: {e}"))?;
     let core = context
         .connect_rc(None)
-        .map_err(|e| anyhow!("PipeWire is not available: {e}"))?;
+        .map_err(|e| anyhow!("PipeWire is not available ({e}); is a PipeWire session running?"))?;
     let registry = core
         .get_registry_rc()
         .map_err(|e| anyhow!("opening the PipeWire registry: {e}"))?;
@@ -840,7 +840,7 @@ fn run_capture(
         .map_err(|e| anyhow!("creating a PipeWire context: {e}"))?;
     let core = context
         .connect_rc(None)
-        .map_err(|e| anyhow!("PipeWire is not available: {e}"))?;
+        .map_err(|e| anyhow!("PipeWire is not available ({e}); is a PipeWire session running?"))?;
 
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -1220,6 +1220,65 @@ mod tests {
         let t = s.stamp(0);
         assert!(t >= before, "{t} !>= {before}");
         assert!(t >= 1.51);
+    }
+
+    /// End-to-end capture latency, measured the only way that does not need a
+    /// second clock: spawn `pw-play` on a tone, and compare the instant it was
+    /// spawned with the pts of the first loud chunk. That includes pw-play's
+    /// own start-up and the graph's buffering, which is what a user hears as
+    /// the offset between pressing play and the recording containing it.
+    #[test]
+    #[ignore = "needs a live PipeWire session and a tone (scripts/audio/integration.sh latency)"]
+    fn system_audio_capture_latency() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wav = std::env::var("REC_AUDIO_TEST_WAV")
+            .expect("REC_AUDIO_TEST_WAV (a tone to play) must be set");
+        let target =
+            std::env::var("REC_AUDIO_TEST_TARGET").unwrap_or_else(|_| "rec_test_sink".into());
+        let mut src = open_capture(AudioKind::System, None).expect("opening system audio");
+        let heard = Arc::new(Mutex::new(None::<(f64, f64)>)); // (pts, arrival)
+        let done = Arc::new(AtomicBool::new(false));
+        let sink = {
+            let heard = heard.clone();
+            Arc::new(move |_kind: AudioKind, chunk: AudioChunk| {
+                if chunk.peak() > 0.05 {
+                    let mut h = heard.lock().unwrap();
+                    if h.is_none() {
+                        *h = Some((chunk.pts, now()));
+                    }
+                }
+            }) as AudioSink
+        };
+        src.start(sink).expect("starting system audio");
+        let t_play = now();
+        let mut player = std::process::Command::new("pw-play")
+            .args(["--target", &target, &wav])
+            .spawn()
+            .expect("running pw-play");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && heard.lock().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done.store(true, Ordering::SeqCst);
+        let _ = player.wait();
+        let _ = src.stop();
+        let (pts, arrival) = heard
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the played tone was never captured");
+        let play_ms = (pts - t_play) * 1000.0;
+        let process_ms = (arrival - t_play) * 1000.0;
+        eprintln!(
+            "latency: first captured tone {play_ms:+.1} ms after pw-play was spawned \
+             (delivered to the sink {process_ms:+.1} ms after)"
+        );
+        assert!(
+            play_ms > -50.0,
+            "a chunk was stamped before it was played: {play_ms} ms"
+        );
+        assert!(play_ms < 2000.0, "capture latency {play_ms} ms is too high");
     }
 
     #[test]
