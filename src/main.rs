@@ -13,6 +13,7 @@ mod capture;
 mod cli;
 mod compose;
 mod gpu;
+mod hotkey;
 mod live;
 mod media;
 mod media_types;
@@ -60,6 +61,10 @@ enum Cmd {
         /// display.
         #[arg(long, value_name = "ID")]
         window: Option<u32>,
+        /// Record a generated test pattern instead of the screen (self-test;
+        /// needs no capture permission).
+        #[arg(long, hide = true)]
+        test_pattern: bool,
     },
     /// List displays, windows, cameras and microphones.
     Devices,
@@ -247,6 +252,7 @@ fn main() {
         start_recording: false,
         settings: false,
         window: None,
+        test_pattern: false,
     }));
     if let Err(e) = r {
         eprintln!("rec: error: {e:#}");
@@ -261,7 +267,8 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             start_recording,
             settings,
             window,
-        } => app::run(start_recording, settings, window),
+            test_pattern,
+        } => app::run(start_recording, settings, window, test_pattern),
         Cmd::Record(a) => record(a),
         Cmd::Devices => devices(),
         Cmd::Stop => record::stop_running(),

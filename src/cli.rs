@@ -464,6 +464,7 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
             .iter()
             .map(|d| live::resolve_destination(d))
             .collect::<Result<Vec<_>>>()?,
+        preview: None,
     };
     Ok(opts)
 }
