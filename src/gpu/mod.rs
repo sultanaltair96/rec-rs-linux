@@ -74,6 +74,34 @@
 //! ratio apply from the next frame. The overlay's masks, border and shadow are
 //! built once per size and style ([`decor`]) and cached, so moving the overlay
 //! only changes a transform, exactly like upstream's `Decor` cache.
+//!
+//! # Threading
+//!
+//! [`Renderer`] is `Send`: the writer creates it on its own thread and keeps it
+//! there. It needs no display and no window, and on a machine with no GPU it
+//! runs on Mesa's software Vulkan device (lavapipe) instead of failing:
+//! [`Renderer::describe_adapter`] says which one
+//! ([`Renderer::is_software`] when it is the CPU). Nothing here is `Sync`:
+//! one renderer belongs to one thread.
+//!
+//! # Performance
+//!
+//! `tests/golden/README.md` records the measured cost per frame on the software
+//! adapter (with the readback) for 1080p and 4K, with and without the camera:
+//! 5 ms for a 1080p screen at the output size, ~48 ms for a 4K screen scaled to
+//! 1080p, ~25 ms for 4K at 4K. The Lanczos passes are the cost on a CPU
+//! rasteriser; the copies dominate at 4K. Nothing is rebuilt per frame — the
+//! pipelines, the textures and the overlay's decor are created on demand and
+//! then reused — so the same shaders on a real GPU are close to free.
+//!
+//! # Tests
+//!
+//! `cargo test gpu::` runs the ported upstream render test, the shapes against
+//! `compose::coverage`, borders, the shadow, mirroring, placement, the camera
+//! scene, Lanczos against an independent CPU implementation (1/255), BT.709
+//! against ffmpeg's own numbers, the corner fill, the pipelined readback and
+//! the golden images under `tests/golden/`; `--ignored` adds the performance
+//! measurement. Without an adapter they print why and return.
 
 // The writer (phase 1G) and the app's preview (phase 1E) construct the
 // renderer; until those land the binary has no other caller than the tests.
