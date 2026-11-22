@@ -154,10 +154,13 @@ pub(super) fn open_source(sel: Option<&str>) -> Result<Option<CameraSource>> {
     if !present(&camera)? {
         return Ok(None);
     }
-    // Ask once; the response handle is not awaited because OpenPipeWireRemote
-    // fails when access was denied, and a dialog the user has already answered
-    // returns immediately.
-    let _ = runtime().block_on(async { camera.request_access().await });
+    // `request_access` waits for the portal's response (ashpd prepares the
+    // Response signal inside the call): the first run shows the desktop's
+    // camera dialog, later runs return immediately. A refusal is a real error,
+    // not "no camera found".
+    runtime()
+        .block_on(async { camera.request_access().await })
+        .map_err(|e| anyhow!("the camera portal refused access: {e}"))?;
     let fd = open_remote(&camera)?;
     let nodes = enumerate_remote(fd)?;
     let chosen = match sel {
@@ -664,15 +667,5 @@ mod tests {
         assert_eq!(pick(&nodes, "portal").unwrap().node_id, 7);
         assert_eq!(pick(&nodes, "default").unwrap().node_id, 7);
         assert!(pick(&nodes, "no such camera").is_none());
-    }
-
-    #[test]
-    fn sandbox_detection_is_false_on_this_desktop() {
-        // The CI container is not a Flatpak (and has no /dev/video*): the
-        // portal must not be asked for a camera on its own.
-        if std::env::var_os("FLATPAK_ID").is_none() {
-            assert!(!std::path::Path::new("/.flatpak-info").exists());
-        }
-        assert!(in_sandbox() || !in_sandbox());
     }
 }
