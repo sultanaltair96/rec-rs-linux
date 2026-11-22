@@ -177,6 +177,26 @@ pub fn cam(w: usize, h: usize) -> VideoFrame {
     VideoFrame::packed(0.0, w, h, PixelFormat::Bgra, px)
 }
 
+/// A 1-px black and white pattern: the highest frequency a source can carry,
+/// and therefore the sharpest test of a downscaler. `vertical` gives stripes,
+/// otherwise a checkerboard.
+pub fn stripes(w: usize, h: usize, vertical: bool) -> VideoFrame {
+    let mut px = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let on = if vertical {
+                x % 2 == 0
+            } else {
+                (x + y) % 2 == 0
+            };
+            let v = if on { 255 } else { 0 };
+            let at = (y * w + x) * 4;
+            px[at..at + 4].copy_from_slice(&[v, v, v, 255]);
+        }
+    }
+    VideoFrame::packed(0.0, w, h, PixelFormat::Bgra, px)
+}
+
 /// A solid frame in a chosen format, for colour and coverage checks.
 pub fn solid(w: usize, h: usize, rgb: [u8; 3]) -> VideoFrame {
     let mut px = vec![0u8; w * h * 4];
@@ -285,6 +305,49 @@ impl Image {
             }
         }
         (max, sum / (self.rgb.len() * 3) as f64)
+    }
+
+    /// The mean of one channel over the whole image.
+    pub fn mean(&self, channel: usize) -> f64 {
+        let sum: f64 = self.rgb.iter().map(|p| p[channel] as f64).sum();
+        sum / self.rgb.len().max(1) as f64
+    }
+
+    /// The largest distance any pixel is from one value over all channels,
+    /// ignoring a border `margin` pixels wide.
+    pub fn max_deviation(&self, want: f64, margin: usize) -> (f64, usize, usize) {
+        let mut worst = 0.0;
+        let (mut at_x, mut at_y) = (0, 0);
+        for y in margin..self.height.saturating_sub(margin) {
+            for x in margin..self.width.saturating_sub(margin) {
+                for v in self.at(x, y) {
+                    let d = (v as f64 - want).abs();
+                    if d > worst {
+                        worst = d;
+                        at_x = x;
+                        at_y = y;
+                    }
+                }
+            }
+        }
+        (worst, at_x, at_y)
+    }
+
+    /// Peak signal-to-noise ratio against another image, in dB.
+    pub fn psnr(&self, other: &Image) -> f64 {
+        assert_eq!((self.width, self.height), (other.width, other.height));
+        let mut sq = 0f64;
+        for (a, b) in self.rgb.iter().zip(other.rgb.iter()) {
+            for c in 0..3 {
+                let d = a[c] as f64 - b[c] as f64;
+                sq += d * d;
+            }
+        }
+        let mse = sq / (self.rgb.len() * 3).max(1) as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0f64 * 255.0 / mse).log10()
     }
 
     /// Every pixel within `tol` of another image, reporting the margin so the

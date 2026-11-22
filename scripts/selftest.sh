@@ -147,8 +147,8 @@ fi
 
 # The GPU compositor: every shape against the mask geometry, borders, the drop
 # shadow, mirroring, placement, the camera scene, the Lanczos scaler against a
-# CPU reference, the BT.709 output, the pipelined readback and the golden
-# images. It needs no display and no GPU: Mesa's software Vulkan device
+# CPU reference, against ffmpeg's Lanczos (PSNR) and on a 1-px pattern
+# (aliasing), the BT.709 output, the pipelined readback and the golden images. It needs no display and no GPU: Mesa's software Vulkan device
 # (lavapipe) runs it, and the tests skip with a printed reason only when there
 # is no adapter at all.
 if wanted compositor; then
@@ -158,7 +158,18 @@ if wanted compositor; then
             adapter=$(sed -n 's/^compositor tests run on: //p' "$OUT/compositor.log" | head -1)
             counts=$(sed -e 's/\x1b\[[0-9;]*m//g' "$OUT/compositor.log" \
                      | grep -oE '[0-9]+ passed; [0-9]+ failed' | tail -1)
-            echo "PASS  compositor  (${counts:-?} on ${adapter:-no adapter})"; pass=$((pass+1))
+            # The scaler against ffmpeg's Lanczos on the same RGB input: two
+            # independent Lanczos3 implementations must agree to 40 dB.
+            if CARGO_BUILD_JOBS=3 timeout "$TIMEOUT" cargo test --release gpu::tests::the_scaler_matches \
+                   -- --ignored --nocapture >"$OUT/compositor-ffmpeg.log" 2>&1 \
+               && grep -q 'PSNR' "$OUT/compositor-ffmpeg.log"; then
+                psnr=$(grep -o 'PSNR [0-9.]*' "$OUT/compositor-ffmpeg.log" | tr '\n' ' ')
+                echo "PASS  compositor  (${counts:-?} on ${adapter:-no adapter}; $psnr)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  compositor  (ffmpeg comparison; see $OUT/compositor-ffmpeg.log)"
+                fail=$((fail+1))
+            fi
         else
             echo "FAIL  compositor  (see $OUT/compositor.log)"; fail=$((fail+1))
         fi

@@ -27,9 +27,14 @@
 //! The screen is scaled in the **encoded** domain, plane for plane, which is
 //! where upstream's `MPSImageLanczosScale` runs over the Y and CbCr planes: no
 //! linearisation, so text keeps its contrast, and the taps past an edge repeat
-//! the edge pixel. Lanczos has a half-width of 3 (a = 3) and never upscales: a
-//! source smaller than the output is drawn at 1:1 and centred with video black
-//! around it. A source that is already the output size skips both passes.
+//! the edge pixel. The kernel is a Lanczos with a half-width of 3 (a = 3)
+//! **stretched by the reduction factor** — six taps an axis at 1:1, twelve at
+//! 2:1, seventeen at 2.67:1 — because reducing a picture means removing
+//! frequencies: a fixed six-tap interpolator would fold everything above the
+//! destination's Nyquist frequency back as moiré (a 5K screen at 1080p is the
+//! worst case this app sees). It never upscales: a source smaller than the
+//! output is drawn at 1:1 and centred with video black around it, and a source
+//! that is already the output size skips both passes.
 //!
 //! The camera is sampled bilinearly by the composite pass, like CoreImage's
 //! default `kCISamplerFilterModeLinear` on upstream's transform, and is

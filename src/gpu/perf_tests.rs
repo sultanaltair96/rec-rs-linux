@@ -12,6 +12,12 @@
 //! overlaps one frame's readback with the next frame's GPU work). On a software
 //! adapter both are far below 60 fps; on a GPU the synchronous number is
 //! dominated by the readback stall and the pipelined one by the actual work.
+//!
+//! Each case runs five passes and reports the fastest and the median, because
+//! the build host is shared: contention shows up as a slowdown of *every* case,
+//! including the unscaled ones, and a single sample would make the table
+//! meaningless. The fastest pass is the closest thing to the adapter's own
+//! speed; the median says how much the host interfered.
 
 use std::time::Instant;
 
@@ -21,8 +27,10 @@ use crate::media_types::VideoFrame;
 use super::testkit::{self, cam, screen};
 use super::{Options, OutputFormat};
 
-/// Frames per case: enough to warm the driver up and still take seconds.
+/// Frames per pass: enough to warm the driver up and still take seconds.
 const FRAMES: usize = 24;
+/// Passes per case; the fastest pass is reported (see the module docs).
+const PASSES: usize = 5;
 
 struct Case {
     name: &'static str,
@@ -41,15 +49,15 @@ fn performance() {
     };
     println!("\ncompositor performance on: {adapter}\n");
     println!(
-        "{:<44} {:>10} {:>10} {:>8}",
-        "case", "sync ms", "piped ms", "frames"
+        "{:<42} {:>17} {:>17} {:>7}",
+        "case", "sync ms (min/med)", "piped ms (min/med)", "frames"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(88));
     for case in cases() {
         let (sync, piped, frames) = measure(&case);
         println!(
-            "{:<44} {:>10.2} {:>10.2} {:>8}",
-            case.name, sync, piped, frames
+            "{:<42} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>7}",
+            case.name, sync.0, sync.1, piped.0, piped.1, frames
         );
     }
     println!();
@@ -131,9 +139,16 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Milliseconds per frame for one case, synchronous and pipelined, plus how
-/// many frames each run actually read back.
-fn measure(case: &Case) -> (f64, f64, usize) {
+/// The fastest and the median sample, in ms.
+fn stat(samples: &mut [f64]) -> (f64, f64) {
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let median = samples[samples.len() / 2];
+    (samples[0], median)
+}
+
+/// Milliseconds per frame for one case, synchronous and pipelined, as
+/// (fastest, median), plus how many frames each run actually read back.
+fn measure(case: &Case) -> ((f64, f64), (f64, f64), usize) {
     let src = screen(case.screen.0, case.screen.1);
     let camera = case.cam.map(|(w, h)| cam(w, h));
     let scene = if case.cam.is_some() {
@@ -153,39 +168,45 @@ fn measure(case: &Case) -> (f64, f64, usize) {
         })
         .expect("a renderer for the measurement")
     };
-    // One warm-up frame so the pipelines and textures exist.
-    let mut r = make(1);
-    let _ = r
-        .render_now(Some(&src), camera.as_ref(), 0.0)
-        .expect("warm up");
-
     // Synchronous: submit and wait for every frame.
-    let mut sync_frames = 0;
-    let start = Instant::now();
-    for i in 0..FRAMES {
-        let out = r
-            .render(Some(&src), camera.as_ref(), i as f64 * 0.033)
-            .expect("render");
-        sync_frames += usize::from(out.is_some());
+    let mut syncs = Vec::with_capacity(PASSES);
+    let mut frames = 0;
+    for _ in 0..PASSES {
+        let mut r = make(1);
+        let _ = r
+            .render_now(Some(&src), camera.as_ref(), 0.0)
+            .expect("warm up");
+        let mut read_back = 0;
+        let start = Instant::now();
+        for i in 0..FRAMES {
+            let out = r
+                .render(Some(&src), camera.as_ref(), i as f64 * 0.033)
+                .expect("render");
+            read_back += usize::from(out.is_some());
+        }
+        read_back += r.flush().expect("flush").len();
+        frames = read_back;
+        syncs.push(start.elapsed().as_secs_f64() * 1000.0 / read_back.max(1) as f64);
     }
-    sync_frames += r.flush().expect("flush").len();
-    let sync = start.elapsed().as_secs_f64() * 1000.0 / sync_frames.max(1) as f64;
 
     // Pipelined: one frame in flight, so a readback overlaps the next frame's
     // submission.
-    let mut r = make(2);
-    let _ = r
-        .render_now(Some(&src), camera.as_ref(), 0.0)
-        .expect("warm up");
-    let mut piped_frames = 0;
-    let start = Instant::now();
-    for i in 0..FRAMES {
-        let out = r
-            .render(Some(&src), camera.as_ref(), i as f64 * 0.033)
-            .expect("render");
-        piped_frames += usize::from(out.is_some());
+    let mut pipeds = Vec::with_capacity(PASSES);
+    for _ in 0..PASSES {
+        let mut r = make(2);
+        let _ = r
+            .render_now(Some(&src), camera.as_ref(), 0.0)
+            .expect("warm up");
+        let mut read_back = 0;
+        let start = Instant::now();
+        for i in 0..FRAMES {
+            let out = r
+                .render(Some(&src), camera.as_ref(), i as f64 * 0.033)
+                .expect("render");
+            read_back += usize::from(out.is_some());
+        }
+        read_back += r.flush().expect("flush").len();
+        pipeds.push(start.elapsed().as_secs_f64() * 1000.0 / read_back.max(1) as f64);
     }
-    piped_frames += r.flush().expect("flush").len();
-    let piped = start.elapsed().as_secs_f64() * 1000.0 / piped_frames.max(1) as f64;
-    (sync, piped, sync_frames)
+    (stat(&mut syncs), stat(&mut pipeds), frames)
 }

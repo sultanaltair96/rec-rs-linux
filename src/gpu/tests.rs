@@ -503,6 +503,145 @@ fn lanczos_matches_a_cpu_reference() {
     }
 }
 
+/// Downscaling has to antialias: a 1-px pattern far above the destination's
+/// Nyquist frequency must average out to its own mean, with no beat pattern.
+///
+/// 5120x2880 scaled to 1920x1080 is 2.67:1, the largest reduction the CLI asks
+/// for (a 5K display at 1080p). An interpolating kernel — fixed taps at the
+/// source's spacing — folds the pattern back as moiré and fails this by two
+/// orders of magnitude; with the filter stretched by the reduction factor only
+/// the outermost columns move, and only because the edge pixel is replicated.
+/// ffmpeg's own Lanczos behaves the same way on this pattern (swscale reaches
+/// 22.6/255 at the last column and 1.6/255 inside, zscale 29.7 and 1.7), so the
+/// strict bound is on the interior and the edge gets a loose one.
+#[test]
+fn downscaling_a_one_pixel_pattern_leaves_only_its_mean() {
+    let Some(mut r) = renderer(1920, 1080, PipSpec::default(), Scene::Screen) else {
+        return;
+    };
+    let mut failures = Vec::new();
+    for (name, vertical) in [("stripes", true), ("checkerboard", false)] {
+        let src = testkit::stripes(5120, 2880, vertical);
+        let out = r.render_now(Some(&src), None, 0.0).expect("render");
+        let img = Image::bgra(&out);
+        let mean = img.mean(1);
+        // The filter's support is 3 * 2.67 = 8 source pixels, about 3 output
+        // pixels; 8 pixels of border is comfortably outside it.
+        let (interior, ix, iy) = img.max_deviation(mean, 8);
+        let (edge, ex, ey) = img.max_deviation(mean, 0);
+        println!(
+            "{name} 5120x2880 -> 1920x1080: mean {mean:.1}, interior {interior:.1} at ({ix},{iy}), \
+             edge {edge:.1} at ({ex},{ey}), centre {:?}",
+            img.at(960, 540)
+        );
+        if (mean - 127.5).abs() > 4.0 {
+            failures.push(format!(
+                "{name}: the mean should survive the scale, got {mean:.1}"
+            ));
+        }
+        if interior > 8.0 {
+            failures.push(format!(
+                "{name}: a {interior:.1}/255 beat pattern at ({ix},{iy}) inside the frame, \
+                 around a mean of {mean:.1}"
+            ));
+        }
+        if edge > 32.0 {
+            failures.push(format!(
+                "{name}: {edge:.1}/255 at the frame's edge ({ex},{ey}); the references stay \
+                 under 30"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The scaler against ffmpeg's Lanczos on the same RGB input, at the two
+/// reductions this app actually uses: a 4K and a 5K screen into 1080p.
+///
+/// `#[ignore]`d because it needs `ffmpeg` on the PATH (the dev image has it);
+/// `scripts/selftest.sh compositor` runs it. 40 dB is the bar: two Lanczos3
+/// implementations differ at edges by a code or two (edge mode, rounding), and
+/// nothing more.
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn the_scaler_matches_ffmpeg_lanczos() {
+    for (sw, sh) in [(3840usize, 2160usize), (5120, 2880)] {
+        let source = screen(sw, sh);
+        let Some(mut r) = renderer(1920, 1080, PipSpec::default(), Scene::Screen) else {
+            return;
+        };
+        let mine = Image::bgra(&r.render_now(Some(&source), None, 0.0).expect("render"));
+        let Some(swscale) = ffmpeg_scale(
+            &source,
+            "scale=1920:1080:flags=lanczos+accurate_rnd+full_chroma_int",
+        ) else {
+            eprintln!("SKIP: ffmpeg is not on the PATH");
+            return;
+        };
+        let psnr = mine.psnr(&swscale);
+        let zscale = ffmpeg_scale(&source, "zscale=w=1920:h=1080:f=lanczos")
+            .map(|theirs| mine.psnr(&theirs));
+        println!("{sw}x{sh} -> 1920x1080: PSNR {psnr:.2} dB against swscale's Lanczos");
+        if let Some(z) = zscale {
+            println!("{sw}x{sh} -> 1920x1080: PSNR {z:.2} dB against zimg's Lanczos (zscale)");
+        }
+        assert!(
+            psnr >= 40.0,
+            "{sw}x{sh} -> 1920x1080 differs from ffmpeg's Lanczos by {psnr:.2} dB"
+        );
+    }
+}
+
+/// `source` through one ffmpeg video filter, as RGB.
+fn ffmpeg_scale(source: &VideoFrame, filter: &str) -> Option<Image> {
+    let stride = source.planes[0].stride;
+    let data = &source.planes[0].data;
+    let mut rgb = Vec::with_capacity(source.width * source.height * 3);
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let at = y * stride + x * 4;
+            rgb.extend_from_slice(&[data[at + 2], data[at + 1], data[at]]);
+        }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "rec-rs-ffmpeg-{}-{}x{}.rgb",
+        std::process::id(),
+        source.width,
+        source.height
+    ));
+    std::fs::write(&path, &rgb).ok()?;
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s"])
+        .arg(format!("{}x{}", source.width, source.height))
+        .arg("-i")
+        .arg(&path)
+        .args(["-vf", filter, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&path);
+    if !out.status.success() {
+        eprintln!("ffmpeg {filter}: {}", String::from_utf8_lossy(&out.stderr));
+        return None;
+    }
+    let wanted = 1920 * 1080 * 3;
+    if out.stdout.len() != wanted {
+        eprintln!(
+            "ffmpeg {filter}: {} bytes, wanted {wanted}",
+            out.stdout.len()
+        );
+        return None;
+    }
+    Some(Image {
+        width: 1920,
+        height: 1080,
+        rgb: out
+            .stdout
+            .chunks_exact(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect(),
+    })
+}
+
 /// A screen that is already the output size is a copy: no scaling pass touches
 /// the pixels.
 #[test]
@@ -912,7 +1051,13 @@ fn lanczos3(x: f64) -> f64 {
     (3.0 * pix.sin() * (pix / 3.0).sin()) / (pix * pix)
 }
 
-/// One axis of the separable filter at a destination coordinate.
+/// One axis of the separable resampler at a destination coordinate.
+///
+/// Written from the definition rather than shared with the shader: a Lanczos3
+/// reconstruction kernel of half-width 3, **stretched by the reduction factor**
+/// (a kernel at the source's own spacing would interpolate and alias), sampled
+/// at the source taps inside its support and normalised so a flat field stays
+/// flat. At 1:1 it is the textbook six taps.
 fn filter(
     dst_pixels: usize,
     scale: f64,
@@ -920,19 +1065,23 @@ fn filter(
     src_len: usize,
     mut sample: impl FnMut(usize) -> [f32; 3],
 ) -> Vec<[f32; 3]> {
+    let stretch = (1.0 / scale).max(1.0);
+    let support = 3.0 * stretch;
     (0..dst_pixels)
         .map(|i| {
             let pos = (i as f64 + 0.5 - offset) / scale - 0.5;
-            let base = pos.floor();
+            // Taps inside the window: floor(pos - 3s) + 1 .. floor(pos + 3s).
+            let lo = (pos - support).floor() as i64 + 1;
+            let hi = (pos + support).floor() as i64;
             let mut acc = [0.0f64; 3];
             let mut wsum = 0.0;
-            for j in -2..4 {
-                let w = lanczos3(pos - (base + j as f64));
+            for t in lo..=hi {
+                let w = lanczos3((pos - t as f64) / stretch);
                 if w != 0.0 {
-                    let t = (base + j as f64).clamp(0.0, src_len as f64 - 1.0) as usize;
-                    let c = sample(t);
-                    for k in 0..3 {
-                        acc[k] += c[k] as f64 * w;
+                    let u = (t as f64).clamp(0.0, src_len as f64 - 1.0) as usize;
+                    let c = sample(u);
+                    for (k, v) in acc.iter_mut().enumerate() {
+                        *v += c[k] as f64 * w;
                     }
                     wsum += w;
                 }
@@ -1018,19 +1167,26 @@ mod reference_tests {
     }
 
     #[test]
-    fn the_reference_filter_blends_neighbours() {
-        // A single bright column, halved: it lands in one output pixel and
-        // rings slightly into its neighbours (that is what Lanczos does, and
-        // what the tolerance of the GPU test is for).
+    fn the_reference_filter_stretches_with_the_reduction() {
+        // A single bright column, halved: the stretched kernel spreads it over
+        // a window twice as wide as an interpolating one would, and far away
+        // the picture is untouched.
         let mut src = [[0.0f32; 3]; 16];
         src[8] = [1.0, 1.0, 1.0];
         let column = filter(8, 0.5, 0.0, 16, |i| src[i]);
+        let lit = column.iter().filter(|c| c[0].abs() > 1e-3).count();
         assert!(
-            column[4][0] > 0.5,
-            "the bright column lands at output 4: {column:?}"
+            lit >= 3,
+            "a stretched kernel touches several outputs: {column:?}"
         );
-        assert!(column[3][0] < 0.0, "and overshoots below it: {column:?}");
-        assert!(column.iter().all(|c| c[0].abs() < 0.7), "{column:?}");
+        assert!(
+            column[4][0] > 0.2,
+            "the bright column lands near output 4: {column:?}"
+        );
+        assert!(column.iter().all(|c| c[0].abs() < 0.8), "{column:?}");
         assert_eq!(column[0][0], 0.0, "far away it is black");
+        // At 1:1 the kernel is the six-tap interpolator: one output is lit.
+        let same = filter(16, 1.0, 0.0, 16, |i| src[i]);
+        assert!(same[8][0] > 0.99, "{same:?}");
     }
 }
