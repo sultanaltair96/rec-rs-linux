@@ -35,7 +35,8 @@ case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
         echo "h264-bitrate sync audio-gaps pause-resume gain"
-        echo "skipped: pattern-screen pattern-webcam pattern-mic stream-rtmp stream-whip"
+        echo "pattern-screen screen-region screen-x11 screen-window screen-token"
+        echo "skipped: pattern-webcam pattern-mic stream-rtmp stream-whip"
         echo "         replay gui"
         exit 0 ;;
 esac
@@ -145,12 +146,77 @@ if wanted gain; then
     fi
 fi
 
+# --- screen capture (phase 1A) ----------------------------------------------
+# Both real pipelines, headless: a sway desktop with xdg-desktop-portal-wlr (the
+# Wayland path: portal -> PipeWire) and Xvfb (the direct X11 path). Each harness
+# paints something that moves, so a still or black capture fails.
+#
+# The cases need the dev image's sway/Xvfb/dbus; on a plain host they skip with
+# the reason instead of failing.
+if command -v dbus-run-session >/dev/null 2>&1 && command -v sway >/dev/null 2>&1 &&
+   command -v Xvfb >/dev/null 2>&1 && [ -x scripts/screen/headless.sh ]; then
+    screen_harness=yes
+else
+    screen_harness=""
+fi
+# `$REC` may be relative; the harness scripts run from another process.
+REC_ABS=$(cd "$(dirname "$REC")" && pwd)/$(basename "$REC")
+
+# Total and distinct video frames of a recording (ffmpeg's per-frame md5).
+frames_total() { ffmpeg -v error -i "$1" -f framemd5 - 2>/dev/null | grep -vc '^#' || true; }
+frames_distinct() { ffmpeg -v error -i "$1" -f framemd5 - 2>/dev/null | grep -v '^#' | cut -d, -f6 | sort -u | wc -l; }
+
+# screen_case NAME FILE WIDTH HEIGHT MIN_DISTINCT: the recording must have the
+# native size, a constant 60 fps and at least MIN_DISTINCT different frames.
+screen_case() {
+    name=$1; f=$2; w=$3; h=$4; move=$5
+    got=$(ffprobe -v error -select_streams v -show_entries stream=width,height -of csv=p=0 "$f" 2>/dev/null | head -1)
+    rate=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$f" 2>/dev/null | head -1)
+    total=$(frames_total "$f")
+    distinct=$(frames_distinct "$f")
+    if [ "$got" = "$w,$h" ] && [ "$rate" = "60/1" ] && [ "$total" -ge 60 ] && [ "$distinct" -ge "$move" ]; then
+        echo "PASS  $name  (${got} @ $rate, $total frames, $distinct distinct)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  $name  (size '$got' want $w,$h, rate '$rate', $total frames, $distinct distinct; see $OUT/$name.mp4.log)"
+        fail=$((fail+1))
+    fi
+}
+
+# screen_test NAME HARNESS CASE WIDTH HEIGHT MIN_DISTINCT
+screen_test() {
+    name=$1; harness=$2; case=$3; w=$4; h=$5; move=$6
+    wanted "$name" || return 0
+    if [ -z "$screen_harness" ]; then
+        echo "SKIP  $name  (needs sway, Xvfb and dbus-run-session: run under scripts/dev.sh)"
+        skip=$((skip+1))
+        return 0
+    fi
+    if REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" "scripts/screen/$harness" \
+           scripts/screen/cases.sh "$case" >/dev/null 2>"$OUT/$name.harness.log"; then
+        screen_case "$name" "$OUT/$name.mp4" "$w" "$h" "$move"
+    else
+        echo "FAIL  $name  (see $OUT/$name.mp4.log and $OUT/$name.harness.log)"
+        fail=$((fail+1))
+    fi
+}
+
+# Wayland: portal + PipeWire, 1280x720 headless sway, restore token stored.
+screen_test pattern-screen headless.sh portal 1280 720 100
+# Wayland: --region crops the shared monitor (640x480 native pixels).
+screen_test screen-region headless.sh region 640 480 40
+# Wayland: `permissions --request` stores a grant; a corrupt token is recovered.
+screen_test screen-token headless.sh token 1280 720 0
+# X11: RandR enumeration and a root capture without a portal.
+screen_test screen-x11 xvfb.sh x11 1280 800 30
+# X11: --window <app> captures one client's own surface.
+screen_test screen-window xvfb.sh window 400 300 30
+
 # Cases that belong to later phases (they need capture, the app or streaming).
 later() {
     wanted "$1" || return 0
     echo "SKIP  $1  ($2)"; skip=$((skip+1))
 }
-later pattern-screen  "phase 1A: screen capture through the portal + PipeWire"
 later pattern-webcam  "phase 1B: camera capture"
 later pattern-mic     "phase 1B: microphone capture"
 later replay          "phase 1D: replay buffer"

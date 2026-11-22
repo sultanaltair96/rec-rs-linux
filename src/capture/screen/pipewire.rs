@@ -115,6 +115,8 @@ struct StreamData {
     /// unchanged (it re-sends one bitmap per frame otherwise).
     cursor: Option<(u32, Arc<CursorImage>)>,
     error: Arc<Mutex<Option<String>>>,
+    /// Warned already that the compositor sends positions but no bitmap.
+    warned_no_bitmap: bool,
     /// The probe leaves the loop as soon as a format arrived.
     quit_on_format: Option<pw::main_loop::MainLoopRc>,
 }
@@ -262,6 +264,7 @@ fn run(
         dropped: 0,
         cursor: None,
         error: error.clone(),
+        warned_no_bitmap: false,
         quit_on_format: None,
     };
     let listener = stream
@@ -469,7 +472,16 @@ fn read_cursor(
     {
         return Some((image.clone(), position.0, position.1));
     }
-    let image = cursor_bitmap(meta)?;
+    let Some(image) = cursor_bitmap(meta) else {
+        if !data.warned_no_bitmap {
+            data.warned_no_bitmap = true;
+            super::warn_once(
+                "the compositor sends the pointer's position but no cursor bitmap, so the cursor \
+                 is not in the recording; without --no-cursor it usually draws the cursor itself",
+            );
+        }
+        return None;
+    };
     let image = Arc::new(image);
     data.cursor = Some((meta.id, image.clone()));
     Some((image, position.0, position.1))
@@ -583,6 +595,7 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
         dropped: 0,
         cursor: None,
         error: error.clone(),
+        warned_no_bitmap: false,
         quit_on_format: Some(main.clone()),
     };
     let size2 = size.clone();

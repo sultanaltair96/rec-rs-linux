@@ -45,7 +45,6 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 
 use crate::media_types::{DisplayInfo, FrameSink, VideoSource, WindowInfo};
-use ashpd::desktop::screencast::CursorMode;
 
 /// A rectangle of a display, in the display's logical units (points) from its
 /// top-left corner.
@@ -268,7 +267,7 @@ fn portal_timeout() -> Duration {
 /// RandR knows the sizes and the picker is not involved.
 struct Pending {
     request: ScreenRequest,
-    cursor: CursorMode,
+    opts: CaptureOptions,
     prepared: portal::Prepared,
 }
 
@@ -321,14 +320,15 @@ fn resolve_portal(req: &ScreenRequest) -> Result<(Target, (usize, usize))> {
             req.display
         );
     }
-    // The cursor mode is only known when the capture starts, and the picker's
-    // grant is per session; Embedded is upstream's default, so reuse this
-    // session whenever the recording keeps the cursor visible.
-    let prepared = portal::prepare(want, CursorMode::Embedded, portal_timeout())?;
+    // `--no-cursor`/`--clicks` are not known here (the CLI resolves the size
+    // before it builds the writer), so this session uses upstream's defaults.
+    // `open_with` reuses it when the options match and otherwise asks again;
+    // the restore token makes that second handshake silent.
+    let prepared = portal::prepare(want, CaptureOptions::default(), portal_timeout())?;
     let (target, native) = target_from_portal(req, &prepared)?;
     let new = Pending {
         request: req.clone(),
-        cursor: CursorMode::Embedded,
+        opts: CaptureOptions::default(),
         prepared,
     };
     if let Some(old) = PENDING.lock().unwrap().replace(new) {
@@ -424,17 +424,6 @@ pub fn open_with(req: &ScreenRequest, opts: &CaptureOptions) -> Result<Box<dyn V
     }
 }
 
-/// The cursor mode a portal session needs for `opts`.
-fn cursor_mode(opts: &CaptureOptions) -> CursorMode {
-    if opts.clicks || !opts.cursor {
-        // Metadata hands us the pointer position (and, when the compositor
-        // sends one, its bitmap) instead of baking it into the pixels.
-        CursorMode::Metadata
-    } else {
-        CursorMode::Embedded
-    }
-}
-
 /// A Wayland capture: the portal session plus the PipeWire stream.
 struct PortalSource {
     /// The portal session; closing it stops the compositor capturing.
@@ -445,23 +434,9 @@ struct PortalSource {
 
 impl PortalSource {
     fn open(req: &ScreenRequest, opts: CaptureOptions) -> Result<PortalSource> {
-        let mode = cursor_mode(&opts);
-        let prepared = take_pending(req, mode)?;
-        if opts.clicks {
-            warn_once(
-                "Wayland does not let an application see mouse buttons, so --clicks cannot \
-                 highlight clicks here; the cursor itself is still recorded. Use an X11 session \
-                 for click highlighting.",
-            );
-        }
-        if prepared.cursor_mode != mode {
-            // `resolve` prepared the session before `--no-cursor`/`--clicks`
-            // were known. A session's cursor mode is fixed once its sources are
-            // selected, so start over with the right one; the restore token
-            // makes that second handshake silent on every desktop that honours
-            // it.
-            prepared.close();
-            return PortalSource::open(req, opts);
+        let prepared = take_pending(req, opts)?;
+        if let Some(note) = &prepared.cursor_note {
+            warn_once(note);
         }
         let crop = match &req.region {
             Some(r) => {
@@ -498,11 +473,11 @@ impl PortalSource {
     }
 }
 
-/// The pending session for `req`, or a fresh handshake.
-fn take_pending(req: &ScreenRequest, mode: CursorMode) -> Result<portal::Prepared> {
+/// The pending session for `req` and `opts`, or a fresh handshake.
+fn take_pending(req: &ScreenRequest, opts: CaptureOptions) -> Result<portal::Prepared> {
     let pending = PENDING.lock().unwrap().take();
     if let Some(p) = pending {
-        if p.request == *req && p.cursor == mode {
+        if p.request == *req && p.opts == opts {
             return Ok(p.prepared);
         }
         p.prepared.close();
@@ -512,7 +487,7 @@ fn take_pending(req: &ScreenRequest, mode: CursorMode) -> Result<portal::Prepare
     } else {
         Want::Monitor
     };
-    portal::prepare(want, mode, portal_timeout())
+    portal::prepare(want, opts, portal_timeout())
 }
 
 impl VideoSource for PortalSource {
@@ -548,7 +523,7 @@ pub fn permission_status(request: bool, wait: u64) -> Result<String> {
 /// Run the ScreenCast dialog once and keep the grant.
 pub fn request_permission(wait: u64) -> Result<()> {
     let timeout = Duration::from_secs(wait.max(5));
-    let prepared = portal::prepare(Want::Monitor, CursorMode::Embedded, timeout)?;
+    let prepared = portal::prepare(Want::Monitor, CaptureOptions::default(), timeout)?;
     println!("screen recording : granted for {}", prepared.picked);
     prepared.close();
     Ok(())
@@ -656,22 +631,14 @@ mod tests {
     #[test]
     fn capture_options_default_to_upstreams_cursor_and_no_clicks() {
         let o = CaptureOptions::default();
-        assert!(o.cursor);
-        assert!(!o.clicks);
-        assert_eq!(cursor_mode(&o), CursorMode::Embedded);
-        assert_eq!(
-            cursor_mode(&CaptureOptions {
+        assert!(o.cursor, "upstream shows the cursor by default");
+        assert!(!o.clicks, "upstream highlights clicks only with --clicks");
+        assert_ne!(
+            o,
+            CaptureOptions {
                 cursor: true,
                 clicks: true
-            }),
-            CursorMode::Metadata
-        );
-        assert_eq!(
-            cursor_mode(&CaptureOptions {
-                cursor: false,
-                clicks: false
-            }),
-            CursorMode::Metadata
+            }
         );
     }
 

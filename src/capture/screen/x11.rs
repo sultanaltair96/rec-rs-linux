@@ -163,6 +163,13 @@ impl Server {
         // Stable numbering: the primary comes first because `--display 1` means
         // "main display" upstream too.
         out.sort_by_key(|(d, r)| (!d.primary, r.x, r.y));
+        // A server that reports no primary (Xvfb, a bare X session, some
+        // drivers) still has a main display: the first one.
+        if !out.iter().any(|(d, _)| d.primary)
+            && let Some((d, _)) = out.first_mut()
+        {
+            d.primary = true;
+        }
         for (i, (d, _)) in out.iter_mut().enumerate() {
             d.index = i + 1;
         }
@@ -590,6 +597,10 @@ fn run(
     let mut buttons = 0u16;
     let mut cursor = None;
     let mut last = Instant::now();
+    // Where the pointer was when the last frame was made: a cursor that moves
+    // over an otherwise static screen is a new frame, because the cursor is
+    // part of the picture we produce.
+    let mut drawn_pointer: Option<(i32, i32)> = None;
     // The ring outlives the click, so keep one slice of recent clicks.
     while !stop.load(Ordering::SeqCst) {
         let now = media_types::now();
@@ -629,10 +640,19 @@ fn run(
             }
         };
         // Identical pixels: nothing to deliver, the writer repeats the last
-        // frame. This is what keeps a still desktop cheap.
-        let changed = previous
+        // frame. This is what keeps a still desktop cheap. What we draw on top
+        // of the pixels counts too: a moving cursor and a live click ring are
+        // new pictures even when the screen behind them is still.
+        let mut changed = previous
             .as_ref()
             .is_none_or(|p| p.len() != data.len() || p[..] != data[..]);
+        let pointer_at = pointer.map(|(x, y, _)| (x, y));
+        if opts.cursor && pointer_at != drawn_pointer {
+            changed = true;
+        }
+        if opts.clicks && !clicks.is_empty() {
+            changed = true;
+        }
         if changed {
             let mut data = data;
             if opts.cursor || opts.clicks {
@@ -664,6 +684,7 @@ fn run(
                 }
             }
             previous = Some(Arc::from(data.as_slice()));
+            drawn_pointer = pointer_at;
             sink(VideoFrame::packed(
                 now,
                 spec.rect.width,
@@ -690,6 +711,257 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    /// A window we own, destroyed when the test ends.
+    ///
+    /// Red (0x00ff0000 in X's RGB masks) so a captured frame's colour is
+    /// unmistakable, with `WM_CLASS`/`WM_NAME` set the way a real client sets
+    /// them.
+    struct TestWindow {
+        server: Server,
+        win: Window,
+        /// Unique per test, so parallel tests do not capture each other's
+        /// windows (they are all solid red and the same size).
+        tag: String,
+    }
+
+    impl TestWindow {
+        /// A window at `x`,`y`. Tests use different positions: without a
+        /// compositor, `GetImage` of an obscured window is undefined, so two
+        /// test windows must not overlap.
+        fn open(server: Server, tag: &str, x: i16, y: i16, width: u16, height: u16) -> TestWindow {
+            let win = server.conn.generate_id().unwrap();
+            server
+                .conn
+                .create_window(
+                    server.conn.setup().roots[0].root_depth,
+                    win,
+                    server.root,
+                    x,
+                    y,
+                    width,
+                    height,
+                    0,
+                    x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                    0,
+                    &x11rb::protocol::xproto::CreateWindowAux::new().background_pixel(0x00ff0000),
+                )
+                .unwrap();
+            let title = format!("rec-rs test window {tag}");
+            server
+                .conn
+                .change_property8(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_NAME,
+                    AtomEnum::STRING,
+                    title.as_bytes(),
+                )
+                .unwrap();
+            let class = format!("{tag}\0{tag}\0");
+            server
+                .conn
+                .change_property8(
+                    x11rb::protocol::xproto::PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    class.as_bytes(),
+                )
+                .unwrap();
+            server.conn.map_window(win).unwrap();
+            // Paint the background now: without a compositor or a window
+            // manager nothing else would, and GetImage would read an
+            // unpainted (black) window.
+            server
+                .conn
+                .clear_area(false, win, 0, 0, width, height)
+                .unwrap();
+            server.conn.flush().unwrap();
+            // Give the server a moment to map it, so `windows()` sees it as
+            // viewable.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            TestWindow {
+                server,
+                win,
+                tag: tag.to_string(),
+            }
+        }
+
+        /// XTEST input, so the pointer and buttons move exactly as a real
+        /// device would (the server generates the events).
+        fn pointer_to(&self, x: i16, y: i16) {
+            // MOTION_NOTIFY is event type 6.
+            self.server
+                .conn
+                .xtest_fake_input(6, 0, 0, self.server.root, x, y, 0)
+                .unwrap();
+            self.server.conn.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+
+        fn button(&self, press: bool) {
+            // BUTTON_PRESS is 4, BUTTON_RELEASE is 5; detail 1 is the left
+            // button.
+            self.server
+                .conn
+                .xtest_fake_input(if press { 4 } else { 5 }, 1, 0, 0, 0, 0, 0)
+                .unwrap();
+            self.server.conn.flush().unwrap();
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = self.server.conn.destroy_window(self.win);
+            let _ = self.server.conn.flush();
+        }
+    }
+
+    /// The X server from `$DISPLAY`, or `None` when the tests run without one
+    /// (the normal case: the X11 tests only run inside `scripts/screen/xvfb.sh`).
+    fn live_server() -> Option<Server> {
+        std::env::var_os("DISPLAY")?;
+        Server::connect().ok()
+    }
+
+    /// Collects every frame a source delivers.
+    fn collector() -> (crate::media_types::FrameSink, Arc<Mutex<Vec<VideoFrame>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let sink_frames = frames.clone();
+        let sink: crate::media_types::FrameSink =
+            Arc::new(move |f: VideoFrame| sink_frames.lock().unwrap().push(f));
+        (sink, frames)
+    }
+
+    fn red_of(frame: &VideoFrame, x: usize, y: usize) -> u8 {
+        let p = &frame.planes[0];
+        p.data[y * p.stride + x * 4 + 2]
+    }
+
+    fn green_of(frame: &VideoFrame, x: usize, y: usize) -> u8 {
+        let p = &frame.planes[0];
+        p.data[y * p.stride + x * 4 + 1]
+    }
+
+    #[test]
+    fn a_monitor_and_a_window_are_enumerated() {
+        let Some(server) = live_server() else {
+            return;
+        };
+        let displays = server.displays();
+        assert!(!displays.is_empty(), "an X server always has a display");
+        assert_eq!(displays[0].index, 1);
+        assert!(displays[0].primary, "the first display is the main one");
+        assert!(displays[0].pixels.0 >= 2 && displays[0].pixels.1 >= 2);
+        let window = TestWindow::open(server, "enumerate-test", 0, 0, 300, 200);
+        // The window list finds it by class and by title, without a window
+        // manager (Xvfb has none).
+        let windows = window.server.windows();
+        let found = windows
+            .iter()
+            .find(|w| w.app == "enumerate-test")
+            .unwrap_or_else(|| panic!("the test window is not listed: {windows:?}"));
+        assert_eq!(found.title, "rec-rs test window enumerate-test");
+        assert_eq!(found.size, (300, 200));
+        // And the selector resolves it by id and by substring.
+        let (spec, w) = resolve_window(&window.server, &window.tag).unwrap();
+        assert_eq!(w.id, found.id);
+        assert_eq!(spec.rect, Rect::new(0, 0, 300, 200));
+        let (spec2, _) = resolve_window(&window.server, &found.id.to_string()).unwrap();
+        assert_eq!(spec2.drawable, spec.drawable);
+    }
+
+    #[test]
+    fn a_window_is_captured_with_its_own_pixels() {
+        let Some(server) = live_server() else {
+            return;
+        };
+        let window = TestWindow::open(server, "capture-test", 400, 0, 300, 200);
+        let (spec, _) = resolve_window(&window.server, &window.tag).unwrap();
+        let mut source = Source::new(spec, CaptureOptions::default());
+        let (sink, frames) = collector();
+        VideoSource::start(&mut source, sink).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        VideoSource::stop(&mut source).unwrap();
+        let frames = frames.lock().unwrap();
+        assert!(!frames.is_empty(), "no frame was captured");
+        // The last frame, not the first: a frame may be captured before the
+        // server has painted the window.
+        let f = frames.last().unwrap();
+        assert_eq!((f.width, f.height), (300, 200));
+        assert_eq!(f.format, PixelFormat::Bgra);
+        // The window is solid red: BGRX bytes are 00 00 ff.
+        assert_eq!(red_of(f, 150, 100), 255, "red window");
+        assert_eq!(green_of(f, 150, 100), 0);
+        // The pointer was never over it, so nothing was drawn over the middle.
+        assert_eq!(red_of(f, 150, 100), 255);
+    }
+
+    #[test]
+    fn a_region_crops_a_monitor() {
+        let Some(server) = live_server() else {
+            return;
+        };
+        let region = super::super::Region {
+            x: 4.0,
+            y: 6.0,
+            width: 320.0,
+            height: 240.0,
+        };
+        let (spec, d) = resolve_display(&server, 1, Some(&region)).unwrap();
+        assert_eq!((spec.rect.width, spec.rect.height), (320, 240));
+        assert_eq!(spec.origin, (region.x as i32, region.y as i32));
+        assert!(d.pixels.0 >= 320);
+    }
+
+    #[test]
+    fn a_click_draws_a_ring_at_the_pointer() {
+        let Some(server) = live_server() else {
+            return;
+        };
+        let window = TestWindow::open(server, "click-test", 800, 0, 300, 200);
+        let (spec, _) = resolve_window(&window.server, &window.tag).unwrap();
+        let origin = spec.origin;
+        let mut source = Source::new(
+            spec,
+            CaptureOptions {
+                cursor: false,
+                clicks: true,
+            },
+        );
+        let (sink, frames) = collector();
+        VideoSource::start(&mut source, sink).unwrap();
+        // Let one clean frame through first.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // The pointer is in root coordinates; the window is not at the origin.
+        window.pointer_to(origin.0 as i16 + 150, origin.1 as i16 + 100);
+        window.button(true);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        window.button(false);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        VideoSource::stop(&mut source).unwrap();
+        let frames = frames.lock().unwrap();
+        // At least one frame shows the ring: a white-ish pixel somewhere near
+        // the pointer, on an otherwise solid red window.
+        let ring = frames.iter().any(|f| {
+            (0..f.height).any(|y| {
+                (0..f.width).any(|x| {
+                    let (dx, dy) = (x as i32 - 150, y as i32 - 100);
+                    let d2 = dx * dx + dy * dy;
+                    // 4..40 px from the pointer: the ring's neighbourhood.
+                    (16..1600).contains(&d2) && red_of(f, x, y) > 200 && green_of(f, x, y) > 200
+                })
+            })
+        });
+        assert!(
+            ring,
+            "no click ring in {} frames (button events were not seen)",
+            frames.len()
+        );
+    }
 
     #[test]
     fn wm_class_takes_the_class_not_the_instance() {

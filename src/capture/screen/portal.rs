@@ -30,8 +30,9 @@ use ashpd::Error as PortalError;
 use ashpd::desktop::ResponseError;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
+use ashpd::enumflags2::BitFlags;
 
-use super::{Want, pipewire, token};
+use super::{CaptureOptions, Want, pipewire, token};
 
 /// The async runtime every portal call is driven on.
 ///
@@ -110,7 +111,9 @@ pub struct Prepared {
     /// reports one. Equal to `pixels` at scale 1.
     pub points: (usize, usize),
     pub want: Want,
-    pub cursor_mode: CursorMode,
+    /// Why the cursor looks different from what `--no-cursor`/`--clicks` asked
+    /// for, when the desktop could not do it.
+    pub cursor_note: Option<String>,
     /// One line about what the picker chose.
     pub picked: String,
 }
@@ -134,14 +137,49 @@ impl Prepared {
 ///
 /// `timeout` bounds the dialog: a picker that is never answered must fail the
 /// recording with a message, not hang it.
-pub fn prepare(want: Want, cursor: CursorMode, timeout: Duration) -> Result<Prepared> {
-    let types = match want {
-        Want::Monitor => SourceType::Monitor,
-        Want::Window => SourceType::Window,
-    };
+pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Prepared> {
     let mut saved = token::load();
     let result = runtime().block_on(async {
         let screencast = Screencast::new().await.map_err(portal_error)?;
+        // Ask what this desktop can actually do before asking it to do it: a
+        // session created with an unsupported source type or cursor mode is
+        // rejected outright, and the error says only "Unavailable cursor mode
+        // 4", which helps nobody.
+        let types = screencast
+            .available_source_types()
+            .await
+            .map_err(portal_error)?;
+        let mode_wanted = match want {
+            Want::Monitor => SourceType::Monitor,
+            Want::Window => SourceType::Window,
+        };
+        if !types.contains(mode_wanted) {
+            let offer = match (
+                types.contains(SourceType::Monitor),
+                types.contains(SourceType::Window),
+            ) {
+                (true, false) => "monitors only",
+                (false, true) => "windows only",
+                _ => "no monitors and no windows",
+            };
+            return Err(anyhow!(
+                "this desktop's screen-cast portal offers {offer}, so {} cannot be captured. \
+                 Record the display (`--region` for part of it) instead",
+                if want == Want::Window {
+                    "a single window"
+                } else {
+                    "a display"
+                }
+            ));
+        }
+        let available = screencast
+            .available_cursor_modes()
+            .await
+            .unwrap_or(CursorMode::Hidden | CursorMode::Embedded);
+        // The chosen mode goes straight into the request; only a fallback is
+        // worth telling the user about later.
+        let (cursor, cursor_note) = choose_cursor(available, opts);
+        let types = BitFlags::from(mode_wanted);
         let session = screencast.create_session().await.map_err(portal_error)?;
         // A stale token is retried without: the portal then asks again, which
         // is recoverable, while failing the recording is not.
@@ -149,24 +187,28 @@ pub fn prepare(want: Want, cursor: CursorMode, timeout: Duration) -> Result<Prep
             .select_sources(
                 &session,
                 cursor,
-                ashpd::enumflags2::BitFlags::from(types),
+                types,
                 false,
                 saved.as_deref(),
                 PersistMode::ExplicitlyRevoked,
             )
             .await;
-        if select.is_err() && saved.is_some() {
+        if let Err(e) = &select
+            && saved.is_some()
+        {
+            // A revoked or expired grant, or a portal that never honoured it.
+            // Ask again rather than fail the recording.
             saved = None;
             let _ = token::clear();
             eprintln!(
-                "rec: the saved screen-capture grant is no longer valid; the system picker will \
+                "rec: the saved screen-capture grant was refused ({e}); the system picker will \
                  ask again"
             );
             select = screencast
                 .select_sources(
                     &session,
                     cursor,
-                    ashpd::enumflags2::BitFlags::from(types),
+                    types,
                     false,
                     None,
                     PersistMode::ExplicitlyRevoked,
@@ -185,9 +227,9 @@ pub fn prepare(want: Want, cursor: CursorMode, timeout: Duration) -> Result<Prep
             })?
             .map_err(portal_error)?;
         let streams = request.response().map_err(portal_error)?;
-        Ok::<_, anyhow::Error>((screencast, session, streams))
+        Ok::<_, anyhow::Error>((screencast, session, streams, cursor_note))
     });
-    let (screencast, session, streams) = result?;
+    let (screencast, session, streams, cursor_note) = result?;
     if let Some(t) = streams.restore_token()
         && let Err(e) = token::store(t)
     {
@@ -253,9 +295,54 @@ pub fn prepare(want: Want, cursor: CursorMode, timeout: Duration) -> Result<Prep
         } else {
             Want::Monitor
         },
-        cursor_mode: cursor,
+        cursor_note,
         picked,
     })
+}
+
+/// Pick the cursor mode the desktop can do, and explain anything it cannot.
+///
+/// `Embedded` is what upstream's "cursor shown" means: the compositor paints
+/// the pointer into the stream, with its own theme and no sampling error.
+/// `Metadata` carries the pointer's position and its bitmap separately, which is
+/// the only way to *move* the cursor in the picture ourselves — but no portal
+/// sends mouse button state, so it cannot make `--clicks` work either. A mode
+/// the portal does not support fails the whole session, so ask first.
+fn choose_cursor(
+    available: BitFlags<CursorMode>,
+    opts: CaptureOptions,
+) -> (CursorMode, Option<String>) {
+    let can = |m: CursorMode| available.contains(m);
+    if !opts.cursor {
+        if can(CursorMode::Hidden) {
+            return (CursorMode::Hidden, None);
+        }
+        return (
+            shown_mode(&available),
+            Some(
+                "this desktop's portal cannot hide the cursor (it offers no hidden cursor mode), \
+                 so it is recorded"
+                    .to_string(),
+            ),
+        );
+    }
+    let note = opts.clicks.then(|| {
+        "desktop portals do not report mouse buttons, so --clicks cannot highlight clicks in a          Wayland recording; the cursor itself is recorded (an X11 session highlights clicks)"
+            .to_string()
+    });
+    (shown_mode(&available), note)
+}
+
+/// The best way to have the pointer visible: the compositor draws it, else we
+/// composite its bitmap from the metadata, else it cannot be shown.
+fn shown_mode(available: &BitFlags<CursorMode>) -> CursorMode {
+    if available.contains(CursorMode::Embedded) {
+        CursorMode::Embedded
+    } else if available.contains(CursorMode::Metadata) {
+        CursorMode::Metadata
+    } else {
+        CursorMode::Hidden
+    }
 }
 
 /// The pixel size the compositor will send.
@@ -352,6 +439,61 @@ mod tests {
         }
         let err = available().unwrap_err().to_string();
         assert!(err.contains("xdg-desktop-portal"), "{err}");
+    }
+
+    #[test]
+    fn cursor_modes_fall_back_to_what_the_portal_offers() {
+        let both: BitFlags<CursorMode> =
+            CursorMode::Hidden | CursorMode::Embedded | CursorMode::Metadata;
+        let wlr: BitFlags<CursorMode> = CursorMode::Hidden | CursorMode::Embedded;
+        let shown = CaptureOptions {
+            cursor: true,
+            clicks: false,
+        };
+        // "Cursor shown" is the compositor's own cursor, not metadata.
+        assert_eq!(choose_cursor(both, shown), (CursorMode::Embedded, None));
+        assert_eq!(choose_cursor(wlr, shown), (CursorMode::Embedded, None));
+        // --clicks cannot work over a portal (no button events), and says so
+        // rather than silently doing nothing.
+        let clicks = CaptureOptions {
+            cursor: true,
+            clicks: true,
+        };
+        let (mode, note) = choose_cursor(both, clicks);
+        assert_eq!(mode, CursorMode::Embedded);
+        assert!(note.unwrap().contains("--clicks"));
+        // Hiding needs the hidden mode.
+        assert_eq!(
+            choose_cursor(
+                wlr,
+                CaptureOptions {
+                    cursor: false,
+                    clicks: false
+                }
+            ),
+            (CursorMode::Hidden, None)
+        );
+        // A portal that only sends metadata: we composite the bitmap
+        // ourselves, and cannot hide it.
+        let only_meta: BitFlags<CursorMode> = CursorMode::Metadata.into();
+        assert_eq!(
+            choose_cursor(only_meta, shown),
+            (CursorMode::Metadata, None)
+        );
+        let (mode, note) = choose_cursor(
+            only_meta,
+            CaptureOptions {
+                cursor: false,
+                clicks: false,
+            },
+        );
+        assert_eq!(mode, CursorMode::Metadata);
+        assert!(note.unwrap().contains("cannot hide"));
+        // Nothing available at all: hidden, with no complaint.
+        assert_eq!(
+            choose_cursor(BitFlags::empty(), shown).0,
+            CursorMode::Hidden
+        );
     }
 
     #[test]
