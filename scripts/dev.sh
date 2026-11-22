@@ -7,11 +7,15 @@
 #   scripts/dev.sh --clean            # kill leftover containers of this repo
 #   scripts/dev.sh                    # interactive shell
 #
-# The image (tag rec-rs-linux-dev) is built from dev/Dockerfile on first use or
-# when the Dockerfile changes. The repo is mounted at the same absolute path,
-# the command runs as the host uid/gid, the cargo registry cache lives in the
-# named volume rec-rs-linux-cache, and CARGO_TARGET_DIR points at a per-worktree
-# directory inside that volume so parallel worktrees never wait on one lock.
+# The image is built from dev/Dockerfile and tagged by its content
+# (rec-rs-linux-dev:<first 12 hex of the Dockerfile's sha256>), so several
+# Dockerfile versions coexist: a worktree with an edited Dockerfile builds its
+# own tag instead of rebuilding over — and being rebuilt back by — the others.
+# A tag is only ever built when it is missing. The repo is mounted at the same
+# absolute path, the command runs as the host uid/gid, the cargo registry cache
+# lives in the named volume rec-rs-linux-cache (shared by every tag), and
+# CARGO_TARGET_DIR points at a per-worktree directory inside that volume so
+# parallel worktrees never wait on one lock.
 #
 # A container is always named rec-rs-dev-<pid> and carries the label
 # rec-rs-dev=1. It runs with --init and --rm, and this script kills it when it
@@ -25,7 +29,7 @@
 set -eu
 
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
-IMAGE=rec-rs-linux-dev
+IMAGE_BASE=rec-rs-linux-dev
 VOLUME=rec-rs-linux-cache
 DOCKERFILE="$REPO/dev/Dockerfile"
 NAME="rec-rs-dev-$$"
@@ -61,13 +65,13 @@ if [ -z "${DOCKER_CONFIG:-}" ] && [ -f "${HOME:-/nonexistent}/.docker/config.jso
 fi
 
 # --- image ----------------------------------------------------------------
-# The image records the Dockerfile's hash as a label, so it is rebuilt when the
-# Dockerfile changes and reused otherwise.
-want=$(sha256sum "$DOCKERFILE" | cut -d' ' -f1)
-have=$(docker image inspect -f '{{index .Config.Labels "rec-rs-linux.dockerfile"}}' "$IMAGE" 2>/dev/null || true)
-if [ "$want" != "$have" ]; then
+# One tag per Dockerfile content, built once. Parallel worktrees can sit on
+# different Dockerfile versions without rebuilding each other's image.
+content=$(sha256sum "$DOCKERFILE" | cut -c1-12)
+IMAGE="$IMAGE_BASE:$content"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "dev.sh: building $IMAGE (first run takes a few minutes)..." >&2
-    docker build --label "rec-rs-linux.dockerfile=$want" -t "$IMAGE" -f "$DOCKERFILE" "$REPO/dev"
+    docker build --label "rec-rs-linux.dockerfile=$content" -t "$IMAGE" -f "$DOCKERFILE" "$REPO/dev"
 fi
 
 UID_HOST=$(id -u)

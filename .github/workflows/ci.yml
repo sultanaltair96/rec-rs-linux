@@ -2,8 +2,8 @@ name: ci
 
 # Everything runs in the same dev container developers use, so CI and a local
 # `scripts/dev.sh cargo test` cannot drift. The image is built with the
-# buildx/GHA layer cache and tagged with the Dockerfile's hash, which is the
-# label scripts/dev.sh compares to decide whether it must rebuild.
+# buildx/GHA layer cache and tagged by its Dockerfile content
+# (rec-rs-linux-dev:<sha256 prefix>), which is the tag scripts/dev.sh looks for.
 on:
   push:
     branches: [main]
@@ -25,18 +25,17 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Dockerfile hash (the label scripts/dev.sh checks)
+      - name: Dockerfile tag (content-addressed, the tag scripts/dev.sh looks for)
         id: dockerfile
-        run: echo "hash=$(sha256sum dev/Dockerfile | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(sha256sum dev/Dockerfile | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Build the dev image
         uses: docker/build-push-action@v6
         with:
           context: dev
           file: dev/Dockerfile
-          tags: rec-rs-linux-dev
+          tags: rec-rs-linux-dev:${{ steps.dockerfile.outputs.tag }}
           load: true
-          labels: rec-rs-linux.dockerfile=${{ steps.dockerfile.outputs.hash }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -58,7 +57,8 @@ jobs:
       - name: Keep the self-test recordings and logs when something failed
         if: failure()
         run: |
-          docker run --rm -v "$PWD:/out" -v rec-rs-linux-cache:/home/dev rec-rs-linux-dev \
+          docker run --rm -v "$PWD:/out" -v rec-rs-linux-cache:/home/dev \
+            "rec-rs-linux-dev:$(sha256sum dev/Dockerfile | cut -c1-12)" \
             sh -c 'cp -r /home/dev/Videos/rec-rs-tests /out/selftest-results 2>/dev/null || true'
 
       - uses: actions/upload-artifact@v4
