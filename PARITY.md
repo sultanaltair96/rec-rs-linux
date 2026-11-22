@@ -23,7 +23,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `-r/--resolution` | 720p/1080p/1440p/4k/native/WxH, source aspect, never upscaled | Identical maths (ported) | 0 | done | unit `tests::sizes` (incl. portrait, odd sizes, 16:10 examples) |
 | `-f/--fps` | 24/25/30/50/60/120 (divisors of 60000) | Same validation and grid | 0 | done | unit `tests::bad_arguments_are_rejected`; selftest CFR check |
 | `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection; HEVC/ProRes need an encoder the host has | 0 (choice), 1C (encoders) | partial | selftest `pattern-prores`; `pattern-hevc` skipped with the element reason |
-| `--bitrate` | Mb/s, else bits/pixel heuristic | Same heuristic (ported) | 0 | done | unit `tests::test_pattern_prepares_without_a_display` (4K ≥ 30 Mb/s) |
+| `--bitrate` | Mb/s, else bits/pixel heuristic | Same heuristic (ported); the encoder honours it where the element supports rate control (x264, VA-API) | 0 (heuristic), 1C (encoders) | partial | unit `tests::test_pattern_prepares_without_a_display` (4K ≥ 30 Mb/s); openh264enc ignores it (dev/ELEMENTS.md) |
 | `--system-audio` / `--no-system-audio` | On by default, flags override each other | Same | 0 | done | unit `tests::system_audio_flags_override_each_other`; selftest `gain` (system track) |
 | `--mic DEVICE` / `--no-mic` | Default mic, id or name substring | PipeWire node by id/name | 1B | todo | parses: unit `tests::goal_command_line_parses`; unavailable mic warns and continues |
 | `-w/--cam/--webcam [DEVICE]` | Webcam overlay, default or device | V4L2 (or camera portal in Flatpak) | 1B | todo | parses: unit `tests::goal_command_line_parses` |
@@ -94,7 +94,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer (openh264enc / x264 / VA-API; ProRes via `avenc_prores_ks`) | 0 (H.264, ProRes), 1C (HW/HEVC) | partial | selftest `pattern-1080-h264`, `pattern-mp4`, `pattern-prores`; `probe` reports h264/prores |
+| Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer (openh264enc / x264 / VA-API; ProRes via `avenc_prores_ks`). In the dev image openh264enc gives Constrained Baseline; x264/VA-API on a desktop give High | 0 (H.264, ProRes), 1C (HW/HEVC, profile) | partial | selftest `pattern-1080-h264`, `pattern-mp4`, `pattern-prores`; `ffprobe` reports h264 / prores, profile Constrained Baseline (dev/ELEMENTS.md) |
 | BT.709 tagging | Yes | `videoconvert` + encoder default (BT.709 for HD) | 1C (explicit tags) | todo | — |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |

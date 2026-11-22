@@ -26,7 +26,7 @@ scripts/dev.sh sh -c 'for e in openh264enc avenc_h264 x264enc vah264enc \
 | `vah264enc` (VA-API) | **no** | Fedora's `gst-plugins-bad-free` does not build the VA plugin's encoders, and the container has no GPU anyway. Phase 1C/1F add it for real desktops (RPM Fusion, or the Flatpak runtime). |
 | `vaapih264enc` | **no** | Same. |
 | `x264enc` | **no** | Needs RPM Fusion's `gstreamer1-plugins-ugly`, which is not in Fedora's free repos. |
-| `openh264enc` | **yes** | The only H.264 encoder here. Its `bitrate` property is in **bits per second**, `rate-control=bitrate` must be set for it to honour it, and the keyframe interval is `gop-size` (frames). |
+| `openh264enc` | **yes** | The only H.264 encoder here. `bitrate` is in **bits per second**, the keyframe interval is `gop-size` (frames). It has no `profile` property: it always encodes **Constrained Baseline**, where upstream writes H.264 High. Its `rate-control=bitrate` does not bound the bitrate in this build — a 1080p60 noisy pattern encoded to 255 Mb/s at a requested 2 Mb/s (and to 10 Mb/s with `enable-frame-skip=true`, which encodes 2 frames out of 120 and so cannot be used for a constant-frame-rate recording). Treat its bitrate as advisory; phase 1C gets x264/VA-API where the budget is honoured. |
 | `avenc_h264` | **no** | `gst-libav` is built from `ffmpeg-free`, which has no libx264. |
 | `x265enc` | **no** | RPM Fusion only. |
 | `vah265enc` | **no** | As above. |
