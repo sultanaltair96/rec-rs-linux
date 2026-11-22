@@ -196,7 +196,20 @@ pub fn remove_stale(i: &Integration, appimage: &Path) -> Result<bool> {
 /// entry for this exact file). `REC_INTEGRATE=1` does it without asking,
 /// `REC_INTEGRATE=0` never does (self-tests and packagers use it).
 pub fn should_offer_integration(appimage: &Path, home_data: &Path) -> bool {
-    match std::env::var("REC_INTEGRATE").ok().as_deref() {
+    should_offer_integration_with(
+        appimage,
+        home_data,
+        std::env::var("REC_INTEGRATE").ok().as_deref(),
+    )
+}
+
+/// [`should_offer_integration`] with the override given (tests).
+pub fn should_offer_integration_with(
+    appimage: &Path,
+    home_data: &Path,
+    mode: Option<&str>,
+) -> bool {
+    match mode {
         Some("1") => true,
         Some("0") => false,
         _ => {

@@ -63,6 +63,10 @@ use self::session::{SessionExt, StreamStatus};
 pub enum Cmd {
     ToggleRecording,
     TogglePause,
+    /// Start/pause/resume from the control socket (`rec-rs gui`'s second
+    /// launch and scripts), which mean exactly one of the three.
+    Pause,
+    Resume,
     ShowWindow,
     /// Close the main window to the tray (Ctrl+W).
     HideWindow,
@@ -423,6 +427,9 @@ struct App {
     main_visible: bool,
     st: State,
     tray: Option<ksni::blocking::Handle<tray::Tray>>,
+    /// The tray starts on a thread: registering the status item talks to D-Bus,
+    /// and a slow (or missing) watcher must not hold up the first frame.
+    tray_rx: Option<Receiver<Option<ksni::blocking::Handle<tray::Tray>>>>,
     tap: preview::Tap,
     tap_sink: FrameSink,
     preview_texture: Option<egui::TextureHandle>,
@@ -467,6 +474,7 @@ impl App {
             main_visible: true,
             st,
             tray: None,
+            tray_rx: None,
             tap,
             tap_sink,
             preview_texture: None,
@@ -982,6 +990,16 @@ impl App {
         match c {
             Cmd::ToggleRecording => self.toggle_recording(),
             Cmd::TogglePause => self.toggle_pause(),
+            Cmd::Pause => {
+                if let Some(s) = &self.st.recording {
+                    s.pause();
+                }
+            }
+            Cmd::Resume => {
+                if let Some(s) = &self.st.recording {
+                    s.resume();
+                }
+            }
             Cmd::ShowWindow => self.show_main(el),
             Cmd::HideWindow => self.hide_main(),
             Cmd::ShowSettings => self.show_settings(el),
@@ -1127,11 +1145,17 @@ impl App {
             finishing: self.st.finishing,
             clock,
             has_last: self.st.last_file.is_some(),
-            replay: self.st.replay_stats.is_some() || self.st.settings.replay_enabled,
+            replay: self.st.replay_stats.is_some(),
             live: self.st.streaming(),
             updates: self.st.updates,
             hotkey_ok: self.st.hotkey_ok,
         };
+        if let Some(rx) = &self.tray_rx
+            && let Ok(handle) = rx.try_recv()
+        {
+            self.tray_rx = None;
+            self.tray = handle;
+        }
         if let Some(t) = &self.tray {
             tray::update(t, view);
         }
@@ -1151,10 +1175,12 @@ impl App {
                     if self.st.recording.is_some() {
                         Cmd::ToggleRecording
                     } else {
-                        Cmd::ShowWindow
+                        // Nothing to stop: leave the app as it is.
+                        continue;
                     }
                 }
-                Control::Pause | Control::Resume => Cmd::TogglePause,
+                Control::Pause => Cmd::Pause,
+                Control::Resume => Cmd::Resume,
                 Control::SaveReplay => Cmd::SaveReplay,
                 Control::Quit => Cmd::Quit,
             };
@@ -1191,6 +1217,9 @@ impl App {
                 }
                 self.st.preview_tex = self.preview_texture.as_ref().map(|h| h.id());
                 self.st.frames_shown += 1;
+                if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!("rec: debug: preview frame {}x{}", px[0], px[1]);
+                }
             }
         }
         let win = if is_main {
@@ -1309,7 +1338,15 @@ impl ApplicationHandler for App {
             hotkey_ok: self.st.hotkey_ok,
             ..Default::default()
         };
-        self.tray = tray::start(view, Arc::new(push));
+        // Never block the event loop on the status notifier.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rec-tray-start".into())
+            .spawn(move || {
+                let _ = tx.send(tray::start(view, Arc::new(push)));
+            })
+            .ok();
+        self.tray_rx = Some(rx);
         if std::env::var_os("REC_GUI_HIDDEN").is_some() {
             self.main_visible = false;
             self.tap.set_wanted(false);

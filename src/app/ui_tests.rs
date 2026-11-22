@@ -465,6 +465,62 @@ fn go_live_needs_a_stream_key() {
 }
 
 #[test]
+fn the_app_menu_has_updates_unless_flatpak() {
+    let mut st = State::new(Settings::default());
+    st.updates = true;
+    let mut h = main_harness(st);
+    h.get_by_label("⋯").click();
+    h.run();
+    for label in ["Check for Updates…", "Open Recordings Folder", "Quit Rec"] {
+        assert!(
+            h.query_by_label(label).is_some(),
+            "the app menu is missing {label:?}"
+        );
+    }
+    // Flatpak updates the app itself: no item.
+    let mut st = State::new(Settings::default());
+    st.updates = false;
+    let mut h = main_harness(st);
+    h.get_by_label("⋯").click();
+    h.run();
+    assert!(
+        h.query_by_label("Check for Updates…").is_none(),
+        "Flatpak hides the update item"
+    );
+    assert!(h.query_by_label("Quit Rec").is_some());
+}
+
+#[test]
+fn the_live_encode_section_is_locked_while_streaming() {
+    let st = full_state(crate::compose::Scene::Screen);
+    let mut h = settings_harness(st);
+    // Not streaming: the "Platform preset" checkbox toggles.
+    h.get_by_label("Platform preset").click();
+    h.run();
+    assert!(!h.state().settings.stream_bitrate_auto);
+    h.state_mut().settings.stream_bitrate_auto = true;
+
+    // Streaming: the whole section is disabled, with a visible reason.
+    h.state_mut().streams = vec![super::Stream {
+        id: 1,
+        url: crate::live::destination_url("youtube"),
+        status: None,
+    }];
+    h.run();
+    assert!(
+        h.query_by_label("Stop streaming to change the live encode.")
+            .is_some(),
+        "the reason is shown"
+    );
+    h.get_by_label("Platform preset").click_accesskit();
+    h.run();
+    assert!(
+        h.state().settings.stream_bitrate_auto,
+        "the live encode cannot change while streaming"
+    );
+}
+
+#[test]
 fn snapshots_of_the_main_and_settings_windows() {
     // The reference images live in tests/snapshots; UPDATE_SNAPSHOTS=1 rewrites
     // them (the layout is compared pixel by pixel). Two harnesses in one test
