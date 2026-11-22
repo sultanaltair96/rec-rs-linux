@@ -437,9 +437,17 @@ fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
         );
         return;
     };
-    // A stride of 0 means "tightly packed"; a negative one is a bottom-up
-    // buffer, which no screencast backend produces.
+    // A stride of 0 means "tightly packed". A negative one is a bottom-up
+    // buffer: no screencast backend produces one, and misreading it would put
+    // the picture together upside down, so say so.
     let row = width * 4;
+    if stride < 0 {
+        set_error(
+            &data.error,
+            format!("the screen-cast stream sent a bottom-up buffer (stride {stride})"),
+        );
+        return;
+    }
     let stride = if stride > 0 { stride as usize } else { row };
     let plane = stride * height;
     if stride < row || plane > bytes.len().saturating_sub(offset) {

@@ -1,10 +1,17 @@
 //! Cursor and click highlighting on CPU frames.
 //!
 //! Upstream asks ScreenCaptureKit for `showsCursor` and `showMouseClicks` and
-//! macOS draws both. On Linux the portal can embed the cursor in the stream
-//! (`CursorMode::Embedded`) but nothing highlights clicks, so `--clicks` asks
-//! for cursor *metadata* instead (the compositor then stops drawing the cursor
-//! itself) and this module draws the cursor bitmap and the click rings.
+//! macOS draws both. On Linux the two halves come from different places:
+//!
+//! * **The cursor** is usually the compositor's job: the portal's `Embedded`
+//!   cursor mode paints it into the stream with the desktop's own theme. When a
+//!   desktop offers only `Metadata` (the pointer's position and bitmap sent
+//!   beside the pixels) the bitmap is composited here, and on X11 the cursor is
+//!   never part of a window's pixels at all, so XFixes' cursor image is drawn
+//!   on top — up to 60 times a second, cheaply, by `CursorImage::draw`.
+//! * **Clicks** are visible only where button events are: X11, through
+//!   `QueryPointer`'s button bits. No portal reports mouse buttons, so a
+//!   Wayland recording gets the cursor but no rings (and says so).
 //!
 //! Everything works on packed BGRA/RGBA rows so it can be unit tested without a
 //! compositor: the ring maths is where an off-by-one shows up as a lopsided
@@ -77,9 +84,7 @@ pub fn ring_at(age: f64, width: usize) -> Option<(f64, f64)> {
 
 /// Draw the rings of every click that is still alive at `now`.
 ///
-/// `data` is one packed plane of `width`x`height` pixels, `stride` bytes per
-/// row. Clicks outside the frame are ignored, so a ring never bleeds across an
-/// edge.
+/// Clicks outside the frame are ignored, so a ring never bleeds across an edge.
 pub fn draw_clicks(frame: &mut Frame<'_>, clicks: &[Click], now: f64) {
     let width = frame.width;
     for click in clicks {
@@ -116,9 +121,9 @@ pub fn draw_clicks(frame: &mut Frame<'_>, clicks: &[Click], now: f64) {
 
 /// Draw one anti-aliased circle outline.
 ///
-/// `inner` is the ring's centre line radius, `thickness` its width. Coverage
-/// falls off over one pixel at both edges, which is what makes a 3 px ring look
-/// round rather than blocky.
+/// `radius` is the ring's centre line, `thickness` its width. Coverage falls
+/// off over one pixel at both edges, which is what makes a 3 px ring look round
+/// rather than blocky.
 pub fn draw_ring(
     frame: &mut Frame<'_>,
     cx: f64,
