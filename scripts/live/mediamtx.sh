@@ -73,6 +73,10 @@ cert() {
 serve() {
     dir=$1
     mkdir -p "$dir/recordings"
+    # MediaMTX writes a certificate of its own (auto.crt/auto.key) if the
+    # configured ones are missing: run it in the run's own folder so it can
+    # never drop files into the repo.
+    cd "$dir"
     cert "$dir"
     cat >"$dir/mediamtx.yml" <<EOF
 logLevel: info
