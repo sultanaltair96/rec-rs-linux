@@ -34,9 +34,9 @@ wanted() { [ -z "$(echo "$only" | tr -d ' ')" ] || [ "${only#* $1 }" != "$only" 
 case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
-        echo "h264-bitrate sync audio-gaps pause-resume gain"
-        echo "skipped: pattern-screen pattern-webcam pattern-mic stream-rtmp stream-whip"
-        echo "         replay gui"
+        echo "h264-bitrate sync audio-gaps pause-resume gain compositor"
+        echo "skipped: pattern-screen pattern-webcam pattern-mic scene-webcam"
+        echo "         stream-rtmp stream-whip replay gui"
         exit 0 ;;
 esac
 
@@ -145,6 +145,39 @@ if wanted gain; then
     fi
 fi
 
+# The GPU compositor: every shape against the mask geometry, borders, the drop
+# shadow, mirroring, placement, the camera scene, the Lanczos scaler against a
+# CPU reference, against ffmpeg's Lanczos (PSNR) and on a 1-px pattern
+# (aliasing), the BT.709 output, the pipelined readback and the golden images. It needs no display and no GPU: Mesa's software Vulkan device
+# (lavapipe) runs it, and the tests skip with a printed reason only when there
+# is no adapter at all.
+if wanted compositor; then
+    if command -v cargo >/dev/null 2>&1; then
+        if CARGO_BUILD_JOBS=3 timeout "$TIMEOUT" cargo test --release gpu:: -- --nocapture \
+               >"$OUT/compositor.log" 2>&1; then
+            adapter=$(sed -n 's/^compositor tests run on: //p' "$OUT/compositor.log" | head -1)
+            counts=$(sed -e 's/\x1b\[[0-9;]*m//g' "$OUT/compositor.log" \
+                     | grep -oE '[0-9]+ passed; [0-9]+ failed' | tail -1)
+            # The scaler against ffmpeg's Lanczos on the same RGB input: two
+            # independent Lanczos3 implementations must agree to 40 dB.
+            if CARGO_BUILD_JOBS=3 timeout "$TIMEOUT" cargo test --release gpu::tests::the_scaler_matches \
+                   -- --ignored --nocapture >"$OUT/compositor-ffmpeg.log" 2>&1 \
+               && grep -q 'PSNR' "$OUT/compositor-ffmpeg.log"; then
+                psnr=$(grep -o 'PSNR [0-9.]*' "$OUT/compositor-ffmpeg.log" | tr '\n' ' ')
+                echo "PASS  compositor  (${counts:-?} on ${adapter:-no adapter}; $psnr)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  compositor  (ffmpeg comparison; see $OUT/compositor-ffmpeg.log)"
+                fail=$((fail+1))
+            fi
+        else
+            echo "FAIL  compositor  (see $OUT/compositor.log)"; fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  compositor  (no cargo in this environment)"; skip=$((skip+1))
+    fi
+fi
+
 # Cases that belong to later phases (they need capture, the app or streaming).
 later() {
     wanted "$1" || return 0
@@ -152,6 +185,7 @@ later() {
 }
 later pattern-screen  "phase 1A: screen capture through the portal + PipeWire"
 later pattern-webcam  "phase 1B: camera capture"
+later scene-webcam    "phase 1G: the writer composites the camera over the screen"
 later pattern-mic     "phase 1B: microphone capture"
 later replay          "phase 1D: replay buffer"
 later stream-rtmp     "phase 1D: RTMP"
