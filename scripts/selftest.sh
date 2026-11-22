@@ -23,6 +23,9 @@ else
 fi
 
 OUT="${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/selftest"
+# Every recorder run is bounded: a hung capture device or encoder must fail the
+# case, not the whole run (the dev container also has a ceiling, see dev.sh).
+TIMEOUT="${REC_TIMEOUT:-120}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 pass=0; fail=0; skip=0
 only=" $* "
@@ -41,7 +44,7 @@ check() {
     name=$1; shift
     wanted "$name" || return 0
     case "$name" in *.mp4) f="$OUT/$name" ;; *) f="$OUT/$name.mov" ;; esac
-    if "$REC" record -q -o "$f" "$@" >/dev/null 2>"$OUT/$name.log" \
+    if timeout "$TIMEOUT" "$REC" record -q -o "$f" "$@" >/dev/null 2>"$OUT/$name.log" \
        && "$REC" probe "$f" >"$OUT/$name.probe" 2>&1 \
        && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/$name.log"; then
         frames=$(ffprobe -v error -select_streams v -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f")
@@ -78,7 +81,7 @@ fi
 # first beep fades in over its first ~10 ms. Every later beep reads 0.0 ms;
 # see PARITY.md's audio track row.
 if wanted sync; then
-    if "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/sync.mov" >/dev/null 2>"$OUT/sync.log" \
+    if timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/sync.mov" >/dev/null 2>"$OUT/sync.log" \
        && python3 scripts/synccheck.py "$OUT/sync.mov" --max-ms 20 >"$OUT/sync.check" 2>&1; then
         echo "PASS  sync  ($(grep -m1 'audio 0' "$OUT/sync.check" | sed 's/.*offset //'))"; pass=$((pass+1))
     else
@@ -89,7 +92,7 @@ fi
 # A glitching device (every 50th audio buffer lost) must not shift audio: the
 # writer fills the gap with silence.
 if wanted audio-gaps; then
-    if REC_SYNTH_DROP_AUDIO=50 "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/gaps.mov" >/dev/null 2>"$OUT/gaps.log" \
+    if REC_SYNTH_DROP_AUDIO=50 timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/gaps.mov" >/dev/null 2>"$OUT/gaps.log" \
        && python3 scripts/synccheck.py "$OUT/gaps.mov" --max-ms 20 >"$OUT/gaps.check" 2>&1; then
         echo "PASS  audio-gaps  (dropped device buffers filled, still in sync)"; pass=$((pass+1))
     else
@@ -100,7 +103,7 @@ fi
 # Pause/resume: 5 s of output with a pause in the middle. The file must have
 # exactly 300 frames (5 s at 60 fps) and audio must still be in sync.
 if wanted pause-resume; then
-    "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/pause.mov" >/dev/null 2>"$OUT/pause.log" &
+    timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 5 -o "$OUT/pause.mov" >/dev/null 2>"$OUT/pause.log" &
     recorder=$!
     sleep 2.3; "$REC" pause || true; sleep 2; "$REC" resume || true
     wait "$recorder" || true
@@ -116,7 +119,7 @@ fi
 # one). The beep is generated at -6 dBFS; at -12 dB it must read -12 dB
 # against that reference.
 if wanted gain; then
-    if "$REC" record -q --test-pattern --no-mic --system-gain=-12 -t 3 -o "$OUT/gain.mov" >/dev/null 2>"$OUT/gain.log" \
+    if timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic --system-gain=-12 -t 3 -o "$OUT/gain.mov" >/dev/null 2>"$OUT/gain.log" \
        && python3 scripts/levelcheck.py "$OUT/gain.mov" --ref=-6 --expect=-12 >"$OUT/gain.check" 2>&1; then
         echo "PASS  gain  (--system-gain -12 on the system audio track)"; pass=$((pass+1))
     else

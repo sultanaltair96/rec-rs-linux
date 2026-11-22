@@ -69,7 +69,29 @@ pub fn probe(file: &Path) -> Result<()> {
         .map_err(|e| anyhow!("{}: {e}", abs.display()))?
         .to_string();
     println!("file      : {}", abs.display());
-    let (duration, streams) = structure(&abs)?;
+    let (duration, mut streams) = structure(&abs)?;
+    let decoded = decode(&uri)?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        for (i, d) in decoded.iter().enumerate() {
+            eprintln!(
+                "rec: debug: stream {i}: video={} buffers={} frames={} fps={:?}",
+                d.video,
+                d.buffers,
+                d.frames,
+                d.fps()
+            );
+        }
+    }
+    // qtdemux's caps do not always carry the frame rate; the decoded timestamps
+    // show it (a constant frame rate is a guarantee of the writer).
+    for s in &mut streams {
+        if s.media == "video"
+            && !s.format.contains("fps")
+            && let Some(fps) = decoded.iter().filter(|d| d.video).find_map(|d| d.fps())
+        {
+            s.format = format!("{} @ {fps:.3} fps", s.format);
+        }
+    }
     let playable = !streams.is_empty();
     println!("playable  : {playable}");
     println!(
@@ -79,7 +101,6 @@ pub fn probe(file: &Path) -> Result<()> {
     for (i, s) in streams.iter().enumerate() {
         println!("track {i}  : {} {} {}", s.media, s.codec, s.format);
     }
-    let decoded = decode(&uri)?;
     let mut ok = playable;
     // Decode lines follow the tracks: the nth video stream is the nth decoded
     // video pad, and so on for audio.
