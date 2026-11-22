@@ -73,6 +73,29 @@ pub fn primitive_samples(element: &str) -> u64 {
     }
 }
 
+/// How far a decoder's output lags the stream position its buffers are labelled
+/// with, in samples (measured on this image: the same click through
+/// `fdkaacenc` and `avenc_aac` decoded again, dev/ELEMENTS.md's method).
+///
+/// An AAC encoder's priming frames mean packet `n` holds input samples
+/// `[n*1024 - priming, …)`; that is what [`AudioPacket::pts`] corrects for, so a
+/// packet's label is the time of the audio it carries. A decoder then emits its
+/// own warm-up before the content lines up again, and the replay writer's
+/// sample-accurate cut has to know it:
+///
+/// | decoder | offset (samples) |
+/// |---|---|
+/// | `avdec_aac` (gst-libav, the default) | -272 |
+/// | `fdkaacdec` | +720 |
+/// | `faad` | 0 (untested, no element in the image) |
+pub fn decoder_offset(element: &str) -> i64 {
+    match element {
+        "avdec_aac" => -272,
+        "fdkaacdec" => 720,
+        _ => 0,
+    }
+}
+
 fn set(el: &gst::Element, name: &str, value: impl ToString) {
     if el.find_property(name).is_some() {
         el.set_property_from_str(name, &value.to_string());
@@ -191,9 +214,16 @@ impl AudioEncoder {
                     .new_sample({
                         let on_packet = on_packet.clone();
                         let codec = codec;
+                        let priming = if codec == AudioCodec::Aac {
+                            primitive_samples(&encoder_name) as f64 / RATE as f64
+                        } else {
+                            // Opus carries its pre-skip in the stream header;
+                            // the RTP/FLV time is the capture time.
+                            0.0
+                        };
                         move |sink| {
                             if let Ok(sample) = sink.pull_sample() {
-                                on_audio_sample(&sample, codec, &on_packet);
+                                on_audio_sample(&sample, codec, priming, &on_packet);
                             }
                             Ok(gst::FlowSuccess::Ok)
                         }
@@ -327,7 +357,16 @@ fn interleaved(chunk: &AudioChunk) -> Vec<u8> {
     out
 }
 
-fn on_audio_sample(sample: &gst::Sample, codec: AudioCodec, on_packet: &OnPacket) {
+/// Turn one appsink sample into a packet whose label is the **time of the audio
+/// it carries**: the AAC encoder's priming frames are taken out of the
+/// timestamp, exactly as upstream subtracts `leading`, so a player that decodes
+/// the packet and places it at its label gets it in step with the picture.
+fn on_audio_sample(
+    sample: &gst::Sample,
+    codec: AudioCodec,
+    priming_secs: f64,
+    on_packet: &OnPacket,
+) {
     let Some(buffer) = sample.buffer() else {
         return;
     };
@@ -335,7 +374,7 @@ fn on_audio_sample(sample: &gst::Sample, codec: AudioCodec, on_packet: &OnPacket
         return;
     };
     let data: Arc<[u8]> = Arc::from(map.as_slice());
-    let pts = buffer.pts().map(|t| t.nseconds()).unwrap_or(0) as f64 / 1e9;
+    let pts = buffer.pts().map(|t| t.nseconds()).unwrap_or(0) as f64 / 1e9 - priming_secs;
     on_packet(AudioPacket {
         codec,
         pts,
@@ -360,6 +399,9 @@ pub struct AacDecoder {
     bus: gst::Bus,
     appsrc: gstreamer_app::AppSrc,
     appsink: gstreamer_app::AppSink,
+    /// The decoder element, and its output offset in samples.
+    pub decoder: String,
+    pub offset: i64,
 }
 
 impl AacDecoder {
@@ -391,17 +433,15 @@ impl AacDecoder {
         let parse = gst::ElementFactory::make("aacparse")
             .build()
             .map_err(|e| anyhow!("aacparse: {e}"))?;
-        let (decoder, name) = ["fdkaacdec", "avdec_aac", "faad"]
+        // avdec_aac first: it is part of gst-libav (always installed) and its
+        // output offset is the smallest of the two.
+        let (decoder, name) = ["avdec_aac", "fdkaacdec", "faad"]
             .iter()
             .find(|n| gst::ElementFactory::find(n).is_some())
-            .map(|n| {
-                (
-                    gst::ElementFactory::make(n).build(),
-                    n.to_string(),
-                )
-            })
-            .ok_or_else(|| anyhow!("no AAC decoder is installed (fdkaacdec or avdec_aac)"))?;
+            .map(|n| (gst::ElementFactory::make(n).build(), n.to_string()))
+            .ok_or_else(|| anyhow!("no AAC decoder is installed (avdec_aac or fdkaacdec)"))?;
         let decoder = decoder.map_err(|e| anyhow!("{name}: {e}"))?;
+        let offset = decoder_offset(&name);
         let convert = gst::ElementFactory::make("audioconvert")
             .build()
             .map_err(|e| anyhow!("audioconvert: {e}"))?;
@@ -447,6 +487,8 @@ impl AacDecoder {
             bus,
             appsrc,
             appsink,
+            decoder: name,
+            offset,
         })
     }
 

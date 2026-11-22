@@ -190,16 +190,14 @@ pub fn write_mp4(
     if let Some(dir) = abs.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    let pcm = decode_audio(audio_packets, formats, t0)?;
-    if std::env::var_os("REC_DEBUG").is_some() {
-        eprintln!(
-            "rec: debug: replay {} video packets ({:.2} s), {} audio packets, {:.2} s of PCM",
-            video_packets.len(),
-            video_packets.last().map_or(0.0, |p| p.pts - t0),
-            audio_packets.len(),
-            pcm.len() as f64 / audio::RATE as f64
-        );
-    }
+    // The clip is as long as its video: audio that arrives after the last
+    // frame (the tap can be a little ahead) is cut, as upstream does.
+    let last_v = video_packets
+        .iter()
+        .map(|p| p.pts)
+        .fold(t0, f64::max)
+        - t0;
+    let pcm = decode_audio(audio_packets, formats, t0, last_v + 0.05)?;
     mux_mp4(&abs, video_packets, t0, &pcm, formats)
         .with_context(|| format!("writing the replay to {}", abs.display()))?;
     Ok(abs)
@@ -210,24 +208,35 @@ fn decode_audio(
     packets: &[EncodedPacket],
     formats: &Formats,
     t0: f64,
+    max_secs: f64,
 ) -> Result<Vec<[f32; 2]>> {
+    // The decoder's own warm-up shifts where its output starts (see
+    // `audio::decoder_offset`); the cut is sample-accurate because of it.
     if packets.is_empty() || formats.aac_cookie.is_empty() {
         return Ok(vec![]);
     }
+    let rate = audio::RATE as f64;
     let mut dec = AacDecoder::new(&formats.aac_cookie)?;
     for p in packets {
         dec.push(p.pts, &p.data)?;
     }
     let decoded = dec.decode_all()?;
-    let rate = audio::RATE as f64;
-    let mut out: Vec<[f32; 2]> = Vec::new();
+    // Never longer than the picture: the last PCM the muxer gets ends with it.
+    let limit = (max_secs.max(0.0) * rate).round() as usize;
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(limit.min(1 << 20));
     for buf in decoded {
         // Sample-accurate cut: the clip's audio starts at t0, and the packets
         // before it are only the decoder's warm-up (which is why they are in
         // the ring at all).
-        let skip = (((t0 - buf.pts) * rate).round().max(0.0)) as usize;
+        let skip = (((t0 - buf.pts) * rate).round().max(0.0) as i64 + dec.offset).max(0) as usize;
         for sample in buf.samples.iter().skip(skip) {
+            if out.len() >= limit {
+                break;
+            }
             out.push(*sample);
+        }
+        if out.len() >= limit {
+            break;
         }
     }
     Ok(out)
@@ -296,7 +305,14 @@ fn mux_mp4(
         if enc.find_property("bitrate").is_some() {
             enc.set_property_from_str("bitrate", &REPLAY_AUDIO_BITRATE.to_string());
         }
-        let drop_frames = audio::primitive_samples(enc.name().as_str()) / AAC_FRAME as u64;
+        // The encoder's priming, plus one frame: a decoder needs one frame of
+        // history to reconstruct the first frame it plays, so the file carries
+        // that much extra priming instead of starting on a cold decoder.
+        // Measured on the written clip with `scripts/synccheck.py` (10 s of the
+        // test pattern, 720p30): priming alone +27.0 ms, priming + 1 frame
+        // +5.7 ms, +2 frames -15.6 ms.
+        let drop_frames =
+            audio::primitive_samples(enc.name().as_str()) / AAC_FRAME as u64 + 1;
         let aparse = gst::ElementFactory::make("aacparse").build()?;
         let q = gst::ElementFactory::make("queue").build()?;
         priming = Some((aparse.clone(), drop_frames));

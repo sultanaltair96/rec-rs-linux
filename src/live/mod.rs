@@ -323,7 +323,7 @@ struct Shared {
     hub: Arc<Mutex<Hub>>,
     tap: Tap,
     session: Mutex<SessionState>,
-    stats: Stats,
+    stats: Arc<Stats>,
     /// The last encoder failure, for the app's banner.
     error: Mutex<Option<String>>,
 }
@@ -350,7 +350,7 @@ impl Default for Live {
                 hub: Arc::new(Mutex::new(Hub::default())),
                 tap: Tap::default(),
                 session: Mutex::new(SessionState::default()),
-                stats: Stats::default(),
+                stats: Arc::new(Stats::default()),
                 error: Mutex::new(None),
             }),
             worker: Mutex::new(None),
@@ -679,10 +679,14 @@ impl Encoders {
         fps: u32,
         generation: u64,
         hub: &Arc<Mutex<Hub>>,
+        stats: &Arc<Stats>,
     ) -> Result<Encoders> {
         let _ = owns_session;
         let (video_hub, audio_hub, opus_hub) =
             (hub.clone(), hub.clone(), hub.clone());
+        let video_stats = stats.clone();
+        let aac_stats = stats.clone();
+        let opus_stats = stats.clone();
         let video = video::VideoEncoder::new(
             video::VideoConfig {
                 width: size.0,
@@ -694,6 +698,10 @@ impl Encoders {
                 hevc,
             },
             Arc::new(move |p| {
+                video_stats.video_packets.fetch_add(1, Ordering::Relaxed);
+                video_stats
+                    .bytes
+                    .fetch_add(p.data.len() as u64, Ordering::Relaxed);
                 let mut hub = video_hub.lock().unwrap();
                 hub.formats.hevc = p.hevc;
                 hub.formats.width = p.width;
@@ -721,14 +729,15 @@ impl Encoders {
             cfg.audio_bitrate,
             {
                 let hub = audio_hub.clone();
-                Arc::new(move |p| dispatch_audio(&hub, p, false))
+                let stats = aac_stats.clone();
+                Arc::new(move |p| dispatch_audio(&hub, &stats, p, false))
             },
         )?;
         let opus = if wants_opus {
             Some(audio::AudioEncoder::new(
                 AudioCodec::Opus,
                 cfg.audio_bitrate.min(256_000),
-                Arc::new(move |p| dispatch_audio(&opus_hub, p, true)),
+                Arc::new(move |p| dispatch_audio(&opus_hub, &opus_stats, p, true)),
             )?)
         } else {
             None
@@ -750,19 +759,20 @@ impl Encoders {
         cfg: &LiveConfig,
         wants_opus: bool,
         hub: &Arc<Mutex<Hub>>,
+        stats: &Arc<Stats>,
     ) -> Result<()> {
-        let h = hub.clone();
+        let (h, s) = (hub.clone(), stats.clone());
         self.aac = audio::AudioEncoder::new(
             AudioCodec::Aac,
             cfg.audio_bitrate,
-            Arc::new(move |p| dispatch_audio(&h, p, false)),
+            Arc::new(move |p| dispatch_audio(&h, &s, p, false)),
         )?;
         self.opus = if wants_opus {
-            let h = hub.clone();
+            let (h, s) = (hub.clone(), stats.clone());
             Some(audio::AudioEncoder::new(
                 AudioCodec::Opus,
                 cfg.audio_bitrate.min(256_000),
-                Arc::new(move |p| dispatch_audio(&h, p, true)),
+                Arc::new(move |p| dispatch_audio(&h, &s, p, true)),
             )?)
         } else {
             None
@@ -792,7 +802,11 @@ impl Encoders {
     }
 }
 
-fn dispatch_audio(hub: &Arc<Mutex<Hub>>, p: audio::AudioPacket, opus: bool) {
+fn dispatch_audio(hub: &Arc<Mutex<Hub>>, stats: &Arc<Stats>, p: audio::AudioPacket, opus: bool) {
+    stats.audio_packets.fetch_add(1, Ordering::Relaxed);
+    stats
+        .bytes
+        .fetch_add(p.data.len() as u64, Ordering::Relaxed);
     let mut hub = hub.lock().unwrap();
     if p.codec == AudioCodec::Aac && !p.cookie.is_empty() {
         hub.formats.aac_cookie = p.cookie.clone();
@@ -942,6 +956,7 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                 fps,
                 generation,
                 &shared.hub,
+                &shared.stats,
             ) {
                 Ok(mut fresh) => {
                     // Keep the mix's position: the new encoder starts at the
@@ -968,7 +983,7 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         if let Some(e) = &mut enc {
             if e.wants_opus != wants_opus && !rebuild_video {
                 let hub = shared.hub.clone();
-                if let Err(err) = e.replace_audio(&cfg, wants_opus, &hub) {
+                if let Err(err) = e.replace_audio(&cfg, wants_opus, &hub, &shared.stats) {
                     report(&shared, format!("{err:#}"));
                     audio_failed = true;
                 }
@@ -1002,9 +1017,7 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                     }
                 }
             }
-            if e.video.encode(frame, frame.pts) {
-                shared.stats.video_packets.fetch_add(1, Ordering::Relaxed);
-            }
+            e.video.encode(frame, frame.pts);
             // Without any audio source, silence keeps the timeline continuous
             // so players and services that require audio accept the stream.
             if audio_sources == [false, false] {
@@ -1041,14 +1054,10 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                 o.push(chunk.pts, chunk);
             }
             audio_end = Some(chunk.pts + chunk.secs());
-            shared.stats.audio_packets.fetch_add(1, Ordering::Relaxed);
         }
 
-        // The packets themselves are counted by the appsink callbacks; this is
-        // the bytes the tap handed over.
-        let bytes: usize = frames.iter().map(|f| f.byte_len()).sum::<usize>()
-            + chunks.iter().map(|c| c.samples.len() * 4).sum::<usize>();
-        shared.stats.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        // Packets and encoded bytes are counted by the appsink callbacks; this
+        // is what the tap had to drop.
         shared
             .stats
             .dropped
@@ -1373,9 +1382,9 @@ mod tests {
                 ));
                 audio_done += chunk;
             }
-            if i % fps == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            // 200 fps of feeding: far faster than real time, far slower than
+            // the tap's cap, so no frame is dropped.
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
