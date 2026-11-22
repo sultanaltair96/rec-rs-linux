@@ -496,12 +496,6 @@ pub fn run(o: Options) -> Result<Stats> {
         libc::signal(libc::SIGHUP, on_signal as *const () as usize);
     }
     install_control_signals();
-    if o.live.is_some() {
-        bail!(
-            "the replay buffer and streaming are not implemented yet (phase {})",
-            live::PHASE
-        );
-    }
     if o.webcam.is_some() {
         bail!(
             "camera capture is not implemented yet (phase {})",
@@ -521,9 +515,39 @@ pub fn run(o: Options) -> Result<Stats> {
         &pidfile,
         format!("{}\n{}\n", std::process::id(), o.output.display()),
     );
+    // --- live session (phase 1D) ------------------------------------------
+    // One encode for the replay buffer and every stream, independent of the
+    // writer and its pauses. Going live is all or nothing: a destination that
+    // cannot start stops the ones before it and the session never starts.
+    let mut live_streams: Vec<(u64, String)> = vec![];
+    if let Some(l) = &o.live {
+        l.begin_session(o.system_audio, o.mic.is_some())?;
+        let urls: Vec<String> = o.streams.iter().map(|(u, _)| u.clone()).collect();
+        let keys: Vec<String> = o.streams.iter().map(|(_, k)| k.clone()).collect();
+        let started = l.add_outputs(&urls, |url| {
+            let key = urls
+                .iter()
+                .position(|u| u == url)
+                .map(|i| keys[i].clone())
+                .unwrap_or_default();
+            live::start_output(url, &key)
+        });
+        match started {
+            Ok(added) => live_streams = added,
+            Err(e) => {
+                let _ = std::fs::remove_file(&pidfile);
+                return Err(e);
+            }
+        }
+    }
     let sess = match Session::start(&o) {
         Ok(s) => s,
         Err(e) => {
+            if let Some(l) = &o.live {
+                for (id, _) in live_streams.drain(..) {
+                    l.remove_output(id);
+                }
+            }
             let _ = std::fs::remove_file(&pidfile);
             return Err(e);
         }
@@ -560,6 +584,7 @@ pub fn run(o: Options) -> Result<Stats> {
 
     let mut last_status = Instant::now();
     let mut warned_no_frames = false;
+    let mut saves: Vec<std::thread::JoinHandle<Result<PathBuf>>> = vec![];
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
         // Requests wait for the first frame (the timeline starts there).
@@ -575,10 +600,34 @@ pub fn run(o: Options) -> Result<Stats> {
             eprint!("\r\x1b[2Krec: resumed\n");
         }
         if REPLAY_REQ.swap(false, Ordering::SeqCst) {
-            eprint!(
-                "\r\x1b[2Krec: save-replay: the replay buffer is not implemented yet (phase {})\n",
-                live::PHASE
-            );
+            match &o.live {
+                Some(l) => {
+                    let dir = o
+                        .output
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(crate::util::videos_dir);
+                    match l.save_replay_async(dir.join(crate::util::timestamped("replay", "mp4")))
+                    {
+                        Ok(h) => saves.push(h),
+                        Err(e) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
+                    }
+                }
+                None => eprint!(
+                    "\r\x1b[2Krec: save-replay: this recording has no replay buffer (start it with --replay SECS)\n"
+                ),
+            }
+        }
+        for h in std::mem::take(&mut saves) {
+            if h.is_finished() {
+                match h.join() {
+                    Ok(Ok(p)) => eprint!("\r\x1b[2Krec: replay saved {}\n", p.display()),
+                    Ok(Err(e)) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
+                    Err(_) => eprint!("\r\x1b[2Krec: replay: the writer panicked\n"),
+                }
+            } else {
+                saves.push(h);
+            }
         }
         let elapsed = sess.started.elapsed().as_secs_f64();
         if o.duration.is_some() && (sess.reached_limit() || (!sess.has_frames() && elapsed > 10.0))
@@ -592,8 +641,23 @@ pub fn run(o: Options) -> Result<Stats> {
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
             let (st, lv) = sess.poll();
+            let mut live_status = String::new();
+            if let Some(l) = &o.live {
+                if let Some((secs, bytes)) = l.replay_stats() {
+                    live_status += &format!("  replay {secs:.0}s {:.1} MB", bytes as f64 / 1e6);
+                }
+                for (_, s) in l.statuses() {
+                    live_status += &format!(
+                        "  {} {} {:.1} Mb/s drop {}",
+                        s.name,
+                        s.state,
+                        s.bitrate / 1e6,
+                        s.dropped_frames
+                    );
+                }
+            }
             eprint!(
-                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB  ",
+                "\r\x1b[2K  {}{}  video {} fr ({} dup, {} drop)  sys {} dB  mic {} dB{}  ",
                 clock(sess.recorded_secs()),
                 if sess.is_paused() { " PAUSED" } else { "" },
                 st.video_frames_out,
@@ -609,6 +673,7 @@ pub fn run(o: Options) -> Result<Stats> {
                 } else {
                     "   off".into()
                 },
+                live_status,
             );
         }
     }
@@ -616,6 +681,18 @@ pub fn run(o: Options) -> Result<Stats> {
         eprintln!("\nrec: stopping...");
     }
     let result = sess.finish();
+    if let Some(l) = &o.live {
+        for (id, _) in live_streams {
+            l.remove_output(id);
+        }
+    }
+    for h in saves {
+        match h.join() {
+            Ok(Ok(p)) => eprintln!("rec: replay saved {}", p.display()),
+            Ok(Err(e)) => eprintln!("rec: replay: {e:#}"),
+            Err(_) => {}
+        }
+    }
     let _ = std::fs::remove_file(&pidfile);
     result
 }

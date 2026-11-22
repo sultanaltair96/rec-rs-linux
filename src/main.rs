@@ -96,6 +96,10 @@ enum Cmd {
     RequestScreen,
     /// Check a recording with GStreamer: decode every sample.
     Probe { file: PathBuf },
+    /// The live encode's harness: drive the live path with the test pattern
+    /// (streams, replay buffer) without a recording. Used by `scripts/live/`.
+    #[command(hide = true, name = "live-selftest")]
+    LiveSelftest(live::harness::HarnessArgs),
     /// Play a file in a reference player window (macOS only; not ported).
     #[command(hide = true)]
     Play {
@@ -148,6 +152,43 @@ fn record(a: RecordArgs) -> Result<()> {
         );
     }
     println!("{}", out.display());
+    Ok(())
+}
+
+/// `rec-rs stream-key DEST`: store (or delete) a stream key in the Secret
+/// Service. The key is read from the terminal with echo off and is never
+/// printed, logged or written to a file.
+fn stream_key(dest: &str, delete: bool) -> Result<()> {
+    let url = live::destination_url(dest);
+    if delete {
+        live::keyring::delete(&url)?;
+        println!("removed the stream key for {url}");
+        return Ok(());
+    }
+    let tty = unsafe { libc::isatty(0) } == 1;
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    if tty {
+        eprint!("stream key for {url}: ");
+        unsafe {
+            libc::tcgetattr(0, &mut old);
+            let mut t = old;
+            t.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
+    let mut key = String::new();
+    let r = std::io::stdin().read_line(&mut key);
+    if tty {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+        eprintln!();
+    }
+    r?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("no key given");
+    }
+    live::keyring::set(&url, key)?;
+    println!("saved the stream key for {url} in the Secret Service");
     Ok(())
 }
 
@@ -267,28 +308,9 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::Stop => record::stop_running(),
         Cmd::Pause => record::signal_running(libc::SIGUSR1),
         Cmd::Resume => record::signal_running(libc::SIGUSR2),
-        Cmd::SaveReplay => match record::signal_running(record::save_replay_signal()) {
-            Ok(()) => Err(anyhow::anyhow!(
-                "the replay buffer is not implemented yet (phase {})",
-                live::PHASE
-            )),
-            Err(e) => Err(e),
-        },
-        Cmd::StreamKey { dest, delete } => {
-            let url = live::destination_url(&dest);
-            if delete {
-                bail!(
-                    "stream keys in the Secret Service are not implemented yet (phase {}); \
-                     set REC_STREAM_KEY for now",
-                    live::PHASE
-                )
-            }
-            bail!(
-                "stream keys in the Secret Service are not implemented yet (phase {}); \
-                 set REC_STREAM_KEY={url}... in the environment for now",
-                live::PHASE
-            )
-        }
+        Cmd::SaveReplay => record::signal_running(record::save_replay_signal()),
+        Cmd::StreamKey { dest, delete } => stream_key(&dest, delete),
+        Cmd::LiveSelftest(a) => live::harness::run(a),
         Cmd::Permissions { request, wait } => permissions(request, wait),
         Cmd::RequestScreen => Err(anyhow::anyhow!(
             "requesting permissions is not implemented yet (phase {})",
