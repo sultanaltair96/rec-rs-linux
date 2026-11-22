@@ -17,12 +17,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 
 use crate::capture::audio::AudioRequest;
+use crate::capture::camera::CameraRequest;
 use crate::capture::screen;
 use crate::capture::{audio as audio_capture, camera as camera_capture};
 use crate::compose::{PipSpec, Scene};
+use crate::gpu;
 use crate::live;
-use crate::media::{AudioLayout, Codec, Stats, VideoSpec, Writer};
+use crate::media::{AudioLayout, Codec, Stats, VideoSpec, Writer, testsrc};
 use crate::media_types::{self, AudioSink, FrameSink, VideoSource};
+
+/// How long a freshly started camera needs before its exposure is close to
+/// settled (upstream measured a MacBook camera: 94% of the final brightness
+/// after 1.5 s, 98% after 2 s).
+const CAMERA_SETTLE_SECS: f64 = 2.0;
 use crate::mixer::Volume;
 use crate::synth::{Pattern, Synth};
 use crate::util::{clock, db, runtime_dir};
@@ -193,6 +200,9 @@ pub struct Options {
     pub write: bool,
     /// Shared live encode for the replay buffer and streams (phase 1D).
     pub live: Option<Arc<live::Live>>,
+    /// The app offers every emitted (composited) frame here, at most 30 times
+    /// a second (phase 1E's preview). Non-blocking.
+    pub preview: Option<FrameSink>,
     /// Stream destinations (URL, key) to start with the session.
     pub streams: Vec<(String, String)>,
 }
@@ -221,6 +231,9 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     pacer: Option<std::thread::JoinHandle<()>>,
     video: Option<Box<dyn VideoSource>>,
+    camera: Option<Box<dyn VideoSource>>,
+    /// What the camera reported (its device name), for the start log and the app.
+    camera_desc: String,
     audio: Vec<Box<dyn crate::media_types::AudioSource>>,
     /// The file being written, if any. The app shows it (phase 1E).
     #[allow(dead_code)]
@@ -250,8 +263,33 @@ impl Session {
             o.mic.is_some(),
             o.audio_layout,
             o.volumes,
+            o.scene,
+            o.pip.clone(),
         )?;
         writer.limit_secs(o.duration);
+        // A camera scene may be chosen before the camera's first frame.
+        writer.set_camera_expected(o.webcam.is_some());
+        // The app's preview sees exactly what is written, overlay included.
+        if let Some(p) = &o.preview {
+            writer.set_preview(p.clone());
+        }
+        // One shared live encode for the replay buffer and the streams.
+        if let Some(l) = &o.live {
+            let _ = l.begin_session(o.system_audio, o.mic.is_some());
+            writer.set_live(l.clone());
+        }
+        // Phase 1C's compositor draws the scenes; until it lands the writer
+        // falls back to the CPU path (and says what it cannot draw).
+        if o.webcam.is_some() {
+            match gpu::Renderer::new(w, h, o.pip.clone()) {
+                Ok(r) => writer.set_renderer(Some(r)),
+                Err(e) => {
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!("rec: debug: no GPU compositor: {e}");
+                    }
+                }
+            }
+        }
         // System audio is captured when mixed and heard one output latency
         // later; the synthetic source needs no shift.
         let sys_ms = match (o.system_offset_ms, o.test_pattern) {
@@ -278,6 +316,8 @@ impl Session {
             stop,
             pacer: None,
             video: None,
+            camera: None,
+            camera_desc: String::new(),
             audio: vec![],
             output: o.write.then(|| o.output.clone()),
             started: Instant::now(),
@@ -321,17 +361,55 @@ impl Session {
     }
 
     fn start_sources(&mut self, o: &Options) -> Result<()> {
-        let shared = self.shared.clone();
-        let vsink: FrameSink = Arc::new(move |f| shared.with(|w| w.push_video(f)));
+        let vsink: FrameSink = {
+            let shared = self.shared.clone();
+            Arc::new(move |f| shared.with(|w| w.push_video(f)))
+        };
+        let camsink: FrameSink = {
+            let shared = self.shared.clone();
+            Arc::new(move |f| shared.with(|w| w.push_cam(f)))
+        };
         let asink: AudioSink = {
             let shared = self.shared.clone();
             Arc::new(move |kind, chunk| shared.with(|w| w.push_audio(kind, &chunk)))
         };
+        // The camera starts first: a cold one holds the file's start until its
+        // exposure has settled (upstream's 2 s gate), so the first frames are
+        // not dark, and its frames feed the scene from the first slot.
+        if let Some(sel) = &o.webcam {
+            let started = std::time::Instant::now();
+            let req = CameraRequest {
+                device: sel.clone(),
+            };
+            let mut cam = match testsrc::camera_from_env() {
+                Some(c) => c,
+                None => camera_capture::open(&req)?,
+            };
+            self.camera_desc = cam.describe();
+            cam.start(camsink)?;
+            // A preview just shows the dark frames; only a file waits.
+            if o.write && o.scene.uses_cam() {
+                let settle = (CAMERA_SETTLE_SECS - started.elapsed().as_secs_f64()).max(0.0);
+                self.shared
+                    .with(|w| w.wait_for_camera(settle));
+            }
+            self.camera = Some(cam);
+        }
         match o.test_pattern {
             Some(noise) => {
+                // REC_SYNTH_NATIVE=WxH makes the pattern larger than the
+                // output, to exercise the scaler (a native-size display into a
+                // smaller recording).
+                let (pw, ph) = std::env::var("REC_SYNTH_NATIVE")
+                    .ok()
+                    .and_then(|v| {
+                        let (w, h) = v.split_once('x')?;
+                        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                    })
+                    .unwrap_or((o.size.0, o.size.1));
                 let synth = Synth::new(Pattern {
-                    width: o.size.0,
-                    height: o.size.1,
+                    width: pw,
+                    height: ph,
                     fps: o.fps,
                     format: media_types::PixelFormat::Bgra,
                     noise,
@@ -359,21 +437,20 @@ impl Session {
                 device: sel.clone(),
                 name: o.mic_name.clone(),
             };
-            match audio_capture::open_mic(&req) {
-                Ok(src) => self.audio.push(src),
-                // An explicit device request fails; the default mic only warns,
-                // because audio never blocks a session (upstream's rule).
-                Err(e) if o.mic_explicit => {
-                    return Err(e.context("the microphone you asked for could not be opened"));
-                }
-                Err(e) => eprintln!("rec: warning: {e}; recording without the microphone"),
+            match testsrc::mic_from_env() {
+                // A synthetic microphone stands in for the device in tests.
+                Some(src) => self.audio.push(src),
+                None => match audio_capture::open_mic(&req) {
+                    Ok(src) => self.audio.push(src),
+                    // An explicit device request fails; the default mic only
+                    // warns, because audio never blocks a session (upstream's
+                    // rule).
+                    Err(e) if o.mic_explicit => {
+                        return Err(e.context("the microphone you asked for could not be opened"));
+                    }
+                    Err(e) => eprintln!("rec: warning: {e}; recording without the microphone"),
+                },
             }
-        }
-        // Both sources present and the layout wants the mix: phase 1C writes it.
-        if o.audio_layout == AudioLayout::Both && o.system_audio && self.audio.len() == 2 {
-            eprintln!(
-                "rec: warning: the system+mic mix track is not implemented yet (phase 1C); writing the stems"
-            );
         }
         if let Some(v) = &mut self.video {
             v.start(vsink)?;
@@ -389,6 +466,11 @@ impl Session {
             && let Err(e) = v.stop()
         {
             eprintln!("rec: warning: stopping capture: {e}");
+        }
+        if let Some(mut c) = self.camera.take()
+            && let Err(e) = c.stop()
+        {
+            eprintln!("rec: warning: stopping the camera: {e}");
         }
         for mut a in self.audio.drain(..) {
             if let Err(e) = a.stop() {
@@ -456,6 +538,36 @@ impl Session {
         self.shared.with(|w| w.set_volumes(volumes));
     }
 
+    /// The camera in use, for the status line and the app (phase 1E).
+    #[allow(dead_code)]
+    pub fn camera_name(&self) -> Option<&str> {
+        (!self.camera_desc.is_empty()).then_some(self.camera_desc.as_str())
+    }
+
+    /// Switch scenes live. Scenes that need the overlay require the GPU
+    /// compositor (phase 1C); the writer returns false when it cannot draw it.
+    #[allow(dead_code)]
+    pub fn set_scene(&self, scene: Scene) -> bool {
+        let mut ok = false;
+        self.shared.with(|w| ok = w.set_scene(scene));
+        ok
+    }
+
+    /// Move or restyle the camera overlay live; it is baked into the file from
+    /// the next emitted frame on.
+    #[allow(dead_code)]
+    pub fn set_pip(&self, pip: PipSpec) {
+        self.shared.with(|w| w.set_pip(pip));
+    }
+
+    /// The camera's aspect ratio, once its frames arrive.
+    #[allow(dead_code)]
+    pub fn cam_aspect(&self) -> Option<f64> {
+        let mut a = None;
+        self.shared.with(|w| a = w.cam_aspect());
+        a
+    }
+
     /// (stats, peak levels [system, mic] since the last call).
     pub fn poll(&self) -> (Stats, [f32; 2]) {
         let mut st = Stats::default();
@@ -502,12 +614,6 @@ pub fn run(o: Options) -> Result<Stats> {
             live::PHASE
         );
     }
-    if o.webcam.is_some() {
-        bail!(
-            "camera capture is not implemented yet (phase {})",
-            camera_capture::PHASE
-        );
-    }
     let mic_desc = match &o.mic {
         None => "off".to_string(),
         Some(None) => "default".to_string(),
@@ -550,7 +656,7 @@ pub fn run(o: Options) -> Result<Stats> {
             },
             if o.system_audio { "on" } else { "off" },
             mic_desc,
-            if o.webcam.is_some() { "on" } else { "off" },
+            sess.camera_name().unwrap_or_else(|| "off".into()),
         );
         if o.write && !o.quiet {
             eprintln!("rec: encoder {}", sess.encoder);

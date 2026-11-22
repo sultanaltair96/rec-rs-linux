@@ -458,6 +458,7 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
         system_offset_ms: a.system_audio_offset_ms,
         mic_offset_ms: a.mic_offset_ms,
         write: !a.no_record,
+        preview: None,
         live,
         streams: a
             .stream
