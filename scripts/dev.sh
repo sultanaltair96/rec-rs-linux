@@ -125,6 +125,15 @@ if [ -d /dev/dri ]; then
     caps="$caps --device /dev/dri:/dev/dri"
 fi
 
+# A memory ceiling per container (DEV_MEMORY, default 4g, 0 = none). Several
+# worktrees share one host: without it a runaway recording (one grew to 10 GB)
+# makes the kernel OOM killer pick a victim host-wide, and it picked the bb host
+# daemon, interrupting every agent. With it, only the offending container dies.
+mem=${DEV_MEMORY:-4g}
+if [ "$mem" != "0" ]; then
+    caps="$caps --memory $mem --memory-swap $mem"
+fi
+
 # shellcheck disable=SC2086 # $envs is a list of -e NAME=value pairs
 status=0
 docker run --rm --init $args \

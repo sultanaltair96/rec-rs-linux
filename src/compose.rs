@@ -135,6 +135,24 @@ pub fn fill(sw: f64, sh: f64, dw: f64, dh: f64) -> (f64, f64, f64, f64) {
     (s, s, tx, ty)
 }
 
+/// [`fill`] that never enlarges: a picture smaller than the canvas is drawn at
+/// 1:1 and centred, so an upscale never turns a sharp capture soft.
+///
+/// The renderer scales the screen with this. `-r` never asks for more pixels
+/// than the display has, but a window capture can be smaller than the output,
+/// and a still frame from a lower-resolution camera can be too.
+pub fn fill_no_upscale(sw: f64, sh: f64, dw: f64, dh: f64) -> (f64, f64, f64, f64) {
+    if sw <= 0.0 || sh <= 0.0 {
+        return (1.0, 1.0, 0.0, 0.0);
+    }
+    if same_aspect(sw, sh, dw, dh) && sw >= dw && sh >= dh {
+        return (dw / sw, dh / sh, 0.0, 0.0);
+    }
+    let (s, _, _) = fit(sw, sh, dw, dh, false);
+    let s = s.min(1.0);
+    (s, s, (dw - sw * s) / 2.0, (dh - sh * s) / 2.0)
+}
+
 /// Where the overlay sits: snapped to a corner (stays there when the size
 /// changes) or centred at a point given as fractions of the frame from its
 /// top-left corner.
@@ -348,6 +366,17 @@ pub fn border_px(pip: &PipSpec, out_h: f64) -> f64 {
     (pip.border.max(0.0) * out_h / 1080.0).round()
 }
 
+/// How far a drop shadow spreads beyond the overlay, in output pixels: 3% of
+/// the frame height, at least 3 pixels.
+pub fn shadow_pad(out_h: f64) -> f64 {
+    (out_h * 0.03).round().max(3.0)
+}
+
+/// How far below the overlay its drop shadow sits, in output pixels.
+pub fn shadow_drop(out_h: f64) -> f64 {
+    (out_h * 0.006).round()
+}
+
 /// How far in from each edge a window's corner fill samples: past the largest
 /// window corner radius (about 26 points at 2x).
 ///
@@ -521,6 +550,46 @@ mod tests {
                 1080.0
             ),
             0.0
+        );
+    }
+
+    #[test]
+    fn the_shadow_scales_with_the_output_height() {
+        // 3% of 1080 is 32 px, dropped 6 px; at 720p 22 px and 4 px.
+        assert_eq!(shadow_pad(1080.0), 32.0);
+        assert_eq!(shadow_pad(720.0), 22.0);
+        assert_eq!(shadow_pad(100.0), 3.0, "never thinner than 3 px");
+        assert_eq!(shadow_drop(1080.0), 6.0);
+        assert_eq!(shadow_drop(720.0), 4.0);
+        assert_eq!(shadow_drop(4.0), 0.0);
+    }
+
+    #[test]
+    fn scaling_never_enlarges() {
+        // The usual case: a 4K display into a 1080p output, edge to edge.
+        assert_eq!(
+            fill_no_upscale(3840.0, 2160.0, 1920.0, 1080.0),
+            (0.5, 0.5, 0.0, 0.0)
+        );
+        // Already the right size: no scaling at all.
+        assert_eq!(
+            fill_no_upscale(1920.0, 1080.0, 1920.0, 1080.0),
+            (1.0, 1.0, 0.0, 0.0)
+        );
+        // Smaller than the output: 1:1, centred, black around it.
+        assert_eq!(
+            fill_no_upscale(1280.0, 720.0, 1920.0, 1080.0),
+            (1.0, 1.0, 320.0, 180.0)
+        );
+        // A 4:3 window into a 16:9 output: fitted, not stretched.
+        assert_eq!(
+            fill_no_upscale(1280.0, 960.0, 1920.0, 1080.0),
+            (1.0, 1.0, 320.0, 60.0)
+        );
+        // A degenerate frame keeps the identity instead of dividing by zero.
+        assert_eq!(
+            fill_no_upscale(0.0, 0.0, 1920.0, 1080.0),
+            (1.0, 1.0, 0.0, 0.0)
         );
     }
 }
