@@ -346,7 +346,13 @@ impl Session {
             }
             None => {
                 let req = o.screen.clone().unwrap_or_default();
-                let src = screen::open(&req)?;
+                let src = screen::open_with(
+                    &req,
+                    &screen::CaptureOptions {
+                        cursor: o.cursor,
+                        clicks: o.clicks,
+                    },
+                )?;
                 self.description = src.describe();
                 self.video = Some(src);
                 if o.system_audio {
