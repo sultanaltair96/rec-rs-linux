@@ -205,7 +205,10 @@ fn devices() -> Result<()> {
             "Output latency (system audio is shifted by this): {:.1} ms",
             l * 1000.0
         ),
-        None => println!("Output latency: unavailable (not implemented yet, phase 1B)"),
+        None => println!(
+            "Output latency: unavailable (the default output device reports none; \
+             set --system-audio-offset-ms to shift system audio yourself)"
+        ),
     }
     Ok(())
 }
