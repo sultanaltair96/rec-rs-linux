@@ -409,10 +409,13 @@ fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
     // The compositor's own capture time when it sends one (wlr and mutter both
     // set a header pts); otherwise the buffer is here now, which is the same
     // clock.
-    let pts = buffer
-        .find_meta::<spa::buffer::meta::MetaHeader>()
-        .and_then(|h| pts_secs(h.pts()))
-        .unwrap_or_else(crate::media_types::now);
+    let now = crate::media_types::now();
+    let pts = sane_pts(
+        buffer
+            .find_meta::<spa::buffer::meta::MetaHeader>()
+            .and_then(|h| pts_secs(h.pts())),
+        now,
+    );
     let cursor = read_cursor(&buffer, data);
     let datas = buffer.datas_mut();
     if datas.is_empty() {
@@ -543,6 +546,28 @@ fn cursor_bitmap(meta: &SpaMetaCursor) -> Option<CursorImage> {
         hotspot_x: meta.hotspot_x,
         hotspot_y: meta.hotspot_y,
     })
+}
+
+/// The timestamp a frame gets: the compositor's, when it is on our clock.
+///
+/// A producer that stamps buffers with another epoch (a compositor bug, or a
+/// graph clock that is not `CLOCK_MONOTONIC`) would otherwise shift the whole
+/// video timeline against the audio, which the writer can only answer by
+/// dropping audio. A stamp more than a few seconds away from arrival is not a
+/// capture time we can use; the arrival time is.
+fn sane_pts(header: Option<f64>, now: f64) -> f64 {
+    match header {
+        Some(pts) if (pts - now).abs() < 5.0 => pts,
+        Some(pts) => {
+            super::warn_once(&format!(
+                "the screen-cast stream stamps frames {:.1} s away from the host clock, so \
+                 arrival time is used instead (A/V sync would be wrong otherwise)",
+                pts - now
+            ));
+            now
+        }
+        None => now,
+    }
 }
 
 /// The negotiated SPA format in the contract's terms.
@@ -728,5 +753,46 @@ fn process_frames(
             format: raw.format,
             planes: vec![crate::media_types::Plane::new(data, stride)],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_timestamp_must_be_on_our_clock() {
+        let now = 1000.0;
+        // The compositor's own capture time: used as is.
+        assert_eq!(sane_pts(Some(999.98), now), 999.98);
+        // Absent: arrival time.
+        assert_eq!(sane_pts(None, now), now);
+        // Wildly off (an epoch, a broken graph clock): arrival time.
+        assert_eq!(sane_pts(Some(1.7e9), now), now);
+        assert_eq!(sane_pts(Some(0.0), now), now);
+        // The boundary is generous enough for a slow frame.
+        assert_eq!(sane_pts(Some(now - 4.9), now), now - 4.9);
+        assert_eq!(sane_pts(Some(now + 4.9), now), now + 4.9);
+    }
+
+    #[test]
+    fn only_packed_formats_are_accepted() {
+        assert_eq!(pixel_format(VideoFormat::BGRx), Some(PixelFormat::Bgra));
+        assert_eq!(pixel_format(VideoFormat::BGRA), Some(PixelFormat::Bgra));
+        assert_eq!(pixel_format(VideoFormat::RGBx), Some(PixelFormat::Rgba));
+        assert_eq!(pixel_format(VideoFormat::RGBA), Some(PixelFormat::Rgba));
+        // Planar formats (which a compositor may offer instead) are refused by
+        // name, not misread as packed pixels.
+        assert_eq!(pixel_format(VideoFormat::NV12), None);
+        assert_eq!(pixel_format(VideoFormat::I420), None);
+    }
+
+    #[test]
+    fn the_format_list_offers_packed_rgb_only() {
+        let pods = format_pods();
+        assert_eq!(pods.len(), 2, "BGRx and BGRA");
+        for pod in &pods {
+            assert!(Pod::from_bytes(pod).is_some());
+        }
     }
 }

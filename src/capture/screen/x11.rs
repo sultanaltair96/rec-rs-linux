@@ -194,7 +194,9 @@ impl Server {
             .ok()?;
         let mut out = vec![];
         for m in reply.monitors {
-            if m.width < 2 || m.height < 2 {
+            // An unusable monitor: no area, or an origin outside the root
+            // window (which `GetImage` cannot address at all).
+            if m.width < 2 || m.height < 2 || m.x < 0 || m.y < 0 {
                 continue;
             }
             let name = atom_name(&self.conn, m.name);
@@ -216,8 +218,8 @@ impl Server {
                     primary: m.primary,
                 },
                 Rect::new(
-                    m.x.max(0) as usize,
-                    m.y.max(0) as usize,
+                    m.x as usize,
+                    m.y as usize,
                     m.width as usize,
                     m.height as usize,
                 ),
