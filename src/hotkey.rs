@@ -182,12 +182,12 @@ pub fn register(which: Shortcut, cb: impl Fn() + Send + Sync + 'static) -> Resul
     }
     let h = h.as_ref().unwrap();
     match h.kind {
-        Backend::X11 => h
-            .tx
-            .as_ref()
-            .ok_or("the X11 hotkey thread is gone")?
-            .send(Msg::Bind(which))
-            .map_err(|_| "the X11 hotkey thread is gone".to_string()),
+        Backend::X11 => {
+            h.tx.as_ref()
+                .ok_or("the X11 hotkey thread is gone")?
+                .send(Msg::Bind(which))
+                .map_err(|_| "the X11 hotkey thread is gone".to_string())
+        }
         Backend::Portal => h
             .portal_tx
             .as_ref()
@@ -226,7 +226,12 @@ fn fire(which: Shortcut) {
 }
 
 /// The X11 keycode for `keysym`, from a keyboard mapping.
-pub fn keycode_for(keysyms: &[u32], min_keycode: u8, keysyms_per_keycode: u8, keysym: u32) -> Option<u8> {
+pub fn keycode_for(
+    keysyms: &[u32],
+    min_keycode: u8,
+    keysyms_per_keycode: u8,
+    keysym: u32,
+) -> Option<u8> {
     let per = keysyms_per_keycode as usize;
     if per == 0 {
         return None;
@@ -391,7 +396,8 @@ mod portal {
                     format!("the GlobalShortcuts portal is unavailable: {e}"),
                 ),
             };
-            let mut held: HashMap<Shortcut, (Session, tokio::task::JoinHandle<()>)> = HashMap::new();
+            let mut held: HashMap<Shortcut, (Session, tokio::task::JoinHandle<()>)> =
+                HashMap::new();
             while let Some(msg) = rx.recv().await {
                 match (gs.as_ref(), msg) {
                     (Some(gs), Msg::Bind(which)) => {
@@ -442,7 +448,10 @@ mod portal {
             .map_err(|e| format!("{} was not registered: {e}", which.label()))?;
         // Some portals answer with an empty list when the user declined.
         if bound.shortcuts().is_empty() {
-            return Err(format!("{} is not registered with the desktop", which.label()));
+            return Err(format!(
+                "{} is not registered with the desktop",
+                which.label()
+            ));
         }
         let mut activated = gs
             .receive_activated()
@@ -534,10 +543,10 @@ mod tests {
     fn a_hotkey_fires_its_callback() {
         let fired = Arc::new(Mutex::new(0));
         let f = fired.clone();
-        callbacks().lock().unwrap().insert(
-            Shortcut::Record,
-            Arc::new(move || *f.lock().unwrap() += 1),
-        );
+        callbacks()
+            .lock()
+            .unwrap()
+            .insert(Shortcut::Record, Arc::new(move || *f.lock().unwrap() += 1));
         fire(Shortcut::Record);
         fire(Shortcut::Replay);
         assert_eq!(*fired.lock().unwrap(), 1, "only the registered one fires");

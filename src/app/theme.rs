@@ -58,11 +58,7 @@ pub fn parse_hex(s: &str) -> Option<Color32> {
         return None;
     }
     let v = u32::from_str_radix(h, 16).ok()?;
-    Some(Color32::from_rgb(
-        (v >> 16) as u8,
-        (v >> 8) as u8,
-        v as u8,
-    ))
+    Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
 /// Colours for one appearance, loosely after AppKit's semantic colours.
@@ -300,7 +296,10 @@ mod tests {
     #[test]
     fn blending_keeps_the_base_opaque() {
         let a = Color32::from_rgb(0x10, 0x20, 0x30);
-        assert_eq!(blend(a, Color32::from_rgba_unmultiplied(255, 255, 255, 0)), a);
+        assert_eq!(
+            blend(a, Color32::from_rgba_unmultiplied(255, 255, 255, 0)),
+            a
+        );
         assert_eq!(blend(a, Color32::WHITE), Color32::WHITE);
         let half = blend(a, Color32::from_rgba_unmultiplied(255, 255, 255, 128));
         assert!(half.r() > a.r() && half.r() < 255);

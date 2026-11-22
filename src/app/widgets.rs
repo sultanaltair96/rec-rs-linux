@@ -64,7 +64,11 @@ pub fn header(ui: &mut Ui, icon: Icon, title: &str) {
                 ..Default::default()
             },
         );
-        ui.label(job);
+        // A LayoutJob has no plain text, so a screen reader (and the UI tests)
+        // gets the label explicitly.
+        let label = title.to_uppercase();
+        ui.label(job)
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &label));
     });
     ui.add_space(8.0);
 }
@@ -104,7 +108,8 @@ pub fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.allocate_ui_with_layout(vec2(w, ROW_H), Layout::left_to_right(Align::Center), |ui| {
         ui.set_min_size(vec2(w, ROW_H));
         ui.label(egui::RichText::new(label).color(p.text));
-        ui.with_layout(Layout::right_to_left(Align::Center), add).inner
+        ui.with_layout(Layout::right_to_left(Align::Center), add)
+            .inner
     })
     .inner
 }
@@ -120,7 +125,9 @@ pub fn field<R>(ui: &mut Ui, label: &str, label_w: f32, add: impl FnOnce(&mut Ui
             ui,
             label_w,
             Align::Min,
-            egui::RichText::new(label).size(SECONDARY + 1.0).color(p.secondary),
+            egui::RichText::new(label)
+                .size(SECONDARY + 1.0)
+                .color(p.secondary),
         );
         add(ui)
     })
@@ -351,8 +358,8 @@ pub fn fader(ui: &mut Ui, db: &mut f32, width: f32, enabled: bool, live: bool) -
 }
 
 /// A speaker button that mutes a source: sound waves when on, a red cross
-/// when muted.
-pub fn mute_button(ui: &mut Ui, muted: &mut bool, enabled: bool) -> Response {
+/// when muted. `label` is what a screen reader (and the UI tests) see.
+pub fn mute_button(ui: &mut Ui, muted: &mut bool, enabled: bool, label: &str) -> Response {
     let (rect, mut resp) = ui.allocate_exact_size(
         vec2(22.0, 22.0),
         if enabled {
@@ -405,6 +412,7 @@ pub fn mute_button(ui: &mut Ui, muted: &mut bool, enabled: bool) -> Response {
             painter.add(Shape::line(pts, s));
         }
     }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     resp
 }
 
@@ -430,7 +438,8 @@ pub fn segmented<T: Copy + PartialEq>(
     } else {
         Color32::from_black_alpha(14)
     };
-    ui.painter().rect_filled(track_rect, CornerRadius::same(8), track);
+    ui.painter()
+        .rect_filled(track_rect, CornerRadius::same(8), track);
     let inner = track_rect.shrink(2.0);
     let w = inner.width() / options.len() as f32;
     let mut changed = false;
@@ -476,6 +485,9 @@ pub fn segmented<T: Copy + PartialEq>(
         ui.painter()
             .galley(r.center() - galley.size() / 2.0, galley, color);
         let resp = if *ok { resp } else { resp.on_hover_text(*why) };
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, *ok, sel, *label)
+        });
         if resp.clicked() && !sel {
             *value = *v;
             changed = true;
@@ -515,7 +527,8 @@ pub fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
     let c = rect.center();
     let at = |x: f32, y: f32| -> Pos2 { pos2(rect.left() + x, rect.top() + y) };
     let r2 = CornerRadius::same(2);
-    let outline = |r: Rect, cr: CornerRadius| painter.rect_stroke(r, cr, s, egui::StrokeKind::Middle);
+    let outline =
+        |r: Rect, cr: CornerRadius| painter.rect_stroke(r, cr, s, egui::StrokeKind::Middle);
     match icon {
         Icon::Scene => {
             // Two stacked layers.
@@ -541,7 +554,13 @@ pub fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Audio => {
             // Waveform bars.
-            for (x, h) in [(2.0, 3.0), (4.75, 7.0), (7.5, 10.0), (10.25, 6.0), (13.0, 2.5)] {
+            for (x, h) in [
+                (2.0, 3.0),
+                (4.75, 7.0),
+                (7.5, 10.0),
+                (10.25, 6.0),
+                (13.0, 2.5),
+            ] {
                 painter.line_segment(
                     [
                         pos2(rect.left() + x - 0.5, c.y - h / 2.0),
@@ -577,7 +596,10 @@ pub fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
                 .collect();
             let start = pts[0];
             painter.add(Shape::line(pts, s));
-            painter.line(vec![start + vec2(-2.6, 0.2), start, start + vec2(0.4, -2.8)], s);
+            painter.line(
+                vec![start + vec2(-2.6, 0.2), start, start + vec2(0.4, -2.8)],
+                s,
+            );
         }
         Icon::Stream => {
             painter.circle_filled(c, 1.6, color);
@@ -662,11 +684,7 @@ mod tests {
                 pressed,
                 modifiers: Default::default(),
             };
-            self.frame(
-                vec![egui::Event::PointerMoved(at), e],
-                db,
-                true,
-            );
+            self.frame(vec![egui::Event::PointerMoved(at), e], db, true);
         }
 
         fn drag(&mut self, from: Pos2, to: Pos2, db: &mut f32) {
@@ -696,7 +714,11 @@ mod tests {
         f.button(pos2(x(-20.0), r.center().y), false, &mut db);
         assert!((db + 20.0).abs() <= 0.1, "{db}");
         // Dragged past the ends: silence and the full boost.
-        f.drag(pos2(x(db), r.center().y), pos2(r.left() - 50.0, r.center().y), &mut db);
+        f.drag(
+            pos2(x(db), r.center().y),
+            pos2(r.left() - 50.0, r.center().y),
+            &mut db,
+        );
         assert_eq!(db, MIN_DB);
         f.drag(
             pos2(x(db), r.center().y),
@@ -749,7 +771,11 @@ mod tests {
                 pressed,
                 modifiers: Default::default(),
             };
-            f.frame(vec![egui::Event::PointerMoved(r.left_center()), e], &mut db, false);
+            f.frame(
+                vec![egui::Event::PointerMoved(r.left_center()), e],
+                &mut db,
+                false,
+            );
         }
         assert_eq!(db, -6.0);
     }
@@ -779,7 +805,9 @@ mod tests {
                 time: Some(i as f64 / 60.0),
                 ..Default::default()
             };
-            let mut out = ctx.run_ui(input, |ui| rect = mute_button(ui, &mut muted, true).rect);
+            let mut out = ctx.run_ui(input, |ui| {
+                rect = mute_button(ui, &mut muted, true, "Mute").rect
+            });
             out.textures_delta.clear();
         }
         assert!(muted);

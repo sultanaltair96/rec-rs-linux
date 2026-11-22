@@ -8,7 +8,7 @@
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, Ui, vec2};
 
 use super::session;
-use super::theme::{self, BODY, SECONDARY, TOOLBAR_H, TITLE_INSET_W};
+use super::theme::{self, BODY, SECONDARY, TITLE_INSET_W, TOOLBAR_H};
 use super::widgets::{self as w, Icon};
 use super::{Cmd, Meter, State, Stream};
 use crate::compose::{self, Corner, Place, Scene, Shape};
@@ -45,14 +45,17 @@ fn toolbar(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
         add(ui);
     });
     let p = theme::pal(ui);
-    ui.painter()
-        .hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.separator));
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, p.separator),
+    );
 }
 
 fn pill(ui: &mut Ui, text: &str, fill: Color32, fg: Color32) {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), theme::semibold(SECONDARY), fg);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), theme::semibold(SECONDARY), fg);
     let (rect, _) = ui.allocate_exact_size(galley.size() + vec2(16.0, 6.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
     ui.painter()
@@ -216,7 +219,10 @@ fn app_menu(ui: &mut Ui, st: &mut State) {
     }
     ui.separator();
     if ui
-        .add_enabled(st.last_file.is_some(), egui::Button::new("Reveal Last Recording"))
+        .add_enabled(
+            st.last_file.is_some(),
+            egui::Button::new("Reveal Last Recording"),
+        )
         .clicked()
     {
         st.cmds.push(Cmd::RevealLast);
@@ -270,7 +276,10 @@ fn preview(ui: &mut Ui, st: &mut State) {
     let avail = ui.available_size();
     let ppp = ui.ctx().pixels_per_point();
     // The preview is converted at exactly this many pixels (aspect kept).
-    st.preview_target = ((avail.x * ppp).floor() as u32, (avail.y * ppp).floor() as u32);
+    st.preview_target = (
+        (avail.x * ppp).floor() as u32,
+        (avail.y * ppp).floor() as u32,
+    );
     let aspect = st.preview_aspect.max(0.1);
     let mut size = vec2(avail.x, avail.x / aspect);
     if size.y > avail.y {
@@ -279,7 +288,10 @@ fn preview(ui: &mut Ui, st: &mut State) {
     // Show the frame at its own pixel size when it fits (1:1, no second
     // scaling), except in low-power mode where it is meant to be small.
     let px = vec2(st.preview_px[0] as f32, st.preview_px[1] as f32) / ppp;
-    if px.x > 0.0 && px.x <= avail.x + 0.5 && px.y <= avail.y + 0.5 && !st.settings.preview_low_power
+    if px.x > 0.0
+        && px.x <= avail.x + 0.5
+        && px.y <= avail.y + 0.5
+        && !st.settings.preview_low_power
     {
         size = px;
     }
@@ -483,8 +495,12 @@ fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
             } else {
                 Stroke::new(1.0, p.control_border)
             };
-            ui.painter()
-                .rect_stroke(rect, CornerRadius::same(7), stroke, egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(7),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
             shape_icon(
                 ui,
                 rect.shrink(2.0),
@@ -516,13 +532,22 @@ fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
             ui,
             VALUE_W,
             Align::Max,
-            RichText::new(fmt(*value)).size(SECONDARY + 1.0).color(p.secondary),
+            RichText::new(fmt(*value))
+                .size(SECONDARY + 1.0)
+                .color(p.secondary),
         );
         changed
     };
     w::field(ui, "Size", LABEL_W, |ui| {
         let mut pct = s.pip_size * 100.0;
-        if slider(ui, &mut pct, 10.0..=50.0, &|v| format!("{v:.0}%"), true, 0.0) {
+        if slider(
+            ui,
+            &mut pct,
+            10.0..=50.0,
+            &|v| format!("{v:.0}%"),
+            true,
+            0.0,
+        ) {
             s.pip_size = pct.round() / 100.0;
         }
     });
@@ -536,7 +561,14 @@ fn overlay_controls(ui: &mut Ui, s: &mut Settings) {
     w::field(ui, "Border", LABEL_W, |ui| {
         // The color swatch shares the row.
         let mut b = s.pip_border;
-        if slider(ui, &mut b, 0.0..=20.0, &|v| format!("{v:.0} px"), true, 30.0) {
+        if slider(
+            ui,
+            &mut b,
+            0.0..=20.0,
+            &|v| format!("{v:.0} px"),
+            true,
+            30.0,
+        ) {
             s.pip_border = b.round();
         }
         ui.add_enabled_ui(s.pip_border > 0.0, |ui| {
@@ -628,7 +660,11 @@ fn controls(ui: &mut Ui, st: &mut State) {
             st.cmds.push(Cmd::TogglePause);
         }
         ui.add_space(10.0);
-        let clock = if recording { st.clock() } else { "00:00".into() };
+        let clock = if recording {
+            st.clock()
+        } else {
+            "00:00".into()
+        };
         let color = if paused {
             p.secondary
         } else if recording {
@@ -636,7 +672,11 @@ fn controls(ui: &mut Ui, st: &mut State) {
         } else {
             p.tertiary
         };
-        ui.label(RichText::new(clock).font(egui::FontId::monospace(22.0)).color(color));
+        ui.label(
+            RichText::new(clock)
+                .font(egui::FontId::monospace(22.0))
+                .color(color),
+        );
         ui.add_space(16.0);
         // The audio mixer: room is left for the buttons on the right.
         let width = (ui.available_width() - 210.0).clamp(250.0, 480.0);
@@ -683,7 +723,15 @@ fn controls(ui: &mut Ui, st: &mut State) {
 /// One channel of the audio mixer: the source's name, mute, a level meter over
 /// its fader, and the level in dB (click to type one). Changes apply live, also
 /// while recording.
-fn channel(ui: &mut Ui, label: &str, m: Meter, on: bool, db: &mut f32, muted: &mut bool, width: f32) {
+pub(super) fn channel(
+    ui: &mut Ui,
+    label: &str,
+    m: Meter,
+    on: bool,
+    db: &mut f32,
+    muted: &mut bool,
+    width: f32,
+) {
     const LABEL_W: f32 = 44.0;
     const VALUE_W: f32 = 62.0;
     let p = theme::pal(ui);
@@ -700,7 +748,7 @@ fn channel(ui: &mut Ui, label: &str, m: Meter, on: bool, db: &mut f32, muted: &m
         } else {
             format!("Mute {label}")
         };
-        w::mute_button(ui, muted, on).on_hover_text(tip);
+        w::mute_button(ui, muted, on, &tip).on_hover_text(tip);
         let bar = (width - LABEL_W - 22.0 - VALUE_W - 3.0 * 6.0).max(80.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -847,6 +895,9 @@ fn combo<T: Clone + PartialEq>(
                     }
                 });
             // Long names are cut to fit; show the whole one on hover.
+            resp.response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, enabled, &current)
+            });
             resp.response.on_hover_text(current);
         });
     });
@@ -888,15 +939,22 @@ fn sources(ui: &mut Ui, st: &mut State) {
 
     w::header(ui, Icon::Display, "Screen");
     w::card(ui, |ui| {
-        let displays: Vec<(usize, String)> =
-            st.displays.iter().enumerate().map(|(i, d)| (i + 1, d.clone())).collect();
+        let displays: Vec<(usize, String)> = st
+            .displays
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i + 1, d.clone()))
+            .collect();
         combo(ui, "display", &mut s.display, &displays, idle);
         let mut targets: Vec<(Option<u32>, String)> = vec![(None, "Entire display".into())];
         targets.extend(st.windows.iter().map(|(id, l)| (Some(*id), l.clone())));
         ui.horizontal(|ui| {
             let bw = 26.0;
             ui.allocate_ui(
-                vec2(ui.available_width() - bw - ui.spacing().item_spacing.x, 24.0),
+                vec2(
+                    ui.available_width() - bw - ui.spacing().item_spacing.x,
+                    24.0,
+                ),
                 |ui| {
                     combo(ui, "window", &mut s.window, &targets, idle);
                 },
@@ -917,8 +975,18 @@ fn sources(ui: &mut Ui, st: &mut State) {
     w::header(ui, Icon::Camera, "Camera");
     w::card(ui, |ui| {
         let mut cams: Vec<(Option<String>, String)> = vec![(None, "Default camera".into())];
-        cams.extend(st.cameras.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
-        combo(ui, "camera", &mut s.camera, &cams, idle && s.scene.uses_cam());
+        cams.extend(
+            st.cameras
+                .iter()
+                .map(|d| (Some(d.id.clone()), d.name.clone())),
+        );
+        combo(
+            ui,
+            "camera",
+            &mut s.camera,
+            &cams,
+            idle && s.scene.uses_cam(),
+        );
         if !s.scene.uses_cam() {
             w::hint(ui, "Pick a camera scene to use the webcam.");
         }
@@ -934,7 +1002,9 @@ fn sources(ui: &mut Ui, st: &mut State) {
             w::switch(ui, &mut s.system_audio, idle)
         });
         w::divider(ui);
-        w::row(ui, "Microphone", |ui| w::switch(ui, &mut s.mic_enabled, idle));
+        w::row(ui, "Microphone", |ui| {
+            w::switch(ui, &mut s.mic_enabled, idle)
+        });
         let mics = mic_options(st, &s);
         if combo(ui, "mic", &mut s.mic, &mics, idle && s.mic_enabled) {
             s.mic_name = mic_label(&mics, &s.mic);
@@ -954,7 +1024,10 @@ fn sources(ui: &mut Ui, st: &mut State) {
                 .on_hover_text(text);
         };
         w::row(ui, "Format", |ui| {
-            value(ui, format!("{} · {} fps", s.resolution.to_uppercase(), s.fps))
+            value(
+                ui,
+                format!("{} · {} fps", s.resolution.to_uppercase(), s.fps),
+            )
         });
         w::divider(ui);
         w::row(ui, "Codec", |ui| {
@@ -1380,7 +1453,10 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         ui.label("Cursor");
         ui.horizontal(|ui| {
             ui.checkbox(&mut s.cursor, "Show");
-            ui.add_enabled(s.cursor, egui::Checkbox::new(&mut s.clicks, "Highlight clicks"));
+            ui.add_enabled(
+                s.cursor,
+                egui::Checkbox::new(&mut s.clicks, "Highlight clicks"),
+            );
         });
         ui.end_row();
         ui.label("Preview");
@@ -1507,7 +1583,11 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
     grid(ui, "cam", &mut |ui| {
         ui.label("Camera");
         let mut cams: Vec<(Option<String>, String)> = vec![(None, "Default camera".into())];
-        cams.extend(st.cameras.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
+        cams.extend(
+            st.cameras
+                .iter()
+                .map(|d| (Some(d.id.clone()), d.name.clone())),
+        );
         combo(ui, "cam2", &mut s.camera, &cams, true);
         ui.end_row();
     });

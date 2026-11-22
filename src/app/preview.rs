@@ -212,7 +212,7 @@ fn to_rgba(frame: &VideoFrame) -> Option<(usize, usize, Vec<u8>)> {
             for y in 0..h {
                 let yrow = &y_plane.data[y * y_plane.stride..][..w];
                 let chroma_row = y / 2;
-                for x in 0..w {
+                for (x, luma) in yrow.iter().enumerate().take(w) {
                     let cw = chroma_row * u_plane.stride + (x / 2);
                     let (u, v) = match frame.format {
                         PixelFormat::Nv12 => (u_plane.data[cw * 2], u_plane.data[cw * 2 + 1]),
@@ -222,7 +222,7 @@ fn to_rgba(frame: &VideoFrame) -> Option<(usize, usize, Vec<u8>)> {
                             (u_plane.data[u_row], v_plane.data[v_row])
                         }
                     };
-                    let (r, g, b) = yuv_to_rgb(yrow[x], u, v);
+                    let (r, g, b) = yuv_to_rgb(*luma, u, v);
                     out.extend_from_slice(&[r, g, b, 255]);
                 }
             }
@@ -324,7 +324,7 @@ mod tests {
         assert!(r > 200 && g < 80 && b < 80, "{r} {g} {b}");
         // NV12: a black frame with neutral grey chroma is black.
         let y = Plane::new(vec![16u8; 4 * 2], 4);
-        let uv = Plane::new(vec![128u8; 2 * 1 * 2], 4);
+        let uv = Plane::new(vec![128u8; 4], 4);
         let f = VideoFrame {
             pts: 1.0,
             width: 4,

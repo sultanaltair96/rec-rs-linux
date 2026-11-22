@@ -302,6 +302,12 @@ impl State {
         }
     }
 
+    /// Forget the cached key lookups (the UI tests change the environment).
+    #[cfg(test)]
+    pub fn key_saved_clear_for_tests(&mut self) {
+        self.key_saved.clear();
+    }
+
     pub fn delete_stream_key(&mut self, url: &str) {
         self.key_saved.insert(url.to_string(), false);
     }
@@ -480,22 +486,26 @@ impl App {
 
     fn gpu(&mut self, surface: &wgpu::Surface<'static>) -> &Gpu {
         if self.gpu.is_none() {
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
             let adapter = pollster::block_on(instance.request_adapter(
                 &wgpu::RequestAdapterOptions {
                     compatible_surface: Some(surface),
                     ..Default::default()
                 },
             ))
-            .expect("no compatible GPU adapter (install Mesa's Vulkan driver or run with a display)");
-            let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("rec-rs"),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
-                ..Default::default()
-            }))
-            .expect("create the wgpu device");
+            .expect(
+                "no compatible GPU adapter (install Mesa's Vulkan driver or run with a display)",
+            );
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("rec-rs"),
+                    required_limits:
+                        wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                    ..Default::default()
+                }))
+                .expect("create the wgpu device");
             self.gpu = Some(Gpu {
                 instance,
                 adapter,
@@ -527,18 +537,17 @@ impl App {
                     wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
                 );
                 let s = instance.create_surface(window.clone()).expect("surface");
-                let adapter = pollster::block_on(instance.request_adapter(
-                    &wgpu::RequestAdapterOptions {
+                let adapter =
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                         compatible_surface: Some(&s),
                         ..Default::default()
-                    },
-                ))
-                .expect("no compatible GPU adapter");
+                    }))
+                    .expect("no compatible GPU adapter");
                 let (device, queue) =
                     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                         label: Some("rec-rs"),
-                        required_limits: wgpu::Limits::downlevel_defaults()
-                            .using_resolution(adapter.limits()),
+                        required_limits:
+                            wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
                         ..Default::default()
                     }))
                     .expect("create the wgpu device");
@@ -661,7 +670,10 @@ impl App {
             .map(|d| d.len())
             .unwrap_or(0);
         if count > 0 && settings.window.is_none() && settings.display > count {
-            let warning = format!("Display {} not connected; using display 1", settings.display);
+            let warning = format!(
+                "Display {} not connected; using display 1",
+                settings.display
+            );
             settings.display = 1;
             eprintln!("rec: warning: {warning}");
             self.st.notice = Some((warning, Instant::now()));
@@ -751,10 +763,7 @@ impl App {
             .join(crate::util::timestamped("replay", "mp4"));
         let r = std::fs::create_dir_all(&self.st.settings.output_dir)
             .map_err(anyhow::Error::from)
-            .and_then(|_| {
-                session::save_replay(&self.st.live, path)
-                    .map_err(|e| anyhow::Error::msg(e))
-            });
+            .and_then(|_| session::save_replay(&self.st.live, path).map_err(anyhow::Error::msg));
         match r {
             Ok(()) => self.st.notice = Some(("Saving the replay…".into(), Instant::now())),
             Err(e) => self.st.error = Some(format!("Replay: {e:#}")),
@@ -798,7 +807,7 @@ impl App {
                     for a in added {
                         let _ = session::remove_output(&self.st.live, a.id);
                     }
-                    self.st.error = Some(format!("{e}"));
+                    self.st.error = Some(e);
                     return;
                 }
             }
@@ -814,8 +823,9 @@ impl App {
     fn sync_preview(&mut self) {
         // The replay buffer and streams keep a session running while the
         // window is closed.
-        let want =
-            (self.main_visible || self.live_wanted()) && self.st.recording.is_none() && !self.st.finishing;
+        let want = (self.main_visible || self.live_wanted())
+            && self.st.recording.is_none()
+            && !self.st.finishing;
         // Overlay changes are applied live (`apply_pip`), not by restarting.
         let stale = self.st.preview_settings.as_ref().map(Settings::capture_key)
             != Some(self.st.settings.capture_key());
@@ -1000,12 +1010,7 @@ impl App {
         if SIG_STOP.swap(false, Ordering::SeqCst) && self.st.recording.is_some() {
             self.stop_recording();
         }
-        if self
-            .st
-            .recording
-            .as_ref()
-            .is_some_and(|s| s.has_frames())
-        {
+        if self.st.recording.as_ref().is_some_and(|s| s.has_frames()) {
             if record::PAUSE_REQ.swap(false, Ordering::SeqCst) {
                 self.st.recording.as_ref().unwrap().pause();
             }
@@ -1079,7 +1084,10 @@ impl App {
         while let Ok(r) = self.update_rx.try_recv() {
             match r {
                 Ok(updater::Found::Newer(rel)) => {
-                    self.st.notice = Some((updater::message(&updater::Found::Newer(rel.clone())), Instant::now()));
+                    self.st.notice = Some((
+                        updater::message(&updater::Found::Newer(rel.clone())),
+                        Instant::now(),
+                    ));
                     linux_desktop::open_url(&rel.url);
                 }
                 Ok(found) => self.st.notice = Some((updater::message(&found), Instant::now())),
@@ -1160,8 +1168,7 @@ impl App {
             return;
         }
         // The preview texture follows the settings' low-power mode.
-        self.tap
-            .set_low_power(self.st.settings.preview_low_power);
+        self.tap.set_low_power(self.st.settings.preview_low_power);
         if is_main && self.main_visible && self.tap.wanted() {
             self.tap.set_target(
                 self.st.preview_target.0.max(2),
@@ -1324,9 +1331,7 @@ impl ApplicationHandler for App {
                 Instant::now(),
             ));
         }
-        eprintln!(
-            "rec: app running (Ctrl+Shift+R toggles recording, Ctrl+Q quits)"
-        );
+        eprintln!("rec: app running (Ctrl+Shift+R toggles recording, Ctrl+Q quits)");
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: ()) {
@@ -1444,7 +1449,11 @@ fn spawn_accent_fetch(tx: Sender<Option<egui::Color32>>) {
                     let s = ashpd::desktop::settings::Settings::new().await.ok()?;
                     let c = s.accent_color().await.ok()?;
                     let to = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    Some(egui::Color32::from_rgb(to(c.red()), to(c.green()), to(c.blue())))
+                    Some(egui::Color32::from_rgb(
+                        to(c.red()),
+                        to(c.green()),
+                        to(c.blue()),
+                    ))
                 })
             });
             let _ = tx.send(color);
@@ -1515,7 +1524,10 @@ mod tests {
         assert!(msg.starts_with("Preview unavailable: "), "{msg}");
         assert!(msg.contains("phase 1A"), "{msg}");
         let e = anyhow::anyhow!("no display found");
-        assert_eq!(session::preview_error(&e), "Preview unavailable: no display found");
+        assert_eq!(
+            session::preview_error(&e),
+            "Preview unavailable: no display found"
+        );
     }
 
     #[test]

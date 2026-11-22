@@ -262,7 +262,9 @@ pub fn start(
     match tray.disable_dbus_name(flatpak).spawn() {
         Ok(h) => Some(h),
         Err(e) => {
-            eprintln!("rec: warning: no tray item ({e}); close the window to keep Rec running hidden");
+            eprintln!(
+                "rec: warning: no tray item ({e}); close the window to keep Rec running hidden"
+            );
             None
         }
     }
@@ -319,10 +321,7 @@ mod tests {
             ]
         );
         // Separators: after Go Live, after Settings, before the hotkey line.
-        let seps = menu(&v)
-            .iter()
-            .filter(|e| **e == Entry::Separator)
-            .count();
+        let seps = menu(&v).iter().filter(|e| **e == Entry::Separator).count();
         assert_eq!(seps, 3);
         // Recording flips the first two rows and enables Pause.
         let v = View {
@@ -366,7 +365,10 @@ mod tests {
             ..idle()
         };
         assert_eq!(labels(&v)[3], "Stop Streaming");
-        assert!(!matches!(menu(&idle())[2], Entry::Action { enabled: true, .. }));
+        assert!(!matches!(
+            menu(&idle())[2],
+            Entry::Action { enabled: true, .. }
+        ));
         // No last recording: nothing to reveal (index 8; 0-3 the actions,
         // 4 separator, 5/6 window/settings, 7 separator, 8 reveal).
         assert!(!matches!(

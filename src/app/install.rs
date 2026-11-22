@@ -146,8 +146,7 @@ fn staging(dest: &Path) -> Result<PathBuf> {
     let dir = dest
         .parent()
         .with_context(|| format!("{} has no folder", dest.display()))?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("could not create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
     let name = dest
         .file_name()
         .with_context(|| format!("{} has no file name", dest.display()))?;
@@ -246,19 +245,18 @@ mod tests {
     fn updates_are_flatpak_managed() {
         // Flatpak updates the app through the store; AppImage and source builds
         // check GitHub Releases themselves.
-        assert!(!flatpak_from(true) == false || !updates_self() || is_flatpak());
-        if is_flatpak() {
-            assert!(!updates_self());
-        } else if std::env::var_os("APPIMAGE").is_none() {
-            assert!(updates_self());
-        }
+        assert_eq!(updates_self(), !is_flatpak());
+        assert!(flatpak_from(true));
     }
 
     #[test]
     fn desktop_entry_starts_this_appimage() {
         let e = desktop_entry(Path::new("/home/x/Apps/Rec-1.0.AppImage"), "Rec");
         assert!(e.starts_with("[Desktop Entry]\n"));
-        assert!(e.contains("Exec=\"/home/x/Apps/Rec-1.0.AppImage\" gui\n"), "{e}");
+        assert!(
+            e.contains("Exec=\"/home/x/Apps/Rec-1.0.AppImage\" gui\n"),
+            "{e}"
+        );
         assert!(e.contains("TryExec=/home/x/Apps/Rec-1.0.AppImage\n"), "{e}");
         assert!(e.contains("Icon=rec-rs\n"));
         assert!(e.contains("Categories=AudioVideo;Recorder;\n"));
@@ -328,12 +326,12 @@ mod tests {
         let dest = d.join("rec-rs.desktop");
         write_atomic(&dest, "one\n").unwrap();
         let seen = std::cell::RefCell::new(vec![]);
-        let _guard = {
-            // Read the file the way a desktop would, right before and after.
-            seen.borrow_mut().push(std::fs::read_to_string(&dest).unwrap());
-            write_atomic(&dest, "two\n").unwrap();
-            seen.borrow_mut().push(std::fs::read_to_string(&dest).unwrap());
-        };
+        // Read the file the way a desktop would, right before and after.
+        seen.borrow_mut()
+            .push(std::fs::read_to_string(&dest).unwrap());
+        write_atomic(&dest, "two\n").unwrap();
+        seen.borrow_mut()
+            .push(std::fs::read_to_string(&dest).unwrap());
         assert_eq!(*seen.borrow(), ["one\n", "two\n"]);
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no staging left");
         std::fs::remove_dir_all(&d).unwrap();
@@ -389,10 +387,7 @@ mod tests {
         let data = d.join("data");
         assert!(should_offer_integration(&app, &data), "not integrated yet");
         integrate(&integration_in(&data, &app, "Rec")).unwrap();
-        assert!(
-            !should_offer_integration(&app, &data),
-            "already integrated"
-        );
+        assert!(!should_offer_integration(&app, &data), "already integrated");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

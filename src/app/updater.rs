@@ -14,7 +14,8 @@
 use anyhow::{Context, Result, bail};
 
 /// The repository's newest release, over the public API.
-pub const LATEST_API: &str = "https://api.github.com/repos/sultanaltair96/rec-rs-linux/releases/latest";
+pub const LATEST_API: &str =
+    "https://api.github.com/repos/sultanaltair96/rec-rs-linux/releases/latest";
 /// The human page the update item opens (the repo's releases).
 pub const DOWNLOAD_PAGE: &str = "https://github.com/sultanaltair96/rec-rs-linux/releases/latest";
 
@@ -129,7 +130,11 @@ pub fn check_now() -> Result<Found> {
 /// The line the app shows for a result.
 pub fn message(found: &Found) -> String {
     match found {
-        Found::Newer(r) => format!("Rec {} is available (this is {}).", r.tag, current_version()),
+        Found::Newer(r) => format!(
+            "Rec {} is available (this is {}).",
+            r.tag,
+            current_version()
+        ),
         Found::Current(tag) => format!("Rec is up to date (the newest release is {tag})."),
     }
 }

@@ -236,8 +236,14 @@ mod tests {
 
     #[test]
     fn stream_keys_come_from_the_environment_for_now() {
-        assert!(has_stream_key_from(Some("abc"), "rtmps://live.twitch.tv/app"));
-        assert!(!has_stream_key_from(Some("  "), "rtmps://live.twitch.tv/app"));
+        assert!(has_stream_key_from(
+            Some("abc"),
+            "rtmps://live.twitch.tv/app"
+        ));
+        assert!(!has_stream_key_from(
+            Some("  "),
+            "rtmps://live.twitch.tv/app"
+        ));
         assert!(!has_stream_key_from(None, "rtmps://live.twitch.tv/app"));
         // WHIP can work without one (a tokenless endpoint), RTMP never.
         assert!(has_stream_key_from(None, "https://example.com/whip"));
@@ -245,7 +251,10 @@ mod tests {
         assert!(!has_stream_key_from(Some("x"), ""));
         // The phase is named when saving is attempted, never silently ignored.
         let e = save_stream_key("rtmp://x/live", "k").unwrap_err();
-        assert!(e.contains("phase 1D") && e.contains("REC_STREAM_KEY"), "{e}");
+        assert!(
+            e.contains("phase 1D") && e.contains("REC_STREAM_KEY"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -253,9 +262,21 @@ mod tests {
         let live = Live::new();
         assert_eq!(replay_stats(&live), None);
         assert!(statuses(&live).is_empty());
-        assert!(add_output(&live, "rtmp://x/live", "k").unwrap_err().contains("phase 1D"));
-        assert!(save_replay(&live, "/tmp/r.mp4".into()).unwrap_err().contains("phase 1D"));
-        assert!(begin_live(&live, true, true).unwrap_err().contains("phase 1D"));
+        assert!(
+            add_output(&live, "rtmp://x/live", "k")
+                .unwrap_err()
+                .contains("phase 1D")
+        );
+        assert!(
+            save_replay(&live, "/tmp/r.mp4".into())
+                .unwrap_err()
+                .contains("phase 1D")
+        );
+        assert!(
+            begin_live(&live, true, true)
+                .unwrap_err()
+                .contains("phase 1D")
+        );
         stop_all(&live);
     }
 

@@ -164,10 +164,7 @@ pub fn claim_at(path: &Path, cmd: Control) -> Claim {
     };
     match thread {
         Some(t) => Claim::Listening {
-            listener: Listener {
-                path,
-                _thread: t,
-            },
+            listener: Listener { path, _thread: t },
             rx,
         },
         None => Claim::Unavailable(rx),
@@ -237,9 +234,15 @@ mod tests {
         assert!(is_running_at(&path));
         // A second launch does not become a listener; it sends its command.
         send_at(&path, Control::Settings).unwrap();
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(Control::Settings));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Control::Settings)
+        );
         assert!(
-            matches!(claim_at(&path, Control::StartRecording), Claim::AlreadyRunning),
+            matches!(
+                claim_at(&path, Control::StartRecording),
+                Claim::AlreadyRunning
+            ),
             "the second launch stands down"
         );
         assert_eq!(
@@ -268,7 +271,10 @@ mod tests {
         };
         assert!(is_running_at(&path));
         send_at(&path, Control::Quit).unwrap();
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(Control::Quit));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Control::Quit)
+        );
         drop(listener);
     }
 
