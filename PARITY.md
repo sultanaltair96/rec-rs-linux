@@ -52,7 +52,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) converted on the CPU to an egui texture at the preview's pixel size; the compositor hands over a GPU frame in 1C (same `record::Options::preview` tap) | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; snapshot `tests/snapshots/main-window.png` |
+| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) converted on the CPU to an egui texture at the preview's pixel size; the compositor hands over a GPU frame in 1C (same `record::Options::preview` tap) | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
 | Own windows excluded from capture | ScreenCaptureKit filter | Portal picks the window; own windows are excluded the same way | 1A | todo | — |
 | Preview low-power mode (half res, 15 fps) | Setting | Same: half resolution and a 15 fps wake rate | 1E | done | unit `app::preview::tests::the_preview_target_is_the_area_in_pixels`; setting round-trip in `app::ui_tests::the_settings_window_round_trips_to_settings_json` |
 | Scene: Screen | Full display or window | Same | 1A | todo | picker: unit `app::ui_tests::main_window_shows_every_card` |
@@ -94,6 +94,37 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | "Check for Updates…" | Sparkle | GitHub Releases for `sultanaltair96/rec-rs-linux`; opens the release page when newer; hidden in Flatpak (Flatpak updates the app) | 1E | done | unit `app::updater::tests::*` (parse, numeric compare, offline), `app::ui_tests::the_app_menu_has_updates_unless_flatpak`; selftest has no network check |
 | Add the AppImage to the desktop menu | Move to Applications | Writes `~/.local/share/applications/rec-rs.desktop` and a scalable icon, atomically | 1E | done | unit `app::install::tests::*` (entry text, quoting, replace, atomic, stale entry) |
 | AppImage/Flatpak self-update | Sparkle replaces the bundle | AppImage: the release check; Flatpak: the software centre | 1E | partial | unit `app::install::tests::spots_flatpak_and_appimage`, `updates_are_flatpak_managed` |
+
+### The 19 upstream app tests on Linux
+
+Upstream's `src/app` carries 19 tests. What happened to each (the pure-logic ones keep their
+assertions; the rest say why not):
+
+| Upstream test | Linux |
+|---|---|
+| widgets: `fader_scale` | ported unchanged |
+| widgets: `fader_follows_the_pointer` | ported unchanged (same synthetic pointer events) |
+| widgets: `fader_scrolls_in_fine_steps` | ported unchanged |
+| widgets: `disabled_fader_ignores_input` | ported unchanged |
+| widgets: `mute_button_toggles` | ported unchanged (the button also gets an accessible label now) |
+| preview: `preview_size_follows_the_area_in_pixels` | ported unchanged; low power halves it |
+| preview: `preview_texture_is_not_srgb` | n-a: there is no Metal texture format to check; the Linux equivalent is `app::preview::tests::frames_are_shown_byte_for_byte_without_a_second_scale` (egui textures are gamma-encoded, values are not converted) |
+| preview: `preview_pixels` (`#[ignore]`, CoreImage/Metal harness) | n-a: replaced by `Tap::image` unit tests (BGRA byte-exact, bilinear resample, NV12/I420 → BT.709 RGB) |
+| mod: `missing_permissions_banner_points_at_its_button` | n-a: Linux has no TCC and no Request Permissions button; replaced by `app::tests::the_preview_banner_names_the_phase` |
+| ui: `levels_as_text_and_typed` | ported unchanged, plus the `-∞`/`off` cases |
+| install: `installs_a_copy_without_quarantine` | n-a: no quarantine flag; replaced by `installs_the_desktop_entry_and_icon` |
+| install: `replaces_an_older_copy` | ported as `replaces_an_older_entry` (the new AppImage's `Exec` replaces the old) |
+| install: `spots_read_only_and_translocated_apps` | n-a: App Translocation is macOS-only; replaced by `spots_flatpak_and_appimage` |
+| install: `plans_by_where_the_download_really_is` | n-a: no move to Applications; replaced by `updates_are_flatpak_managed` |
+| install: `compares_real_paths` | ported as `compares_real_paths` (a symlinked destination folder) |
+| install: `never_leaves_the_destination_missing` | ported as `never_leaves_the_destination_missing` (the desktop entry is replaced by an atomic rename) |
+| install: `stages_apart_from_other_copies` | ported as `staging_is_apart_from_other_copies` |
+| install: `reopens_a_new_instance_with_the_same_options` | n-a: the app never moves itself, so it never reopens; the single-instance handover is covered by `app::control::tests::the_second_launch_talks_to_the_first` and `desktop_entry_starts_this_appimage` |
+| install: `original_of_a_translocated_app` (`#[ignore]`, real macOS bundle) | n-a: no translocated bundle exists on Linux |
+
+New app tests beyond those: `app::theme` (3), `app::preview` (6), `app::control` (4), `app::tray`
+(3), `app::install` (10), `app::updater` (3), `app::linux_desktop` (2), `app::session` (4),
+`app::mod` (4), `app::ui` (3), `hotkey` (5), and the 11 `egui_kittest` UI tests.
 
 ### Needs a real desktop (manual checks, phase 1E)
 

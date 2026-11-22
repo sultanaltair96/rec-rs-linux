@@ -152,22 +152,35 @@ impl Tap {
 
 /// One frame at `size` as an egui image (RGBA, pointed at by egui as
 /// gamma-encoded values: egui's textures are not sRGB).
+///
+/// A packed frame is resampled and swizzled in one pass: a 4K capture at
+/// preview size then costs the preview's pixels, not the frame's.
 pub fn image(frame: &VideoFrame, size: (usize, usize)) -> Option<(ColorImage, [u32; 2])> {
     let (dw, dh) = size;
     if dw < 2 || dh < 2 || !frame.is_well_formed() {
         return None;
     }
-    let (sw, sh, rgba) = to_rgba(frame)?;
+    let (sw, sh) = (frame.width, frame.height);
     let (dw, dh) = (dw.min(sw.max(2)), dh.min(sh.max(2)));
-    let pixels = if (dw, dh) == (sw, sh) {
-        rgba.chunks_exact(4)
-            .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
-            .collect()
-    } else {
-        resample(&rgba, sw, sh, dw, dh)
-            .chunks_exact(4)
-            .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
-            .collect()
+    let pixels = match frame.format {
+        PixelFormat::Bgra | PixelFormat::Rgba => {
+            let plane = frame.planes.first()?;
+            resample_packed(plane, sw, sh, dw, dh, frame.format == PixelFormat::Bgra)?
+        }
+        _ => {
+            let (ws, hs, rgba) = to_rgba(frame)?;
+            let (dw, dh) = (dw.min(ws.max(2)), dh.min(hs.max(2)));
+            if (dw, dh) == (ws, hs) {
+                rgba.chunks_exact(4)
+                    .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+                    .collect()
+            } else {
+                resample(&rgba, ws, hs, dw, dh)
+                    .chunks_exact(4)
+                    .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+                    .collect()
+            }
+        }
     };
     Some((
         ColorImage {
@@ -177,6 +190,51 @@ pub fn image(frame: &VideoFrame, size: (usize, usize)) -> Option<(ColorImage, [u
         },
         [dw as u32, dh as u32],
     ))
+}
+
+/// Bilinear resample of a packed BGRA (or RGBA) plane, straight to egui
+/// colours: one pass, no intermediate RGBA frame.
+fn resample_packed(
+    plane: &crate::media_types::Plane,
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    bgra: bool,
+) -> Option<Vec<egui::Color32>> {
+    if sw == 0 || sh == 0 || plane.stride < sw * 4 {
+        return None;
+    }
+    let fx = sw as f64 / dw as f64;
+    let fy = sh as f64 / dh as f64;
+    let texel = |px: usize, py: usize| -> [f32; 4] {
+        let o = py * plane.stride + px * 4;
+        let p = &plane.data[o..o + 4];
+        [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32]
+    };
+    let mut out = Vec::with_capacity(dw * dh);
+    for y in 0..dh {
+        let sy = ((y as f64 + 0.5) * fy - 0.5).max(0.0);
+        let y0 = (sy.floor() as usize).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let wy = (sy - y0 as f64) as f32;
+        for x in 0..dw {
+            let sx = ((x as f64 + 0.5) * fx - 0.5).max(0.0);
+            let x0 = (sx.floor() as usize).min(sw - 1);
+            let x1 = (x0 + 1).min(sw - 1);
+            let wx = (sx - x0 as f64) as f32;
+            let (a, b, c, d) = (texel(x0, y0), texel(x1, y0), texel(x0, y1), texel(x1, y1));
+            let mut px = [0f32; 4];
+            for ch in 0..4 {
+                let top = a[ch] * (1.0 - wx) + b[ch] * wx;
+                let bottom = c[ch] * (1.0 - wx) + d[ch] * wx;
+                px[ch] = (top * (1.0 - wy) + bottom * wy).round().clamp(0.0, 255.0);
+            }
+            let (r, bch) = if bgra { (px[2], px[0]) } else { (px[0], px[2]) };
+            out.push(egui::Color32::from_rgb(r as u8, px[1] as u8, bch as u8));
+        }
+    }
+    Some(out)
 }
 
 /// Any supported frame as tight RGBA at its own size.
@@ -372,5 +430,27 @@ mod tests {
         let small = bgra_frame(640, 360, [0, 0, 0, 255]);
         let (_, size) = tap.image(&small).expect("image");
         assert_eq!(size, [640, 360]);
+    }
+
+    /// What a preview frame costs (run in release:
+    /// `cargo test --release app::preview::tests::preview_cost -- --ignored --nocapture`).
+    /// The compositor's texture (phase 2) removes this CPU copy entirely.
+    #[test]
+    #[ignore]
+    fn preview_cost() {
+        let (tap, _sink) = Tap::new(Arc::new(|| {}));
+        tap.set_target(704, 396);
+        for (w, h) in [(1920usize, 1080usize), (3840, 2160)] {
+            let f = bgra_frame(w, h, [10, 20, 30, 255]);
+            let n = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(tap.image(&f));
+            }
+            println!(
+                "{w}x{h} -> 704x396: {:.2} ms/frame",
+                t.elapsed().as_secs_f64() * 1000.0 / n as f64
+            );
+        }
     }
 }
