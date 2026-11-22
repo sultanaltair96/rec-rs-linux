@@ -43,10 +43,11 @@ case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
         echo "tracks audio-tracks sync audio-gaps pause-resume gain h264-bitrate"
-        echo "scale camera camera-lag crash finalize-crash defrag timeout-stop"
+        echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor"
+        echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "opt-in: long-finalize (10 min)"
-        echo "skipped: pattern-screen pattern-webcam device-mic stream-rtmp stream-whip"
-        echo "         replay gui"
+        echo "skipped: pattern-webcam device-mic scene-webcam"
+        echo "         stream-rtmp stream-whip replay gui"
         exit 0 ;;
 esac
 
@@ -147,7 +148,7 @@ if wanted pattern-prores; then
     if record pattern-prores --test-pattern -t 2 --codec prores --no-mic && decodes "$f"; then
         codec=$(ff codec_name "$f"); profile=$(ff profile "$f")
         prim=$(ff color_primaries "$f"); spc=$(ff color_space "$f")
-        if [ "$codec" = prores ] && [ "$profile" = standard ] && [ "$prim" = bt709 ] && [ "$spc" = bt709 ] \
+        if [ "$codec" = prores ] && [ "$profile" = Standard ] && [ "$prim" = bt709 ] && [ "$spc" = bt709 ] \
            && [ "$(tracks "$f")" = 2 ] && [ "$(frame_count "$f")" -ge 10 ]; then
             echo "PASS  pattern-prores  ($codec/$profile, bt709, $(frame_count "$f") frames)"
             pass=$((pass+1))
@@ -227,6 +228,7 @@ fi
 # --audio-tracks mix (one AAC track) and stems (no mix, every track enabled).
 if wanted audio-tracks; then
     ok=1
+    export REC_SYNTH_MIC=1
     if record audio-tracks-mix --test-pattern --mic default --audio-tracks mix -t 2 && decodes "$f"; then
         [ "$(tracks "$f")" = 2 ] || ok=0
         has "$(track_line "$f" 1)" "[mp4 #2 enabled alt-group 0" || ok=0
@@ -234,7 +236,6 @@ if wanted audio-tracks; then
         ok=0
     fi
     f=$OUT/audio-tracks-stems.mov
-    export REC_SYNTH_MIC=1
     if timeout "$TIMEOUT" "$REC" record -q --test-pattern --mic default --audio-tracks stems -t 2 -o "$f" >/dev/null 2>"$OUT/audio-tracks-stems.log" && decodes "$f"; then
         [ "$(tracks "$f")" = 3 ] || ok=0
         # No group: both stems are enabled alternatives of a normal movie.
@@ -334,13 +335,15 @@ fi
 # recording) is scaled with Lanczos, and every frame is on the grid.
 if wanted scale; then
     export REC_SYNTH_NATIVE=2560x1440
-    if record scale --test-pattern --no-mic -t 2 && decodes "$f"; then
+    # 30 fps: the Lanczos downscale plus x264 at 1440p->1080p does not keep up
+    # with 60 fps on a software-only host; at 30 every slot must be there.
+    if record scale --test-pattern --no-mic -t 2 -f 30 && decodes "$f"; then
         w=$(ff width "$f"); h=$(ff height "$f"); n=$(frame_count "$f")
-        if [ "$w" = 1920 ] && [ "$h" = 1080 ] && [ "$n" = 120 ]; then
+        if [ "$w" = 1920 ] && [ "$h" = 1080 ] && [ "$n" = 60 ]; then
             echo "PASS  scale  (2560x1440 source -> ${w}x${h} output, $n frames)"
             pass=$((pass+1))
         else
-            bad scale "${w}x${h}, $n frames (expected 1920x1080, 120)"
+            bad scale "${w}x${h}, $n frames (expected 1920x1080, 60)"
         fi
     fi
     unset REC_SYNTH_NATIVE
@@ -391,11 +394,14 @@ fi
 # Crash safety: SIGKILL mid-recording leaves a playable fragmented file.
 if wanted crash; then
     f="$OUT/crash.mov"
-    timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 10 -o "$f" >/dev/null 2>"$OUT/crash.log" &
+    # No `timeout` wrapper: the SIGKILL must reach the recorder itself, or it
+    # keeps writing while the probe reads the file.
+    "$REC" record -q --test-pattern --no-mic -t 10 -o "$f" >/dev/null 2>"$OUT/crash.log" &
     pid=$!
     sleep 4.5
     kill -9 "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    sleep 0.2
     if [ -s "$f" ] && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/crash.log" \
        && "$REC" probe "$f" >"$OUT/crash.probe" 2>&1 && grep -q '^fragmented: yes' "$OUT/crash.probe"; then
         frames=$(frame_count "$f" 2>/dev/null || echo 0)
@@ -512,13 +518,114 @@ fi
 
 # Cases that belong to later phases (they need a real device, the app or
 # streaming; the synthetic equivalents above cover the writer's side).
+
+# The GPU compositor: every shape against the mask geometry, borders, the drop
+# shadow, mirroring, placement, the camera scene, the Lanczos scaler against a
+# CPU reference, against ffmpeg's Lanczos (PSNR) and on a 1-px pattern
+# (aliasing), the BT.709 output, the pipelined readback and the golden images. It needs no display and no GPU: Mesa's software Vulkan device
+# (lavapipe) runs it, and the tests skip with a printed reason only when there
+# is no adapter at all.
+if wanted compositor; then
+    if command -v cargo >/dev/null 2>&1; then
+        if CARGO_BUILD_JOBS=3 timeout "$TIMEOUT" cargo test --release gpu:: -- --nocapture \
+               >"$OUT/compositor.log" 2>&1; then
+            adapter=$(sed -n 's/^compositor tests run on: //p' "$OUT/compositor.log" | head -1)
+            counts=$(sed -e 's/\x1b\[[0-9;]*m//g' "$OUT/compositor.log" \
+                     | grep -oE '[0-9]+ passed; [0-9]+ failed' | tail -1)
+            # The scaler against ffmpeg's Lanczos on the same RGB input: two
+            # independent Lanczos3 implementations must agree to 40 dB.
+            if CARGO_BUILD_JOBS=3 timeout "$TIMEOUT" cargo test --release gpu::tests::the_scaler_matches \
+                   -- --ignored --nocapture >"$OUT/compositor-ffmpeg.log" 2>&1 \
+               && grep -q 'PSNR' "$OUT/compositor-ffmpeg.log"; then
+                psnr=$(grep -o 'PSNR [0-9.]*' "$OUT/compositor-ffmpeg.log" | tr '\n' ' ')
+                echo "PASS  compositor  (${counts:-?} on ${adapter:-no adapter}; $psnr)"
+                pass=$((pass+1))
+            else
+                echo "FAIL  compositor  (ffmpeg comparison; see $OUT/compositor-ffmpeg.log)"
+                fail=$((fail+1))
+            fi
+        else
+            echo "FAIL  compositor  (see $OUT/compositor.log)"; fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  compositor  (no cargo in this environment)"; skip=$((skip+1))
+    fi
+fi
+
+# --- screen capture (phase 1A) ----------------------------------------------
+# Both real pipelines, headless: a sway desktop with xdg-desktop-portal-wlr (the
+# Wayland path: portal -> PipeWire) and Xvfb (the direct X11 path). Each harness
+# paints something that moves, so a still or black capture fails.
+#
+# The cases need the dev image's sway/Xvfb/dbus; on a plain host they skip with
+# the reason instead of failing.
+if command -v dbus-run-session >/dev/null 2>&1 && command -v sway >/dev/null 2>&1 &&
+   command -v Xvfb >/dev/null 2>&1 && [ -x scripts/screen/headless.sh ]; then
+    screen_harness=yes
+else
+    screen_harness=""
+fi
+# `$REC` may be relative; the harness scripts run from another process.
+REC_ABS=$(cd "$(dirname "$REC")" && pwd)/$(basename "$REC")
+
+# Total and distinct video frames of a recording (ffmpeg's per-frame md5).
+frames_total() { ffmpeg -v error -i "$1" -f framemd5 - 2>/dev/null | grep -vc '^#' || true; }
+frames_distinct() { ffmpeg -v error -i "$1" -f framemd5 - 2>/dev/null | grep -v '^#' | cut -d, -f6 | sort -u | wc -l; }
+
+# screen_case NAME FILE WIDTH HEIGHT MIN_DISTINCT: the recording must have the
+# native size, a constant 60 fps and at least MIN_DISTINCT different frames.
+screen_case() {
+    name=$1; f=$2; w=$3; h=$4; move=$5
+    got=$(ffprobe -v error -select_streams v -show_entries stream=width,height -of csv=p=0 "$f" 2>/dev/null | head -1)
+    rate=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$f" 2>/dev/null | head -1)
+    total=$(frames_total "$f")
+    distinct=$(frames_distinct "$f")
+    if [ "$got" = "$w,$h" ] && [ "$rate" = "60/1" ] && [ "$total" -ge 60 ] && [ "$distinct" -ge "$move" ]; then
+        echo "PASS  $name  (${got} @ $rate, $total frames, $distinct distinct)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  $name  (size '$got' want $w,$h, rate '$rate', $total frames, $distinct distinct; see $OUT/$name.mp4.log)"
+        fail=$((fail+1))
+    fi
+}
+
+# screen_test NAME HARNESS CASE WIDTH HEIGHT MIN_DISTINCT
+screen_test() {
+    name=$1; harness=$2; case=$3; w=$4; h=$5; move=$6
+    wanted "$name" || return 0
+    if [ -z "$screen_harness" ]; then
+        echo "SKIP  $name  (needs sway, Xvfb and dbus-run-session: run under scripts/dev.sh)"
+        skip=$((skip+1))
+        return 0
+    fi
+    if REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" "scripts/screen/$harness" \
+           scripts/screen/cases.sh "$case" >/dev/null 2>"$OUT/$name.harness.log"; then
+        screen_case "$name" "$OUT/$name.mp4" "$w" "$h" "$move"
+    else
+        echo "FAIL  $name  (see $OUT/$name.mp4.log and $OUT/$name.harness.log)"
+        fail=$((fail+1))
+    fi
+}
+
+# Wayland: portal + PipeWire, 1280x720 headless sway, restore token stored.
+screen_test pattern-screen headless.sh portal 1280 720 100
+# Wayland: --region crops the shared monitor (640x480 native pixels).
+screen_test screen-region headless.sh region 640 480 40
+# Wayland: `permissions --request` stores a grant; a corrupt token is recovered.
+screen_test screen-token headless.sh token 1280 720 0
+# X11: RandR enumeration and a root capture without a portal.
+screen_test screen-x11 xvfb.sh x11 1280 800 30
+# X11: --window <app> captures one client's own surface.
+screen_test screen-window xvfb.sh window 400 300 30
+
+# Cases that belong to later phases (they need capture, the app or streaming).
 later() {
     wanted "$1" || return 0
     echo "SKIP  $1  ($2)"; skip=$((skip+1))
 }
-later pattern-screen  "phase 1A: real screen capture through the portal + PipeWire"
 later pattern-webcam  "needs a real desktop: a V4L2 camera (the synthetic one is covered by 'camera')"
 later device-mic      "needs a real desktop: a PipeWire microphone (the synthetic one is covered by 'tracks')"
+later scene-webcam    "needs a real desktop: a V4L2 camera over the screen (the synthetic one is covered by 'camera')"
 later replay          "phase 1D: replay buffer"
 later stream-rtmp     "phase 1D: RTMP"
 later stream-whip     "phase 1D: WHIP"

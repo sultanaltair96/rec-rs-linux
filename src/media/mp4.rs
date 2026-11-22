@@ -230,6 +230,15 @@ fn slice<'a>(buf: &'a [u8], b: &BoxRef) -> &'a [u8] {
 
 /// Scan top-level boxes without reading their payloads.
 fn scan(path: &Path) -> Result<(File, Vec<BoxRef>, u64)> {
+    scan_with(path, false)
+}
+
+/// `scan`, optionally tolerating a truncated last box.
+///
+/// A SIGKILL can land in the middle of writing an `mdat`, so a crashed
+/// recording's last box is short. `probe` must still report the file (it plays
+/// up to the last complete fragment); the finalise refuses such a file.
+fn scan_with(path: &Path, tolerant: bool) -> Result<(File, Vec<BoxRef>, u64)> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let len = file.metadata()?.len();
     let mut boxes = vec![];
@@ -249,6 +258,9 @@ fn scan(path: &Path) -> Result<(File, Vec<BoxRef>, u64)> {
             s => (s, 8),
         };
         if size < header || at + size > len {
+            if tolerant && at + header <= len {
+                break; // a truncated tail from a crash
+            }
             bail!(
                 "{}: bad box {} at {at} (size {size}, file {len})",
                 path.display(),
@@ -463,7 +475,7 @@ fn parse_moov(moov: &[u8]) -> Result<Init> {
 
 /// Read a recording's movie structure: `probe` prints it.
 pub fn read(path: &Path) -> Result<MovieInfo> {
-    let (mut file, boxes, _len) = scan(path)?;
+    let (mut file, boxes, _len) = scan_with(path, true)?;
     // After a finalise a file has two moovs for a moment; the last is the
     // regular one. Before it, the only moov is the fragmented init.
     let moov = boxes

@@ -269,6 +269,13 @@ pub struct Writer {
     last_preview: f64,
     /// GPU compositor, when phase 1C's renderer is available.
     renderer: Option<Renderer>,
+    /// The last composited frame, reused if a pipelined renderer has none ready
+    /// yet (the frame grid must not lose a slot).
+    composed_last: Option<Arc<VideoFrame>>,
+    /// Moving average of the compositor's cost per frame, and how many frames
+    /// in a row exceeded the frame budget on a software device.
+    compose_ema: f64,
+    slow_frames: u32,
     /// The session has a camera, even before its first frame arrives.
     cam_expected: bool,
     /// Size of the newest camera frame, for `cam_aspect` before the first
@@ -350,6 +357,9 @@ impl Writer {
             preview: None,
             last_preview: 0.0,
             renderer: None,
+            composed_last: None,
+            compose_ema: 0.0,
+            slow_frames: 0,
             cam_expected: false,
             cam_size: None,
             scene,
@@ -993,14 +1003,23 @@ impl Writer {
         let screen = self.screen_last.clone();
         let cam = self.cam_last.clone();
         if self.renderer.is_some() {
-            let pts = slot_t;
+            let started = std::time::Instant::now();
             let rendered = self
                 .renderer
                 .as_mut()
                 .unwrap()
-                .render(screen.as_deref(), cam.as_deref(), pts);
+                .render(screen.as_deref(), cam.as_deref(), slot_t);
+            let took = started.elapsed().as_secs_f64();
             match rendered {
-                Ok(frame) => return Some(Arc::new(frame)),
+                Ok(Some(frame)) => {
+                    self.note_compose_cost(took);
+                    let frame = Arc::new(frame);
+                    self.composed_last = Some(frame.clone());
+                    return Some(frame);
+                }
+                // Only with a pipelined readback (the writer uses depth 1):
+                // the previous composited frame keeps the grid exact.
+                Ok(None) => return self.composed_last.clone(),
                 Err(e) => {
                     // A compositor failure must not stop the recording: fall
                     // back to the CPU path and say so once.
@@ -1019,13 +1038,47 @@ impl Writer {
                 if !self.warned_overlay && cam.is_some() {
                     self.warned_overlay = true;
                     eprintln!(
-                        "rec: warning: the camera overlay needs the GPU compositor (phase {}); \
-                         recording the screen alone",
-                        crate::gpu::PHASE
+                        "rec: warning: the camera overlay needs the GPU compositor, which is \
+                         unavailable on this host; recording the screen alone"
                     );
                 }
                 screen.or(cam)
             }
+        }
+    }
+
+    /// Track the compositor's cost. On a software device (lavapipe) a 4K/5K
+    /// screen can take 45-50 ms a frame, far past the frame budget; the writer
+    /// then falls back to the CPU path (videoscale + no overlay) instead of
+    /// dropping every other slot. A real GPU never trips this.
+    fn note_compose_cost(&mut self, took: f64) {
+        self.compose_ema = if self.compose_ema == 0.0 {
+            took
+        } else {
+            self.compose_ema * 0.9 + took * 0.1
+        };
+        let budget = 0.8 / self.spec.fps as f64;
+        let software = self.renderer.as_ref().is_some_and(|r| r.is_software());
+        if software && self.compose_ema > budget {
+            self.slow_frames += 1;
+            if self.slow_frames == 30 {
+                let adapter = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.describe_adapter())
+                    .unwrap_or_default();
+                eprintln!(
+                    "rec: warning: the software compositor ({adapter}) needs {:.1} ms per frame, \
+                     over the {:.1} ms budget at {} fps; using the CPU scaler without the overlay \
+                     so frames are not dropped",
+                    self.compose_ema * 1000.0,
+                    budget * 1000.0,
+                    self.spec.fps
+                );
+                self.renderer = None;
+            }
+        } else {
+            self.slow_frames = 0;
         }
     }
 
@@ -1121,6 +1174,11 @@ impl Writer {
             bail!("no video frames were captured, nothing written");
         }
         self.emit_until(end);
+        // Frames still in flight on the compositor's GPU pipeline (depth 1
+        // keeps none, but the API must be drained).
+        if let Some(r) = self.renderer.as_mut() {
+            let _ = r.flush();
+        }
         // The last pieces of audio, then the end of the streams.
         self.drain_mix(true);
         self.drain_live(true);

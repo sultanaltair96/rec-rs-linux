@@ -21,6 +21,18 @@ serde_json = "1"
 libc = "0.2"
 gstreamer = "0.24"
 gstreamer-app = "0.24"
+ashpd = "0.12"
+pipewire = "0.10"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+x11rb = { version = "0.14", default-features = false, features = ["randr", "xfixes", "xtest"] }
+# The GPU compositor and scaler (phase 1C). The same wgpu version egui-wgpu
+# 0.36 uses, so the app shares one device with the compositor (phase 1E).
+wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
+pollster = "1"
+
+[dev-dependencies]
+# Golden image fixtures for the compositor (tests/golden).
+png = "0.18"
 
 [profile.release]
 debug = 1

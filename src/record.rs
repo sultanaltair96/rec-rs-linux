@@ -281,8 +281,28 @@ impl Session {
         // Phase 1C's compositor draws the scenes; until it lands the writer
         // falls back to the CPU path (and says what it cannot draw).
         if o.webcam.is_some() {
-            match gpu::Renderer::new(w, h, o.pip.clone()) {
-                Ok(r) => writer.set_renderer(Some(r)),
+            // The recording needs one composited frame per grid slot, so the
+            // writer builds the renderer with a synchronous readback
+            // (`pipeline_depth: 1`); the app's preview uses its own texture.
+            let opts = gpu::Options {
+                width: w,
+                height: h,
+                scene: o.scene,
+                pip: o.pip.clone(),
+                output: gpu::OutputFormat::Nv12,
+                // A window capture's rounded transparent corners are filled
+                // with the window's edge colour before encoding.
+                corner_fill: o.test_pattern.is_none()
+                    && o.screen.as_ref().is_some_and(|s| s.window.is_some()),
+                pipeline_depth: 1,
+            };
+            match gpu::Renderer::with_options(&opts) {
+                Ok(r) => {
+                    if !o.quiet {
+                        eprintln!("rec: compositor {}", r.describe_adapter());
+                    }
+                    writer.set_renderer(Some(r));
+                }
                 Err(e) => {
                     if std::env::var_os("REC_DEBUG").is_some() {
                         eprintln!("rec: debug: no GPU compositor: {e}");
@@ -424,7 +444,13 @@ impl Session {
             }
             None => {
                 let req = o.screen.clone().unwrap_or_default();
-                let src = screen::open(&req)?;
+                let src = screen::open_with(
+                    &req,
+                    &screen::CaptureOptions {
+                        cursor: o.cursor,
+                        clicks: o.clicks,
+                    },
+                )?;
                 self.description = src.describe();
                 self.video = Some(src);
                 if o.system_audio {
