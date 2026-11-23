@@ -35,7 +35,7 @@ if "$APPIMAGE" --version; then ok "AppImage starts"; else bad "AppImage starts";
 
 echo "== record: h264, test pattern"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 3 -o /tmp/x.mp4 >/tmp/h264.log 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/h264.log | head -1
+    grep -o 'encoder [a-z0-9_]*: chosen' /tmp/h264.log | head -1
     ok "record h264"
 else
     cat /tmp/h264.log
@@ -54,7 +54,7 @@ fi
 echo "== record: hevc"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 2 --codec hevc \
         -o /tmp/hevc.mp4 >/tmp/hevc.log 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/hevc.log | head -1
+    grep -o 'encoder [a-z0-9_]*: chosen' /tmp/hevc.log | head -1
     ok "record hevc"
     if "$APPIMAGE" probe /tmp/hevc.mp4 >/tmp/hevc.probe 2>&1; then ok "probe hevc"; else cat /tmp/hevc.probe; bad "probe hevc"; fi
 else
@@ -65,8 +65,8 @@ fi
 echo "== record: prores"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 2 --codec prores \
         -o /tmp/prores.mov >/tmp/prores.log 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/prores.log | head -1
-    ok "record prores ($(grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/prores.log | head -1 | sed 's/.*encoder //'))"
+    grep -o 'encoder [a-z0-9_]*: chosen' /tmp/prores.log | head -1
+    ok "record prores ($(grep -o 'encoder [a-z0-9_]*: chosen' /tmp/prores.log | head -1 | sed 's/: chosen//'))"
 else
     cat /tmp/prores.log
     bad "record prores"
@@ -143,6 +143,14 @@ if [ -e /dev/dri/renderD128 ]; then
     else
         tail -12 /tmp/va-plugin.log
         bad "vah264enc registers through AppRun on this GPU"
+    fi
+    if REC_DEBUG=1 "$APPIMAGE" record --test-pattern -r 1080p -t 3 --no-mic --codec h264 \
+            -o /tmp/va.mp4 >/tmp/va-encode.log 2>&1 &&
+       grep -q 'encoder vah264enc: chosen' /tmp/va-encode.log; then
+        ok "the writer picks vah264enc on this GPU ($(grep -o 'encoder vah264enc: chosen ([A-Z0-9_]*)' /tmp/va-encode.log | head -1))"
+    else
+        tr '\r' '\n' </tmp/va-encode.log | tail -10
+        bad "the writer picks vah264enc on this GPU"
     fi
 else
     # No GPU here: the plugin still has to load, which proves libva resolved
