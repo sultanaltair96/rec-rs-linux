@@ -1,0 +1,145 @@
+name: release
+
+# Tag-triggered release. Pushing a tag like v0.1.0 builds the Flatpak bundle
+# and the AppImage (+ its zsync file) and attaches them to a GitHub Release.
+# Nothing else triggers this workflow, so a branch push or a pull request can
+# never publish a release.
+#
+# The builds call exactly the same scripts developers run locally
+# (packaging/flatpak/build-flatpak.sh, packaging/appimage/build-appimage.sh),
+# in the same containers, so a release cannot drift from a tested local build:
+#
+#   packaging/flatpak/build-flatpak.sh      # Flathub builder image, rec.flatpak
+#   packaging/appimage/build-appimage.sh    # ubuntu:22.04, AppImage + zsync
+#
+# The updater in the AppImage and on the app's site expects the asset names
+# below; `Rec-*x86_64.AppImage.zsync` is the pattern embedded in the AppImage's
+# update information (gh-releases-zsync|sultanaltair96|rec-rs-linux|latest|...).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Create the Release and upload its assets. Nothing else needs write access.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flatpak:
+    name: Flatpak bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the tag and the upstream reference
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - name: Build rec.flatpak
+        env:
+          REC_PKG_OUT: ${{ runner.temp }}/out
+          PKG_JOBS: 4
+        run: packaging/flatpak/build-flatpak.sh
+
+      - name: Test the bundle (install, record, probe)
+        env:
+          REC_PKG_OUT: ${{ runner.temp }}/out
+        run: packaging/flatpak/test-flatpak.sh
+
+      - name: Keep the Flatpak bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak
+          path: ${{ runner.temp }}/out/rec.flatpak
+          if-no-files-found: error
+
+      - name: Keep the Flatpak test evidence when something failed
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak-test-logs
+          path: ${{ runner.temp }}/out/test/**
+          if-no-files-found: ignore
+
+  appimage:
+    name: AppImage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the tag and the upstream reference
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+
+      - name: Build the AppImage and its zsync
+        env:
+          REC_PKG_OUT: ${{ runner.temp }}/out
+          PKG_JOBS: 4
+        run: packaging/appimage/build-appimage.sh
+
+      - name: Test the AppImage on Fedora and Debian without GStreamer
+        env:
+          REC_PKG_OUT: ${{ runner.temp }}/out
+        run: packaging/appimage/test-appimage.sh
+
+      - name: Keep the AppImage and zsync
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appimage
+          path: |
+            ${{ runner.temp }}/out/Rec-*-x86_64.AppImage
+            ${{ runner.temp }}/out/Rec-*-x86_64.AppImage.zsync
+          if-no-files-found: error
+
+      - name: Keep the AppImage test evidence when something failed
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appimage-test-logs
+          path: ${{ runner.temp }}/out/test-appimage/**
+          if-no-files-found: ignore
+
+  release:
+    name: GitHub Release
+    needs: [flatpak, appimage]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout: Cargo.toml
+
+      - name: The tag is the version the binary reports
+        run: |
+          want=${GITHUB_REF_NAME#v}
+          got=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "tag=$want cargo=$got"
+          test "$want" = "$got"
+
+      - name: Collect the assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List the assets
+        run: ls -l dist
+
+      - name: Create the release and attach both packages
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: Rec ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/rec.flatpak
+            dist/Rec-*-x86_64.AppImage
+            dist/Rec-*-x86_64.AppImage.zsync
