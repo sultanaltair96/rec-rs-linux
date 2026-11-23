@@ -116,6 +116,23 @@ else
     fi
 fi
 
+echo "== settings live in the sandbox's XDG config dir"
+if flatpak run --command=sh "$APP" -c '
+        set -e
+        case "$XDG_CONFIG_HOME" in
+            "$HOME"/.var/app/io.github.sultanaltair96.Rec/*) ;;
+            *) echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME is not the app dir"; exit 1 ;;
+        esac
+        mkdir -p "$XDG_CONFIG_HOME/rec-rs"
+        printf "{\"output_dir\":\"%s\"}\n" "$HOME/Videos" > "$XDG_CONFIG_HOME/rec-rs/settings.json"
+        cat "$XDG_CONFIG_HOME/rec-rs/settings.json"'; then
+    ok "settings path is writable and private to the app"
+    ls -l "$HOME/.var/app/io.github.sultanaltair96.Rec/config/rec-rs/settings.json" \
+        >"$OUT/settings.ls" 2>&1 && ok "settings file is in ~/.var/app (on the host)"
+else
+    bad "settings path"
+fi
+
 echo "== desktop integration inside the sandbox"
 if flatpak run --command=sh "$APP" -c \
         'ls /app/share/applications/io.github.sultanaltair96.Rec.desktop
