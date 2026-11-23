@@ -52,6 +52,34 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// How many `Prepared`s have been dropped inside the runtime, and whether the
+/// drop saw a reactor (tests: see `portal_objects_are_dropped_inside_the_runtime`).
+#[cfg(test)]
+static DROPS_ON_RUNTIME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static DROP_SAW_REACTOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run `fut` on the portal runtime from wherever the caller is.
+///
+/// Only the destructors of ashpd/zbus objects need this (see [`Prepared`]):
+/// they reach for the Tokio reactor when the proxy is dropped, and a panic in a
+/// destructor while unwinding aborts the process. If the caller is already
+/// inside a runtime — the runtime's own worker, or a future that drops a
+/// `Prepared` — `block_on` would panic ("Cannot start a runtime from within a
+/// runtime"), so the work is spawned there instead.
+fn runtime_scope<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let rt = runtime();
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            rt.spawn(fut);
+        }
+        Err(_) => rt.block_on(fut),
+    }
+}
+
 /// What the portal exposes, for `rec-rs permissions`.
 #[derive(Clone, Debug)]
 pub struct Availability {
@@ -62,38 +90,43 @@ pub struct Availability {
 }
 
 /// Ask the portal daemon what it can do, without showing a dialog.
+///
+/// The whole conversation (and the proxy's drop) happens inside one runtime
+/// block: a zbus proxy dropped on a plain thread panics in its destructor with
+/// "there is no reactor running".
 pub fn available() -> Result<Availability> {
-    let screencast = runtime()
-        .block_on(async { Screencast::new().await })
-        .map_err(portal_error)?;
-    // `Screencast` derefs to the zbus proxy, whose cached `version` property is
-    // the portal interface version (`AvailableCursorModes` needs >= 2).
-    let version = runtime()
-        .block_on(async { screencast.get_property::<u32>("version").await })
-        .unwrap_or(0);
-    let sources = runtime()
-        .block_on(async { screencast.available_source_types().await })
-        .map_err(portal_error)?;
-    // `AvailableCursorModes` needs portal v2; a v1 portal can still cast, it
-    // just cannot tell us which modes it has, so assume the two v1 ones.
-    let modes = runtime()
-        .block_on(async { screencast.available_cursor_modes().await })
-        .unwrap_or(CursorMode::Hidden | CursorMode::Embedded);
-    let mut cursor_modes = vec![];
-    for (mode, name) in [
-        (CursorMode::Hidden, "hidden"),
-        (CursorMode::Embedded, "embedded"),
-        (CursorMode::Metadata, "metadata"),
-    ] {
-        if modes.contains(mode) {
-            cursor_modes.push(name);
+    runtime().block_on(async {
+        let screencast = Screencast::new().await.map_err(portal_error)?;
+        // `Screencast` derefs to the zbus proxy, whose cached `version` property
+        // is the portal interface version (`AvailableCursorModes` needs >= 2).
+        let version = screencast.get_property::<u32>("version").await.unwrap_or(0);
+        let sources = screencast
+            .available_source_types()
+            .await
+            .map_err(portal_error)?;
+        // `AvailableCursorModes` needs portal v2; a v1 portal can still cast, it
+        // just cannot tell us which modes it has, so assume the two v1 ones.
+        let modes = screencast
+            .available_cursor_modes()
+            .await
+            .unwrap_or(CursorMode::Hidden | CursorMode::Embedded);
+        let mut cursor_modes = vec![];
+        for (mode, name) in [
+            (CursorMode::Hidden, "hidden"),
+            (CursorMode::Embedded, "embedded"),
+            (CursorMode::Metadata, "metadata"),
+        ] {
+            if modes.contains(mode) {
+                cursor_modes.push(name);
+            }
         }
-    }
-    Ok(Availability {
-        version,
-        monitors: sources.contains(SourceType::Monitor),
-        windows: sources.contains(SourceType::Window),
-        cursor_modes,
+        Ok(Availability {
+            version,
+            monitors: sources.contains(SourceType::Monitor),
+            windows: sources.contains(SourceType::Window),
+            cursor_modes,
+        })
+        // `screencast` drops here, inside the runtime.
     })
 }
 
@@ -103,8 +136,10 @@ pub fn available() -> Result<Availability> {
 /// same session afterwards, so this type is what travel between them.
 pub struct Prepared {
     /// Kept alive for the session's lifetime: dropping the proxy ends it.
-    _screencast: Screencast<'static>,
-    session: Session<'static, Screencast<'static>>,
+    ///
+    /// Its owner returns both objects to the runtime for cleanup, including
+    /// when preparation unwinds before this struct is constructed.
+    _portal: PortalOwner,
     pub node_id: u32,
     pub fd: OwnedFd,
     /// The pixel size of the stream (probed over PipeWire).
@@ -133,7 +168,46 @@ impl Prepared {
 
     /// Close the portal session, which also stops the compositor capturing.
     pub fn close(self) {
-        let _ = runtime().block_on(async { self.session.close().await });
+        // Dropping is closing: see `Drop`.
+        drop(self);
+    }
+}
+
+/// Owns the portal objects as soon as they leave the handshake, including
+/// during probing and unwinding before `Prepared` has been constructed.
+struct PortalOwner {
+    screencast: Option<Screencast<'static>>,
+    session: Option<Session<'static, Screencast<'static>>>,
+}
+
+impl Drop for PortalOwner {
+    fn drop(&mut self) {
+        let session = self.session.take();
+        let screencast = self.screencast.take();
+        if session.is_none() && screencast.is_none() {
+            return;
+        }
+        // The portal conversation ends here, on the runtime: close the session
+        // (which stops the compositor capturing) and then drop both objects
+        // where their destructors can reach the Tokio reactor.
+        runtime_scope(async move {
+            #[cfg(test)]
+            {
+                // Inside this future we are on the portal runtime by
+                // construction; recording it lets the test prove the drop did
+                // not happen on the caller's bare thread.
+                DROP_SAW_REACTOR.store(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                DROPS_ON_RUNTIME.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(session) = session {
+                let _ = session.close().await;
+                drop(session);
+            }
+            drop(screencast);
+        });
     }
 }
 
@@ -285,23 +359,36 @@ fn prepare_session(
             })?
             .map_err(portal_error)?;
         let streams = request.response().map_err(portal_error)?;
-        Ok::<_, anyhow::Error>((screencast, session, streams, cursor_note))
+        let Some(stream) = streams.streams().first().cloned() else {
+            // Drop the session here, on the runtime, before the error escapes.
+            let _ = session.close().await;
+            return Err(anyhow!(
+                "the portal started a screen-cast session without a stream"
+            ));
+        };
+        // The PipeWire remote belongs to the same conversation: opening it in a
+        // second `block_on` used to leave the session and its proxy alive
+        // across the boundary, to be dropped on a plain thread.
+        let fd = screencast
+            .open_pipe_wire_remote(&session)
+            .await
+            .map_err(portal_error)
+            .context("opening the portal's PipeWire remote")?;
+        let owner = PortalOwner {
+            screencast: Some(screencast),
+            session: Some(session),
+        };
+        Ok::<_, anyhow::Error>((owner, streams, stream, fd, cursor_note))
     });
-    let (screencast, session, streams, cursor_note) = result?;
+    // The owner guards the session and proxy immediately upon leaving the
+    // runtime, including if probing or constructing Prepared unwinds.
+    let (owner, streams, stream, fd, cursor_note) = result?;
     if let Some(t) = streams.restore_token()
         && let Err(e) = token::store(t)
     {
         eprintln!("rec: warning: could not save the screen-capture grant: {e}");
     }
-    let Some(stream) = streams.streams().first().cloned() else {
-        let _ = runtime().block_on(async { session.close().await });
-        bail!("the portal started a screen-cast session without a stream");
-    };
     let node_id = stream.pipe_wire_node_id();
-    let fd = runtime()
-        .block_on(async { screencast.open_pipe_wire_remote(&session).await })
-        .map_err(portal_error)
-        .context("opening the portal's PipeWire remote")?;
     let reported = stream
         .size()
         .map(|(w, h)| (w.max(2) as usize, h.max(2) as usize))
@@ -346,8 +433,7 @@ fn prepare_session(
         ),
     };
     Ok(Prepared {
-        _screencast: screencast,
-        session,
+        _portal: owner,
         node_id,
         fd,
         pixels,
@@ -565,12 +651,16 @@ mod tests {
         );
     }
 
+    // The portal tests share the forced-probe hook and drop observations.
+    static PORTAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A portal session whose stream never negotiated a format is replaced,
     /// not used: no consumer of such a node ever gets a format, so the session
     /// (not the stream) is what has to go. The `FORCE_UNPROBED` hook makes the
     /// first session look like that without needing a stalled compositor.
     #[test]
     fn a_session_without_a_format_is_replaced() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
             return; // needs the headless harness (scripts/screen/headless.sh)
         }
@@ -590,15 +680,66 @@ mod tests {
         assert_eq!(FORCE_UNPROBED.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// Every ashpd/zbus object must be created, used **and dropped** on the
+    /// portal runtime. A zbus proxy dropped on a plain thread panics in its
+    /// destructor with "there is no reactor running", and a panic in a
+    /// destructor while unwinding aborts the process — a real desktop crash
+    /// (exit 134) in the camera portal, and latent here until `available()` and
+    /// `Prepared` were fixed.
+    ///
+    /// Both calls run on the bare test thread and drop whatever they created:
+    /// `available()` its `Screencast`, and the `Prepared` below is dropped on a
+    /// second thread that never had a runtime at all.
+    #[test]
+    fn portal_objects_are_dropped_inside_the_runtime() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // needs the headless harness (scripts/screen/headless.sh)
+        }
+        let availability = available().expect("the portal reports its capabilities");
+        assert!(availability.version > 0, "{availability:?}");
+        let prepared = prepare(
+            Want::Monitor,
+            CaptureOptions::default(),
+            Duration::from_secs(20),
+        )
+        .expect("a portal session");
+        let before = DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst);
+        DROP_SAW_REACTOR.store(false, std::sync::atomic::Ordering::SeqCst);
+        let dropped = std::thread::spawn(move || drop(prepared));
+        if let Err(e) = dropped.join() {
+            let message = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "no message".to_string());
+            panic!("dropping a Prepared off the runtime panicked: {message}");
+        }
+        // The destructor's work ran, and it ran inside the runtime: without
+        // that, the proxy's drop spawns a match-rule removal on an executor
+        // that is not there.
+        assert_eq!(
+            DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "the session was not dropped on the runtime"
+        );
+        assert!(
+            DROP_SAW_REACTOR.load(std::sync::atomic::Ordering::SeqCst),
+            "the drop saw no Tokio reactor"
+        );
+    }
+
     /// Two sessions without a format are a refusal, not a silent recording.
     /// Before this check the second session was used anyway and the recording
     /// failed three seconds later with "no video frames were captured".
     #[test]
     fn two_sessions_without_a_format_are_refused() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
             return; // needs the headless harness (scripts/screen/headless.sh)
         }
         FORCE_UNPROBED.store(2, std::sync::atomic::Ordering::SeqCst);
+        let before = DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst);
         let err = match prepare(
             Want::Monitor,
             CaptureOptions::default(),
@@ -609,6 +750,33 @@ mod tests {
         };
         assert!(err.contains("two sessions"), "{err}");
         assert!(err.contains("no video"), "{err}");
+        // Both sessions were closed and dropped on the runtime, not left to the
+        // caller's thread (the recovery path returns nothing, so its objects
+        // must be cleaned up inside the block).
+        assert!(
+            DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst) >= before + 2,
+            "the refused sessions were not dropped on the runtime"
+        );
+        assert!(DROP_SAW_REACTOR.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A dialog that never answers is an error path inside the same runtime
+    /// block: the session and the proxy must be dropped there, and the call
+    /// must not panic or hang.
+    #[test]
+    fn a_timed_out_picker_is_an_error_without_a_crash() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // needs the headless harness (scripts/screen/headless.sh)
+        }
+        let err = match prepare(Want::Monitor, CaptureOptions::default(), Duration::ZERO) {
+            Ok(prepared) => {
+                prepared.close();
+                panic!("a zero timeout must not produce a session");
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("did not answer"), "{err}");
     }
 
     #[test]
