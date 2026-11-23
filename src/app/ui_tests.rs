@@ -22,6 +22,15 @@ fn gpu() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The real-pipeline tests need GStreamer, which `main` initialises for the
+/// app; a test binary has to do it itself (once, it is idempotent).
+fn gst_init() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = gstreamer::init();
+    });
+}
+
 /// The one device every UI harness renders on.
 fn wgpu_setup() -> egui_wgpu::WgpuSetup {
     use std::sync::OnceLock;
@@ -687,6 +696,7 @@ fn the_composited_preview_moves_the_overlay_after_set_pip() {
     }
 
     let _gpu_guard = gpu();
+    gst_init();
     unsafe {
         std::env::set_var("REC_SYNTH_CAM", "1");
         std::env::set_var("REC_SYNTH_CAM_SIZE", "320x180");
@@ -813,4 +823,168 @@ fn the_composited_preview_moves_the_overlay_after_set_pip() {
 
     let _ = sess.finish();
     clear_env();
+}
+
+/// G1: the app's camera hand-over. A preview opens the camera once; the
+/// recording takes that running camera (no second open, no 2 s dark settle)
+/// and hands it back to the preview afterwards. A cold start is measured too,
+/// so the difference is visible.
+#[test]
+fn the_camera_is_handed_over_without_reopening_it() {
+    use std::time::{Duration, Instant};
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("REC_SYNTH_CAM");
+            std::env::remove_var("REC_SYNTH_CAM_SIZE");
+            std::env::remove_var("REC_SYNTH_CAM_FPS");
+        }
+    }
+    /// The first frame this tap delivers, and how long it took.
+    fn first_frame(
+        tap: &mut super::preview::Tap,
+        limit: Duration,
+    ) -> Option<(Duration, crate::media_types::VideoFrame)> {
+        let t0 = Instant::now();
+        while t0.elapsed() < limit {
+            if let Some(f) = tap.take() {
+                return Some((t0.elapsed(), f));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    let _gpu_guard = gpu();
+    gst_init();
+    unsafe {
+        std::env::set_var("REC_SYNTH_CAM", "1");
+        std::env::set_var("REC_SYNTH_CAM_SIZE", "320x180");
+        std::env::set_var("REC_SYNTH_CAM_FPS", "30");
+    }
+    let dir = std::env::temp_dir().join(format!("rec-g1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let camera_settings = Settings {
+        scene: crate::compose::Scene::ScreenCam,
+        resolution: "720p".into(),
+        fps: 30,
+        mic_enabled: false,
+        system_audio: false,
+        output_dir: dir.clone(),
+        ..Default::default()
+    };
+    let preview_opts = || {
+        super::session::options(&camera_settings, None, None, None, true).expect("preview options")
+    };
+    let recording_opts = |name: &str| {
+        super::session::options(&camera_settings, Some(&dir.join(name)), None, None, true)
+            .expect("recording options")
+    };
+
+    let opens_before = crate::record::camera_opens();
+
+    // 1. Preview: opens the camera (once) and starts showing it.
+    let (mut ptap, psink) = super::preview::Tap::new(std::sync::Arc::new(|| {}));
+    ptap.set_wanted(true);
+    ptap.set_target(1280, 720);
+    let mut po = preview_opts();
+    po.preview = Some(psink);
+    let mut prev = match super::Session::start_with_camera(&po, None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SKIP: cannot start a preview session here: {e:#}");
+            clear_env();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    assert!(
+        first_frame(&mut ptap, Duration::from_secs(10)).is_some(),
+        "the preview shows the camera"
+    );
+    assert_eq!(
+        crate::record::camera_opens(),
+        opens_before + 1,
+        "the preview opened the camera once"
+    );
+
+    // 2. Hand it to the recording: no second open, no 2 s dark settle.
+    let cam = prev.take_camera().expect("the preview's camera");
+    let _ = prev.finish();
+    let (mut rtap, rsink) = super::preview::Tap::new(std::sync::Arc::new(|| {}));
+    rtap.set_wanted(true);
+    rtap.set_target(1280, 720);
+    let mut ro = recording_opts("g1-warm.mov");
+    ro.preview = Some(rsink);
+    let t0 = Instant::now();
+    let mut rec = super::Session::start_with_camera(&ro, Some(cam)).expect("warm recording");
+    let warm = first_frame(&mut rtap, Duration::from_secs(10))
+        .expect("the recording's first frame")
+        .0;
+    let warm_total = t0.elapsed();
+    assert_eq!(
+        crate::record::camera_opens(),
+        opens_before + 1,
+        "the recording reused the running camera instead of opening it again"
+    );
+    assert!(
+        warm_total < Duration::from_millis(1500),
+        "a warm camera starts at once, not after the long settle: {warm_total:?} (first frame {warm:?})"
+    );
+    assert!(
+        rec.camera_name().is_some(),
+        "the recording knows which camera it has"
+    );
+
+    // 3. And back to the preview after stopping.
+    let cam = rec.take_camera().expect("the recording's camera");
+    let _ = rec.finish();
+    let (mut ptap2, psink2) = super::preview::Tap::new(std::sync::Arc::new(|| {}));
+    ptap2.set_wanted(true);
+    ptap2.set_target(1280, 720);
+    let mut po2 = preview_opts();
+    po2.preview = Some(psink2);
+    let t0 = Instant::now();
+    let prev2 = super::Session::start_with_camera(&po2, Some(cam)).expect("preview again");
+    let back = first_frame(&mut ptap2, Duration::from_secs(10))
+        .expect("the preview's frame after the recording")
+        .0;
+    let back_total = t0.elapsed();
+    assert_eq!(
+        crate::record::camera_opens(),
+        opens_before + 1,
+        "the preview got the same camera back, not a new one"
+    );
+    assert!(
+        back_total < Duration::from_millis(1500),
+        "the returned camera starts at once: {back_total:?} (first frame {back:?})"
+    );
+    let _ = prev2.finish();
+
+    // 4. For comparison: a cold camera waits for its exposure (2 s gate).
+    let (mut ctap, csink) = super::preview::Tap::new(std::sync::Arc::new(|| {}));
+    ctap.set_wanted(true);
+    ctap.set_target(1280, 720);
+    let mut co = recording_opts("g1-cold.mov");
+    co.preview = Some(csink);
+    let t0 = Instant::now();
+    let cold = super::Session::start_with_camera(&co, None).expect("cold recording");
+    let cold_first = first_frame(&mut ctap, Duration::from_secs(15))
+        .expect("the cold recording's first frame")
+        .0;
+    let cold_total = t0.elapsed();
+    assert_eq!(
+        crate::record::camera_opens(),
+        opens_before + 2,
+        "the cold start opened its own camera"
+    );
+    assert!(
+        cold_total >= Duration::from_millis(1800) && cold_first >= Duration::from_millis(1500),
+        "a cold camera holds the file for the settle gate: {cold_total:?} (first frame {cold_first:?})"
+    );
+    let _ = cold.finish();
+
+    clear_env();
+    let _ = std::fs::remove_dir_all(&dir);
 }

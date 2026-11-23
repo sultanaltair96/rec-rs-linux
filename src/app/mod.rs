@@ -185,6 +185,10 @@ pub struct State {
     pub settings: Settings,
     pub recording: Option<Session>,
     pub preview: Option<Session>,
+    /// A running camera between sessions (preview -> recording -> preview),
+    /// handed over so the device never restarts dark (phase 1E, upstream's
+    /// `spare_cam`): its exposure stays settled and the LED stays on.
+    spare_cam: Option<crate::record::Camera>,
     /// Settings the running preview session was started with.
     preview_settings: Option<Settings>,
     pub finishing: bool,
@@ -243,6 +247,7 @@ impl State {
             settings,
             recording: None,
             preview: None,
+            spare_cam: None,
             preview_settings: None,
             finishing: false,
             last_file: None,
@@ -834,13 +839,22 @@ impl App {
         let stale = self.st.preview_settings.as_ref().map(Settings::capture_key)
             != Some(self.st.settings.capture_key());
         if self.st.preview.is_some() && (!want || stale) {
-            if let Some(s) = self.st.preview.take() {
+            if let Some(mut s) = self.st.preview.take() {
+                // Keep the camera for the next session (a recording, or the
+                // restarted preview): re-opening it would restart its
+                // exposure and its LED.
+                if want {
+                    self.st.spare_cam = s.take_camera();
+                }
                 let _ = s.finish();
             }
             self.st.preview_settings = None;
         }
         if want && self.st.preview.is_none() && self.st.error.is_none() {
-            let r = self.options(None).and_then(|o| Session::start(&o));
+            let cam = self.st.spare_cam.take();
+            let r = self
+                .options(None)
+                .and_then(|o| Session::start_with_camera(&o, cam));
             match r {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
@@ -870,8 +884,11 @@ impl App {
     }
 
     fn start_recording(&mut self) {
-        // One capture session at a time: the recording feeds the preview.
-        if let Some(s) = self.st.preview.take() {
+        // One capture session at a time: the recording feeds the preview and
+        // takes over its camera, already exposed for the room.
+        let mut cam = self.st.spare_cam.take();
+        if let Some(mut s) = self.st.preview.take() {
+            cam = cam.or_else(|| s.take_camera());
             let _ = s.finish();
         }
         self.st.preview_settings = None;
@@ -880,7 +897,7 @@ impl App {
         let r = std::fs::create_dir_all(&self.st.settings.output_dir)
             .map_err(anyhow::Error::from)
             .and_then(|_| self.options(Some(&file)))
-            .and_then(|o| Session::start(&o));
+            .and_then(|o| Session::start_with_camera(&o, cam));
         match r {
             Ok(sess) => {
                 let _ = std::fs::write(
@@ -905,9 +922,11 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
-        let Some(sess) = self.st.recording.take() else {
+        let Some(mut sess) = self.st.recording.take() else {
             return;
         };
+        // The camera goes back to the preview once the file is finished.
+        self.st.spare_cam = sess.take_camera();
         let file = sess.output.clone().unwrap_or_default();
         self.st.finishing = true;
         let done = self.finished.clone();
