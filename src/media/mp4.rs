@@ -883,6 +883,26 @@ fn media_duration(samples: &[Sample]) -> u64 {
     samples.iter().map(|s| s.duration as u64).sum()
 }
 
+/// Give the last sample the remaining duration up to the take's end.
+///
+/// A slot dropped at the end of the take (the encoder was busy, or the drain
+/// at stop refused it) leaves the last written sample no further, so the video
+/// track ended short of the audio and the A/V offset grew with every trailing
+/// drop. Mid-take gaps are already in the durations and are left alone; only
+/// the last sample is extended.
+fn extend_last_sample(samples: &mut [Sample], end: u64) {
+    let start: u64 = samples
+        .iter()
+        .take(samples.len().saturating_sub(1))
+        .map(|s| s.duration as u64)
+        .sum();
+    if let Some(last) = samples.last_mut()
+        && end > start
+    {
+        last.duration = (end - start).min(u32::MAX as u64) as u32;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writing boxes
 // ---------------------------------------------------------------------------
@@ -1211,6 +1231,7 @@ pub fn finalize(
     layout: &Layout,
     crash_at: CrashAt,
     keep: Option<&Path>,
+    video_end: Option<f64>,
 ) -> Result<FinalizeReport> {
     let started = Instant::now();
     let (mut file, boxes, len) = scan(path)?;
@@ -1243,7 +1264,13 @@ pub fn finalize(
         let samples = per_track.get(&t.info.track_id);
         let media_duration = match samples {
             Some(samples) => {
-                let samples = sane_durations(samples, t.info.timescale);
+                let mut samples = sane_durations(samples, t.info.timescale);
+                if t.info.handler == Handler::Video
+                    && let Some(end) = video_end
+                {
+                    let end = (end.max(0.0) * t.info.timescale as f64).round() as u64;
+                    extend_last_sample(&mut samples, end);
+                }
                 total_samples += samples.len() as u64;
                 let tables = build_tables(&samples);
                 plan.tables = Some((tables, samples.len() as u32));

@@ -638,7 +638,7 @@ fn chunk_offsets(moov: &[u8], index: usize) -> Vec<u64> {
 fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
     let (bytes, payloads) = fragmented_fixture();
     let path = write_temp("finalize", &bytes);
-    let report = finalize(&path, &layout(), CrashAt::None, None).unwrap();
+    let report = finalize(&path, &layout(), CrashAt::None, None, None).unwrap();
     assert!(report.defragmented);
     assert_eq!(report.tracks, 4);
     assert_eq!(report.samples, 4 + 4 + 4 + 4);
@@ -804,7 +804,7 @@ fn a_regular_movie_is_patched_without_growing_media_offsets() {
     let pad = vec![0xabu8; 64];
     bytes.extend_from_slice(&mdat(&pad));
     let path = write_temp("regular", &bytes);
-    let report = finalize(&path, &layout(), CrashAt::None, None).unwrap();
+    let report = finalize(&path, &layout(), CrashAt::None, None, None).unwrap();
     assert!(!report.defragmented);
     let info = read(&path).unwrap();
     assert!(!info.fragmented);
@@ -854,7 +854,7 @@ fn priming_is_scaled_to_the_track_timescale() {
         default_audio: Some(0),
         audio_priming: vec![2048],
     };
-    finalize(&path, &layout, CrashAt::None, None).unwrap();
+    finalize(&path, &layout, CrashAt::None, None, None).unwrap();
     let info = read(&path).unwrap();
     let audio = &info.tracks[0];
     assert_eq!(audio.timescale, 44100);
@@ -870,7 +870,7 @@ fn keep_copies_the_fragmented_file_before_the_append() {
     let (bytes, _) = fragmented_fixture();
     let path = write_temp("keep", &bytes);
     let keep = path.with_extension("frag.mp4");
-    finalize(&path, &layout(), CrashAt::None, Some(&keep)).unwrap();
+    finalize(&path, &layout(), CrashAt::None, Some(&keep), None).unwrap();
     let kept = std::fs::read(&keep).unwrap();
     assert_eq!(kept, bytes, "the kept copy is the fragmented file");
     std::fs::remove_file(&keep).ok();
@@ -952,4 +952,56 @@ fn a_retimed_audio_timeline_is_rebuilt_uniform_and_monotonic() {
     assert_eq!(tables.stts, vec![(4, 1024)], "one monotonic run");
     assert!(tables.ctts.is_none(), "the compensating cts is dropped");
     assert_eq!(media_duration(&fixed), 4096);
+}
+
+/// A video sample on the output grid (60 fps at timescale 6000).
+fn video_sample(duration: u32) -> Sample {
+    Sample {
+        offset: 0,
+        size: 1,
+        duration,
+        cts: 0,
+        sync: true,
+    }
+}
+
+#[test]
+fn a_drop_at_the_end_of_the_take_extends_the_last_sample() {
+    // 600 slots were due, the encoder refused the last four, so 596 frames
+    // were written. The last one must hold to slot 600 or the video track ends
+    // 83 ms short of the audio.
+    let mut samples: Vec<Sample> = (0..596).map(|_| video_sample(100)).collect();
+    extend_last_sample(&mut samples, 600 * 100);
+    assert_eq!(samples.last().unwrap().duration, 500);
+    assert_eq!(media_duration(&samples), 60_000);
+}
+
+#[test]
+fn drops_during_the_stop_drain_still_reach_the_end() {
+    // The drain at stop lost 30 slots: the last written frame covers its own
+    // frame plus those 30.
+    let mut samples: Vec<Sample> = (0..570).map(|_| video_sample(100)).collect();
+    extend_last_sample(&mut samples, 600 * 100);
+    assert_eq!(samples.last().unwrap().duration, 3_100);
+    assert_eq!(media_duration(&samples), 60_000);
+}
+
+#[test]
+fn a_mid_take_gap_is_kept_and_the_tail_still_reaches_the_end() {
+    // One mid-take drop (a 300-unit gap) and nine trailing drops. The gap is
+    // already in the durations; only the last sample is extended.
+    let mut samples: Vec<Sample> = (0..590).map(|_| video_sample(100)).collect();
+    samples[100].duration = 300;
+    extend_last_sample(&mut samples, 600 * 100);
+    assert_eq!(samples[100].duration, 300, "the mid-take gap stays");
+    assert_eq!(samples.last().unwrap().duration, 900);
+    assert_eq!(media_duration(&samples), 60_000);
+}
+
+#[test]
+fn an_end_before_the_last_sample_does_not_shorten_it() {
+    let mut samples: Vec<Sample> = (0..596).map(|_| video_sample(100)).collect();
+    extend_last_sample(&mut samples, 500 * 100);
+    assert_eq!(samples.last().unwrap().duration, 100);
+    assert_eq!(media_duration(&samples), 59_600);
 }
