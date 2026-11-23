@@ -526,7 +526,11 @@ struct Conn {
 
 impl Conn {
     fn open(u: &RtmpUrl, key: &str) -> Result<Conn> {
+        let debug = std::env::var_os("REC_DEBUG").is_some();
         let addr = format!("{}:{}", u.host, u.port);
+        if debug {
+            eprintln!("rec: debug: rtmp connecting to {addr}");
+        }
         let tcp = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
             .find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(10)).ok())
             .ok_or_else(|| anyhow!("cannot connect to {addr}"))?;
@@ -545,29 +549,51 @@ impl Conn {
             hevc_ok: true,
         };
         c.s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        if debug {
+            eprintln!("rec: debug: rtmp connected, handshake");
+        }
         c.handshake()?;
+        if debug {
+            eprintln!("rec: debug: rtmp handshake done, publish");
+        }
         c.publish(u, key)?;
         Ok(c)
     }
 
     fn handshake(&mut self) -> Result<()> {
+        let debug = std::env::var_os("REC_DEBUG").is_some();
         let mut c1 = vec![0u8; 1536];
-        let _ = std::fs::read("/dev/urandom").map(|r| {
-            let n = r.len().min(c1.len() - 8);
-            c1[8..8 + n].copy_from_slice(&r[..n]);
-        });
+        // The handshake only wants unpredictable bytes; read exactly the
+        // buffer (a plain read of /dev/urandom never ends) and fall back to
+        // zeros, which servers accept.
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read as _;
+            let _ = f.read_exact(&mut c1[8..]);
+        }
         c1[..8].fill(0);
         let mut c0c1 = vec![3u8];
         c0c1.extend_from_slice(&c1);
         self.s.write_all(&c0c1)?;
+        if debug {
+            eprintln!("rec: debug: rtmp C0+C1 sent");
+        }
         let mut s0s1 = vec![0u8; 1537];
         self.s.read_exact(&mut s0s1).context("handshake (S0/S1)")?;
+        if debug {
+            eprintln!("rec: debug: rtmp S0+S1 received");
+        }
         if s0s1[0] != 3 {
             bail!("unexpected RTMP version {}", s0s1[0]);
         }
         self.s.write_all(&s0s1[1..])?; // C2 echoes S1
+        if debug {
+            eprintln!("rec: debug: rtmp C2 sent");
+        }
         let mut s2 = vec![0u8; 1536];
         self.s.read_exact(&mut s2).context("handshake (S2)")?;
+        if debug {
+            eprintln!("rec: debug: rtmp S2 received");
+        }
         Ok(())
     }
 
@@ -579,6 +605,10 @@ impl Conn {
     }
 
     fn cmd(&mut self, sid: u32, values: &[Amf]) -> Result<()> {
+        if std::env::var_os("REC_DEBUG").is_some() {
+            let name = values.first().and_then(Amf::str).unwrap_or("?");
+            eprintln!("rec: debug: rtmp -> {name} (stream {sid})");
+        }
         self.send(C_COMMAND, 20, sid, 0, &command(values))
     }
 
@@ -618,6 +648,13 @@ impl Conn {
                         || (name == "onStatus" && status_level(&v) == Some("error"))
                     {
                         bail!("{what} refused: {}", status_text(&v));
+                    }
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!(
+                            "rec: debug: rtmp <- {} {}",
+                            v.first().and_then(Amf::str).unwrap_or("?"),
+                            status_text(&v)
+                        );
                     }
                     if pred(&v) {
                         return Ok(v);
@@ -822,6 +859,10 @@ impl RtmpOutput {
                 state: "connecting".into(),
                 want_key: true,
                 skip_to_key: true,
+                // REC_LIVE_HEVC_REFUSE makes the output behave like a server
+                // that answered the enhanced-RTMP connect without `hvc1`, which
+                // the self-test needs because MediaMTX accepts HEVC.
+                hevc_refused: std::env::var_os("REC_LIVE_HEVC_REFUSE").is_some(),
                 ..Default::default()
             }),
             Condvar::new(),

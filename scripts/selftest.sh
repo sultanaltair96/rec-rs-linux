@@ -36,8 +36,8 @@ case "${1:-}" in
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
         echo "h264-bitrate sync audio-gaps pause-resume gain compositor"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
-        echo "skipped: pattern-webcam pattern-mic scene-webcam"
-        echo "         stream-rtmp stream-whip replay gui"
+        echo "replay stream-rtmp stream-whip"
+        echo "skipped: pattern-webcam pattern-mic scene-webcam gui"
         exit 0 ;;
 esac
 
@@ -245,6 +245,50 @@ screen_test screen-x11 xvfb.sh x11 1280 800 30
 # X11: --window <app> captures one client's own surface.
 screen_test screen-window xvfb.sh window 400 300 30
 
+# The replay buffer: 20 s with --replay 15, saved with `rec-rs save-replay`,
+# checked for length, keyframe start, playability, sync and the memory report.
+if wanted replay; then
+    if scripts/live/replay.sh >"$OUT/replay.log" 2>&1; then
+        echo "PASS  replay  ($(grep -m1 '^PASS  replay-length' "$OUT/replay.log" | sed 's/^PASS  replay-length  (//; s/)$//'))"
+        pass=$((pass+1))
+    else
+        echo "FAIL  replay  (see $OUT/replay.log)"; fail=$((fail+1))
+    fi
+fi
+
+# Streaming against a local MediaMTX: two RTMP paths and an RTMPS one from one
+# encode, and a reconnect after the server restarts. MediaMTX is downloaded at
+# test time into the cache (outside the repo) and records every path, so the
+# checks measure what the server received. Exit 3 means it could not be
+# downloaded (offline): that is a SKIP, not a failure.
+if wanted stream-rtmp; then
+    status=0
+    scripts/live/streams.sh --rtmp >"$OUT/stream-rtmp.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "PASS  stream-rtmp  ($(grep -m1 '^PASS  rtmp-a' "$OUT/stream-rtmp.log" | sed 's/^PASS  rtmp-a  (//; s/)$//'); $(grep -c '^PASS  rtmp\|^PASS  rtmps' "$OUT/stream-rtmp.log") recordings checked)"
+        pass=$((pass+1))
+    elif [ "$status" -eq 3 ]; then
+        echo "SKIP  stream-rtmp  (MediaMTX could not be downloaded)"; skip=$((skip+1))
+    else
+        echo "FAIL  stream-rtmp  (see $OUT/stream-rtmp.log)"; fail=$((fail+1))
+    fi
+fi
+
+# WHIP: SDP POST, ICE/DTLS/SRTP, H.264 + Opus, A/V aligned, recorded by the
+# server and measured with the sync check.
+if wanted stream-whip; then
+    status=0
+    scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "PASS  stream-whip  ($(grep -m1 '^PASS  whip-sync' "$OUT/stream-whip.log" | sed 's/^PASS  whip-sync  (//; s/)$//'))"
+        pass=$((pass+1))
+    elif [ "$status" -eq 3 ]; then
+        echo "SKIP  stream-whip  (MediaMTX could not be downloaded)"; skip=$((skip+1))
+    else
+        echo "FAIL  stream-whip  (see $OUT/stream-whip.log)"; fail=$((fail+1))
+    fi
+fi
+
 # Cases that belong to later phases (they need capture, the app or streaming).
 later() {
     wanted "$1" || return 0
@@ -253,9 +297,6 @@ later() {
 later pattern-webcam  "phase 1B: camera capture"
 later scene-webcam    "phase 1G: the writer composites the camera over the screen"
 later pattern-mic     "phase 1B: microphone capture"
-later replay          "phase 1D: replay buffer"
-later stream-rtmp     "phase 1D: RTMP"
-later stream-whip     "phase 1D: WHIP"
 later gui             "phase 1E: the app"
 
 echo "$pass passed, $fail failed, $skip skipped"

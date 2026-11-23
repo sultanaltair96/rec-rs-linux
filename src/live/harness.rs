@@ -324,7 +324,7 @@ struct Summary {
 
 fn print_status(s: &OutputStatus, ever_live: bool) {
     println!(
-        "live: stream {} {} live {:.1}s {:.2} Mb/s drops {} reconnects {} hashes-ever {} error {}",
+        "live: stream {} {} live {:.1}s {:.2} Mb/s drops {} reconnects {} ever-live {} error {}",
         s.name,
         s.state,
         s.duration,
