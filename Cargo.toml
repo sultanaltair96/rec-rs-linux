@@ -42,8 +42,16 @@ winit = "0.30"
 ksni = { version = "0.3", features = ["blocking"] }
 futures-util = "0.3"
 rfd = "0.18"
-# "Check for Updates" against GitHub Releases.
+gstreamer-video = "0.24"
+# Live outputs (phase 1D): RTMPS through rustls (ring provider, so no cmake or
+# aws-lc build tools are needed), WHIP through str0m with its pure-Rust crypto
+# backend, ureq (also the app's update check) with its rustls client, and
+# stream keys in the Secret Service.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 # Golden image fixtures for the compositor (tests/golden).

@@ -1,11 +1,16 @@
 //! The seam between the app and the backends.
 //!
-//! The camera, the compositor and the writer are real now: `record::Session`
-//! offers `set_pip`, `set_scene`, `cam_aspect` and `camera_name`, and
-//! `Options::preview` carries the composited frame. What is still a stub is one
-//! phase only — the live encode (replay buffer, streams, stream keys, phase
-//! 1D) — and this module is the one place that names it, so the UI can say why
-//! a control is disabled instead of silently doing nothing.
+//! Everything the app starts is real: `record::Session` owns the capture and the
+//! file, the camera and the compositor are wired, and the live encode
+//! ([`crate::live::Live`]) owns the replay buffer and the streams. This module
+//! is the one place that translates between the UI's model and those APIs, so a
+//! control is never silently ignored: `Err` here is what the banner shows.
+//!
+//! The live encode's shape: `Live::begin_session(system, mic)` once a session
+//! exists, `add_output`/`remove_output` for destinations (each returns the id
+//! the status list is keyed by), `statuses()` for the stream cards,
+//! `replay_stats()` for the memory line, `save_replay_async` behind the Save
+//! Replay button and `stop_all` when the app quits.
 //!
 //! Nothing here duplicates a `media_types` type.
 
@@ -29,25 +34,24 @@ pub struct Caps {
     pub stream: bool,
 }
 
-/// Today's abilities: camera, compositor and live overlay/scene changes are
-/// in; the live encode (replay buffer, streams, stream keys) is still phase 1D.
+/// Today's abilities: everything the window offers is backed by a real
+/// implementation (camera, compositor, live overlay and scene changes, the live
+/// encode with its replay buffer and streams).
 pub fn caps() -> Caps {
     Caps {
         camera: true,
         pip: true,
         scene_switch: true,
-        replay: false,
-        stream: false,
+        replay: true,
+        stream: true,
     }
 }
 
-/// The phase that provides an app feature, for the UI's "not yet" hints.
+/// What the UI says when a control has nothing to act on yet.
 pub fn phase_note(feature: &str) -> String {
     match feature {
-        "replay" | "stream" | "keys" => format!(
-            "replay and streaming are not implemented yet (phase {})",
-            live::PHASE
-        ),
+        "replay" => "the replay buffer starts with the capture session".into(),
+        "stream" | "keys" => "streaming needs a destination in Stream".into(),
         other => format!("{other} is not available in this build"),
     }
 }
@@ -67,61 +71,105 @@ pub struct StreamStatus {
     pub reconnects: u64,
 }
 
-/// Replay buffer (seconds held, bytes in memory), when it is on (phase 1D).
-pub fn replay_stats(_live: &Live) -> Option<(f64, usize)> {
-    None
+/// Replay buffer (seconds held, bytes in memory), when it is on.
+pub fn replay_stats(live: &Live) -> Option<(f64, usize)> {
+    live.replay_stats()
 }
 
-/// Start the live encode for a session. `Err` is what the banner shows.
-pub fn begin_live(_live: &Live, system: bool, mic: bool) -> Result<(), String> {
-    let _ = (system, mic);
+/// Start the live encode for a session: which audio sources this session
+/// delivers (already through their faders). Silence stands in when there are
+/// none, so every service gets an audio track.
+pub fn begin_live(live: &Live, system: bool, mic: bool) -> Result<(), String> {
+    live.begin_session(system, mic)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The key for a destination: the one the caller typed, else the Secret Service
+/// entry for the URL. WHIP endpoints may run without one; RTMP(S) may not.
+fn destination_key(url: &str, key: &str) -> Result<String, String> {
+    let key = key.trim();
+    if !key.is_empty() {
+        return Ok(key.to_string());
+    }
+    if let Some(stored) = live::keyring::get(url) {
+        return Ok(stored);
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Ok(String::new());
+    }
     Err(format!(
-        "the live encode is not implemented yet (phase {})",
-        live::PHASE
+        "no stream key for {url}: type one in Stream (it goes to the Secret Service) or set REC_STREAM_KEY"
     ))
 }
 
-/// Add one destination to the running live encode (phase 1D): its output id
-/// and URL.
-pub fn add_output(_live: &Live, _url: &str, _key: &str) -> Result<u64, String> {
-    Err(format!(
-        "streaming is not implemented yet (phase {})",
-        live::PHASE
-    ))
+/// Add one destination to the running live encode; its output id is what
+/// [`statuses`] and [`remove_output`] use.
+pub fn add_output(live: &Live, url: &str, key: &str) -> Result<u64, String> {
+    let url = live::destination_url(url);
+    let key = destination_key(&url, key)?;
+    let output = live::start_output(&url, &key).map_err(|e| {
+        format!(
+            "Could not go live on {}: {e:#}",
+            live::destination_name(&url)
+        )
+    })?;
+    Ok(live.add_output(output))
 }
 
-/// Remove a destination by id (phase 1D).
-pub fn remove_output(live: &Live, _id: u64) -> Result<(), String> {
-    let _ = live;
-    Err(format!(
-        "streaming is not implemented yet (phase {})",
-        live::PHASE
-    ))
+/// Remove a destination by id (the encode keeps running for the others).
+pub fn remove_output(live: &Live, id: u64) -> Result<(), String> {
+    live.remove_output(id);
+    Ok(())
 }
 
-/// Every destination's status, by output id (phase 1D).
-pub fn statuses(_live: &Live) -> Vec<(u64, StreamStatus)> {
-    vec![]
+/// Every destination's status, by output id.
+pub fn statuses(live: &Live) -> Vec<(u64, StreamStatus)> {
+    live.statuses()
+        .into_iter()
+        .map(|(id, s)| {
+            (
+                id,
+                StreamStatus {
+                    live: s.live,
+                    state: s.state,
+                    error: s.error,
+                    duration: s.duration,
+                    bitrate: s.bitrate,
+                    dropped_frames: s.dropped_frames,
+                    reconnects: s.reconnects,
+                },
+            )
+        })
+        .collect()
 }
 
-/// Stop the live encode and every destination (phase 1D).
+/// Stop the live encode and every destination (the window closed, or Go Live
+/// was switched off).
 pub fn stop_all(live: &Live) {
-    let _ = live;
+    live.stop_all()
 }
 
-/// Write the replay buffer to `path` in the background (phase 1D).
-pub fn save_replay(_live: &Live, _path: std::path::PathBuf) -> Result<(), String> {
-    Err(format!(
-        "the replay buffer is not implemented yet (phase {})",
-        live::PHASE
-    ))
+/// Write the replay buffer to `path` in the background (the buffer keeps
+/// running). An immediate error — no buffer, still empty — is the banner's; the
+/// finished path is printed when it lands.
+pub fn save_replay(live: &Live, path: std::path::PathBuf) -> Result<(), String> {
+    let handle = live.save_replay_async(path).map_err(|e| format!("{e:#}"))?;
+    std::thread::spawn(move || match handle.join() {
+        Ok(Ok(saved)) => eprintln!("rec: replay saved {}", saved.display()),
+        Ok(Err(e)) => eprintln!("rec: replay: {e:#}"),
+        Err(_) => eprintln!("rec: replay: the writer panicked"),
+    });
+    Ok(())
 }
 
-/// Whether a stream key is stored for `url` (phase 1D: the Secret Service).
-/// Until then the `REC_STREAM_KEY` override is the whole story, which is also
-/// what the CLI uses.
+/// Whether a stream key is stored for `url`: the Secret Service entry, or the
+/// `REC_STREAM_KEY` override the CLI uses too.
 pub fn has_stream_key(url: &str) -> bool {
-    has_stream_key_from(std::env::var("REC_STREAM_KEY").ok().as_deref(), url)
+    if url.is_empty() {
+        return false;
+    }
+    let env = std::env::var("REC_STREAM_KEY").ok();
+    has_stream_key_from(env.as_deref(), url) || live::keyring::get(url).is_some()
 }
 
 /// [`has_stream_key`] with the environment given (tests): WHIP endpoints may
@@ -136,13 +184,13 @@ pub fn has_stream_key_from(key: Option<&str>, url: &str) -> bool {
     key.is_some_and(|k| !k.trim().is_empty())
 }
 
-/// Store a stream key (phase 1D: the Secret Service). Until then, point at the
-/// environment override instead of pretending.
-pub fn save_stream_key(_url: &str, _key: &str) -> Result<(), String> {
-    Err(format!(
-        "stream keys in the Secret Service are not implemented yet (phase {}); set REC_STREAM_KEY",
-        live::PHASE
-    ))
+/// Store a stream key in the Secret Service, keyed by destination URL (the same
+/// place `rec-rs stream-key` writes). Never a file.
+pub fn save_stream_key(url: &str, key: &str) -> Result<(), String> {
+    if url.is_empty() || key.trim().is_empty() {
+        return Err("a destination URL and a key are needed".into());
+    }
+    live::keyring::set(url, key.trim()).map_err(|e| format!("{e:#}"))
 }
 
 /// Build the session options for these settings, exactly as the CLI would: the
@@ -190,8 +238,37 @@ pub fn preview_error(e: &anyhow::Error) -> String {
 mod tests {
     use super::*;
 
+    /// The seam drives the real `Live`: a key from the environment or the store,
+    /// destinations added and removed by id, statuses keyed by that id, and the
+    /// replay buffer's own report.
     #[test]
-    fn stream_keys_come_from_the_environment_for_now() {
+    fn the_seam_drives_the_live_encode() {
+        let live = Live::new();
+        assert_eq!(replay_stats(&live), None);
+        assert!(statuses(&live).is_empty());
+        // No buffer configured: the Save Replay button has nothing to save.
+        let e = save_replay(&live, "/tmp/r.mp4".into()).unwrap_err();
+        assert!(e.contains("replay buffer is off"), "{e}");
+
+        begin_live(&live, true, false).expect("a session can start the encode");
+        live.set_replay(Some(15.0));
+        assert_eq!(replay_stats(&live), Some((0.0, 0)), "on, still empty");
+
+        // A destination without a key fails before any connection is made, and
+        // one with an unsupported URL fails with the URL in the message.
+        let e = add_output(&live, "rtmps://live.twitch.tv/app", "").unwrap_err();
+        assert!(e.contains("no stream key"), "{e}");
+        let e = add_output(&live, "ftp://example.com/live", "k").unwrap_err();
+        assert!(e.contains("Could not go live on"), "{e}");
+
+        assert!(live.active(), "the replay buffer keeps the encode running");
+        stop_all(&live);
+        live.set_replay(None);
+        assert!(!live.active(), "nothing consumes it: the encode stops");
+    }
+
+    #[test]
+    fn stream_keys_come_from_the_store_or_the_environment() {
         assert!(has_stream_key_from(
             Some("abc"),
             "rtmps://live.twitch.tv/app"
@@ -205,47 +282,40 @@ mod tests {
         assert!(has_stream_key_from(None, "https://example.com/whip"));
         assert!(has_stream_key_from(None, "http://localhost/whip"));
         assert!(!has_stream_key_from(Some("x"), ""));
-        // The phase is named when saving is attempted, never silently ignored.
-        let e = save_stream_key("rtmp://x/live", "k").unwrap_err();
-        assert!(
-            e.contains("phase 1D") && e.contains("REC_STREAM_KEY"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn live_adapter_says_which_phase_owes_the_feature() {
-        let live = Live::new();
-        assert_eq!(replay_stats(&live), None);
-        assert!(statuses(&live).is_empty());
-        assert!(
-            add_output(&live, "rtmp://x/live", "k")
-                .unwrap_err()
-                .contains("phase 1D")
-        );
-        assert!(
-            save_replay(&live, "/tmp/r.mp4".into())
-                .unwrap_err()
-                .contains("phase 1D")
-        );
-        assert!(
-            begin_live(&live, true, true)
-                .unwrap_err()
-                .contains("phase 1D")
-        );
-        stop_all(&live);
+        // Storing goes to the Secret Service and never to a file: with one
+        // running this round-trips, without one the error names it.
+        let url = format!("rtmps://rec-rs-test.invalid/{}", std::process::id());
+        match save_stream_key(&url, "sk_test_123") {
+            Ok(()) => {
+                assert_eq!(live::keyring::get(&url).as_deref(), Some("sk_test_123"));
+                assert!(has_stream_key(&url), "the store answers");
+                live::keyring::delete(&url).unwrap();
+            }
+            Err(e) => {
+                assert!(
+                    e.contains("Secret Service") || e.contains("keyring"),
+                    "a missing keyring must be named: {e}"
+                );
+                assert!(!has_stream_key(&url));
+            }
+        }
+        assert!(save_stream_key("", "k").is_err());
+        assert!(save_stream_key("rtmp://x/live", "  ").is_err());
     }
 
     #[test]
     fn caps_follow_the_backends() {
-        // Camera, compositor and live overlay/scene changes are in (1B/1C);
-        // the live encode is still phase 1D, and the UI says so.
+        // Every feature the window offers is backed by an implementation now.
         let c = caps();
-        assert!(c.camera && c.pip && c.scene_switch);
-        assert!(!c.replay && !c.stream);
-        assert!(phase_note("replay").contains("phase 1D"));
-        assert!(phase_note("stream").contains("phase 1D"));
-        assert!(phase_note("keys").contains("phase 1D"));
+        assert!(c.camera && c.pip && c.scene_switch && c.replay && c.stream);
+        // The hints no longer name a phase that owes the feature.
+        for feature in ["replay", "stream", "keys"] {
+            assert!(
+                !phase_note(feature).contains("not implemented"),
+                "{}",
+                phase_note(feature)
+            );
+        }
     }
 
     #[test]
