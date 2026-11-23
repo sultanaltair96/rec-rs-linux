@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 11.4 MB bundle (runtime shared) | 104 MiB AppImage (GStreamer inside) |
+| Size | 11.4 MB bundle (runtime shared) | 104.4 MiB AppImage (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -108,7 +108,7 @@ stays MIT OR Apache-2.0 (mere aggregation).
 
 **AAC** comes from the runtime's `avenc_aac` (fdk-aac is non-free and not in the
 runtime); the writer already knows its priming (`REC_AAC_PRIMING`, see
-`src/media/writer.rs`). ProRes 422 is `avenc_prores_ks`, Opus is `opusenc`.
+`src/media/writer.rs`). ProRes 422 is `avenc_prores_aw` (the writer's first choice since 1G, falling back to `avenc_prores`/`avenc_prores_ks`; the Flatpak test prints `rec: encoder avenc_prores_aw`), Opus is `opusenc`.
 
 The live path (phase 1D) asks for `fdkaacenc`/`fdkaacdec` first and then
 `avenc_aac`/`avdec_aac`; in the sandbox `gst-inspect` reports **`fdkaacenc` and
@@ -184,15 +184,18 @@ WHIP from one encode with a 15 s replay buffer; MediaMTX's own recordings probed
 from inside the sandbox for video + AAC/Opus audio; the replay buffer filling),
 and **the Secret Service** (`stream-key` stored and deleted through
 `org.freedesktop.secrets`, with gnome-keyring running in the container).
-Result: **18/18 pass, 1 skip**. The skip is `save-replay` from a *second*
-`flatpak run`: each instance gets its own PID namespace, so the pid in the
-pidfile is the recorder's namespace-local pid and the signal hits the caller
-instead (exit 163). The runtime directory is shared between instances, so the
-fix is the unix control socket the port plan already names for `save-replay` —
-a code change in 1D/1E, not packaging. The AppImage, which has no sandbox, runs
-the full `save-replay` proof.
+Result: **23/23 pass, no skips.** That includes the checks that were
+impossible before phase 1E's recorder socket: `save-replay` from a *second*
+`flatpak run` now lands (the clip plays), and the full 1E scenario — an idle app,
+a CLI recording, a pidfile overwritten with `999999` and a bogus path, then
+`stop` — prints `/tmp/cli.mp4` and leaves the app running. A second `record`
+is refused with "another recorder is running". The recordings MediaMTX made of
+both destinations carry video and audio (`soun mp4a` for RTMP, `soun Opus` for
+WHIP; the test pattern synthesizes the system-audio beeps, so no device is
+needed), the replay buffer fills, and `stream-key` stores and deletes a key
+through `org.freedesktop.secrets`.
 
-Bundle size: **11.4 MB** (`rec.flatpak`, 11,423,152 bytes) — the runtime is shared. The manifest
+Bundle size: **11.4 MB** (`rec.flatpak`, 11,420,360 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -307,13 +310,16 @@ pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
 Result: **Debian 13 14/14 pass** and **Fedora 43 13/13 pass + 1 skip**. The
-encoders are `x264enc`, `x265enc` and `avenc_prores_ks`, `probe` reports
+encoders are `x264enc`, `x265enc` and `avenc_prores_ks` (`avenc_prores_aw` and
+`avenc_prores` are bundled too, but Ubuntu's libav picks the `_ks` variant
+first), `probe` reports
 `video h264 1920x1080 @ 60.000 fps` and HEVC, 28 plugins are bundled, and the
 GUI opens under Xvfb on Debian 13 (window still up after 8 s). The **live path**
 runs for real: RTMP + WHIP from one encode with a 15 s replay buffer, a
 `save-replay` clip from a second AppImage process (the AppImage has no PID
 namespace, so this works), and MediaMTX's own recordings probe with video +
-**aac** (RTMP) and video + **opus** (WHIP). `fdkaacenc`/`fdkaacdec` are absent
+**aac** (RTMP) and video + **opus** (WHIP), and the replay clip from a second
+AppImage process plays. `fdkaacenc`/`fdkaacdec` are absent
 from the bundle (Ubuntu has no fdk-aac); `avenc_aac`, `avdec_aac` and `voaacenc`
 are present, so the live path's fallback is what runs.
 
@@ -325,7 +331,7 @@ Mesa, opens its window in the same container — the difference is the host's
 rendering stack, not the package. A real Fedora desktop with a GPU driver is
 check 8 in the list below.
 
-Sizes: AppImage **104.3 MiB** (109,414,904 bytes), `.zsync` 183 KiB. Most of it
+Sizes: AppImage **104.4 MiB** (109,423,096 bytes), `.zsync` 183 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
 fonts. That is the price of AAC, ProRes, the app and streaming in a single file;
@@ -351,6 +357,7 @@ which package provides it:
 | Folder picker (rfd) | FileChooser portal | host FileChooser portal |
 | Inter (Regular/Medium/SemiBold) | `include_bytes!` in the binary (`assets/fonts/`), nothing to install | the same bytes, in the same binary |
 | GStreamer + encoders | the runtime + `codecs-extra` + the built x265 | 28 bundled plugins (see above) |
+| Control from another instance (`stop`, `pause`, `resume`, `save-replay`) | the shared `$XDG_RUNTIME_DIR/rec-rs-recorder.sock` (phase 1E), which crosses the sandbox's PID namespace; the pidfile signal is the fallback | the same socket, plus the pidfile signal (no namespaces, both work) |
 
 ## Desktop integration
 
