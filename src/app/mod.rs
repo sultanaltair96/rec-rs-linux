@@ -19,7 +19,7 @@
 //! decorations, a StatusNotifierItem tray, the GlobalShortcuts portal/X11
 //! grabs and the GitHub Releases check.
 
-mod control;
+pub(crate) mod control;
 mod install;
 mod linux_desktop;
 mod lock;

@@ -46,6 +46,19 @@ wanted() { [ -z "$only_clean" ] || [ "${only#* $1 }" != "$only" ]; }
 # An opt-in case only runs when it is named: the default pass stays short.
 named() { [ -n "$only_clean" ] && wanted "$1"; }
 
+# The recorder's pidfile ($XDG_RUNTIME_DIR, else /tmp/rec-rs-$UID).
+pidfile_path() {
+    dir=${XDG_RUNTIME_DIR:-}
+    [ -n "$dir" ] && [ -d "$dir" ] || dir="/tmp/rec-rs-$(id -u)"
+    echo "$dir/rec-rs.pid"
+}
+
+# Simulate a second PID namespace (a Flatpak instance): the pidfile's pid is
+# meaningless there, so only the control socket can reach the recorder.
+bogus_pidfile() {
+    printf '999999\n%s\n' "$1" >"$(pidfile_path)"
+}
+
 case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
@@ -319,16 +332,24 @@ fi
 # exactly 300 frames (5 s at 60 fps) and audio must still be in sync.
 if wanted pause-resume; then
     f="$OUT/pause-resume.mov"
+    started=$(date +%s)
     timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 5 -o "$f" >/dev/null 2>"$OUT/pause-resume.log" &
     recorder=$!
-    sleep 2.3; "$REC" pause >/dev/null 2>&1 || true; sleep 2; "$REC" resume >/dev/null 2>&1 || true
+    # The pidfile holds a pid that only exists inside the recorder's namespace
+    # (as in a Flatpak): the socket in the shared runtime dir must carry the
+    # commands, and they must report success.
+    pause_ok=no; resume_ok=no
+    sleep 2.3; bogus_pidfile "$f"; "$REC" pause >/dev/null 2>>"$OUT/pause-resume.log" && pause_ok=yes
+    sleep 2; bogus_pidfile "$f"; "$REC" resume >/dev/null 2>>"$OUT/pause-resume.log" && resume_ok=yes
     wait "$recorder" || true
+    wall=$(( $(date +%s) - started ))
     frames=$(ffprobe -v error -select_streams v -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f" 2>/dev/null || echo 0)
-    if python3 scripts/synccheck.py "$f" --max-ms 1 >"$OUT/pause-resume.check" 2>&1 && [ "$frames" = 300 ]; then
-        echo "PASS  pause-resume  ($frames frames, audio in sync across the pause)"
+    if [ "$pause_ok" = yes ] && [ "$resume_ok" = yes ] && [ "$wall" -ge 6 ] &&
+       python3 scripts/synccheck.py "$f" --max-ms 1 >"$OUT/pause-resume.check" 2>&1 && [ "$frames" = 300 ]; then
+        echo "PASS  pause-resume  ($frames frames, ${wall}s wall with a 2 s pause over the socket, foreign pid, audio in sync)"
         pass=$((pass+1))
     else
-        bad pause-resume "$frames frames; see $OUT/pause-resume.check"
+        bad pause-resume "$frames frames, pause=$pause_ok resume=$resume_ok, wall ${wall}s; see $OUT/pause-resume.check"
     fi
 fi
 
@@ -516,19 +537,44 @@ if wanted timeout-stop; then
     timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -o "$f" >/dev/null 2>"$OUT/timeout-stop.log" &
     pid=$!
     sleep 2
-    if "$REC" stop >"$OUT/timeout-stop.out" 2>>"$OUT/timeout-stop.log"; then
+    # A second recorder refuses while one is live (and leaves the first alone).
+    second=no
+    if timeout 20 "$REC" record -q --test-pattern --no-mic -t 1 -o "$OUT/second.mov" \
+           >"$OUT/timeout-stop.second" 2>&1; then
+        second=started
+    elif grep -q "another recorder is running" "$OUT/timeout-stop.second"; then
+        second=refused
+    fi
+    bogus_pidfile "$f"
+    if [ "$second" = refused ] && "$REC" stop >"$OUT/timeout-stop.out" 2>>"$OUT/timeout-stop.log"; then
         sleep 0.3
         frames=$(frame_count "$f" 2>/dev/null || echo 0)
         if [ "$frames" -ge 60 ] && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/timeout-stop.log"; then
-            echo "PASS  timeout-stop  ($frames frames after \`rec-rs stop\`)"
+            echo "PASS  timeout-stop  ($frames frames after \`rec-rs stop\` with a foreign pid; a second recorder refused)"
             pass=$((pass+1))
         else
             bad timeout-stop "$frames frames"
         fi
     else
-        bad timeout-stop "rec-rs stop failed"
+        bad timeout-stop "rec-rs stop failed (second recorder: $second)"
     fi
     wait "$pid" 2>/dev/null || true
+    # The pidfile signal stays the fallback when nothing listens (a shell with
+    # no socket, an older recorder): removing the socket file makes the next
+    # stop take the SIGINT path, with a real pid.
+    f2="$OUT/timeout-stop-signal.mov"
+    timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -o "$f2" >/dev/null 2>"$OUT/timeout-stop-signal.log" &
+    pid2=$!
+    sleep 2
+    rm -f "${XDG_RUNTIME_DIR:-/tmp/rec-rs-$(id -u)}/rec-rs-control.sock"
+    if "$REC" stop >"$OUT/timeout-stop-signal.out" 2>>"$OUT/timeout-stop-signal.log" &&
+       [ "$(cat "$OUT/timeout-stop-signal.out")" = "$f2" ]; then
+        echo "PASS  timeout-stop-signal  (SIGINT fallback with the socket gone)"
+        pass=$((pass+1))
+    else
+        bad timeout-stop-signal "the signal fallback failed; see $OUT/timeout-stop-signal.log"
+    fi
+    wait "$pid2" 2>/dev/null || true
 fi
 
 # Ten minutes at a small size: measures the finalise with hundreds of
