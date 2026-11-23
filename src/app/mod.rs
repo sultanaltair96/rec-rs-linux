@@ -518,6 +518,11 @@ struct App {
     last_meter: Instant,
     control_rx: Receiver<Control>,
     _listener: Option<control::Listener>,
+    /// The recorder socket, held only while a recording runs, so a CLI
+    /// `rec-rs record` can start while this app is idle (and refuses while it
+    /// records).
+    recorder_server: Option<control::Server>,
+    recorder_rx: Receiver<Control>,
     start_recording: bool,
     test_pattern: bool,
     finished: Arc<Mutex<Option<Finished>>>,
@@ -583,6 +588,8 @@ impl App {
             last_meter: Instant::now(),
             control_rx,
             _listener: listener,
+            recorder_server: None,
+            recorder_rx: std::sync::mpsc::channel().1,
             start_recording,
             test_pattern,
             finished: Arc::new(Mutex::new(None)),
@@ -1017,6 +1024,7 @@ impl App {
                     self.st.cam_aspect = a;
                 }
                 self.st.recording = Some(sess);
+                self.start_recorder_socket();
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
                 // G3: a display (or region) capture includes Rec's own window
@@ -1065,6 +1073,33 @@ impl App {
             eprintln!("rec: debug: excluding own windows {ids:?}");
         }
         crate::capture::screen::set_excluded_windows(ids);
+    }
+
+    /// Hold the recorder socket while a recording runs: `rec-rs
+    /// stop|pause|resume|save-replay` find it there (in a Flatpak too, where the
+    /// pidfile's pid means nothing), and a second recorder refuses on
+    /// `AddrInUse`. An idle app holds only its control socket.
+    fn start_recorder_socket(&mut self) {
+        if self.recorder_server.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handler: control::Handler = std::sync::Arc::new(move |c| tx.send(c).is_ok());
+        match control::serve_recorder(handler) {
+            Ok(server) => {
+                self.recorder_server = Some(server);
+                self.recorder_rx = rx;
+            }
+            Err(e) => {
+                eprintln!("rec: warning: could not open the recorder socket: {e}");
+            }
+        }
+    }
+
+    /// Release the recorder socket (the recording ended): the name is free for
+    /// the next recorder.
+    fn stop_recorder_socket(&mut self) {
+        self.recorder_server = None;
     }
 
     /// Whether the capture excludes our windows itself (X11) rather than the app
@@ -1287,6 +1322,7 @@ impl App {
         let done = self.finished.lock().unwrap().take();
         if let Some((file, r)) = done {
             self.st.finishing = false;
+            self.stop_recorder_socket();
             self.restore_after_recording();
             match r {
                 Ok(_) => {
@@ -1415,6 +1451,17 @@ impl App {
         }
         if let Some(t) = &self.tray {
             tray::update(t, view);
+        }
+        while let Ok(c) = self.recorder_rx.try_recv() {
+            let cmd = match c {
+                Control::Stop if self.st.recording.is_some() => Cmd::ToggleRecording,
+                Control::Pause => Cmd::Pause,
+                Control::Resume => Cmd::Resume,
+                Control::SaveReplay => Cmd::SaveReplay,
+                // App commands on the recorder socket: not ours to run here.
+                _ => continue,
+            };
+            self.handle(el, cmd);
         }
         while let Ok(c) = self.control_rx.try_recv() {
             let cmd = match c {

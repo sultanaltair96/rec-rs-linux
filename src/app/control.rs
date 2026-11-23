@@ -5,13 +5,15 @@
 //! tray item, hotkeys and capture. A second launch therefore says what it wants
 //! on a Unix socket and exits; the first instance listens on that socket.
 //!
-//! `rec-rs stop|pause|resume|save-replay` use that socket too, and only fall
-//! back to the pidfile and a signal when nothing listens. Inside a Flatpak each
-//! instance has its own PID namespace (the pid in the pidfile is meaningless in
-//! another instance, and its signal hits the wrong process), while
-//! `$XDG_RUNTIME_DIR` is shared — the socket is what makes those commands work
-//! from a second `flatpak run`. A CLI `rec-rs record` listens on the same
-//! socket with the same protocol, so both kinds of recorder answer.
+//! `rec-rs stop|pause|resume|save-replay` go to a **second** socket,
+//! [`recorder_socket_path`], which exists only while something is actually
+//! recording — the app while its recording runs, or a CLI `rec-rs record`.
+//! Its presence is the "a recording is live" answer: a second recorder refuses
+//! on `AddrInUse` (as upstream refuses while a recording is live), and an idle
+//! app window never blocks a CLI recording. When no recorder socket listens the
+//! commands fall back to the pidfile and a signal. Everything is in the shared
+//! `$XDG_RUNTIME_DIR`, so it works from a second `flatpak run` (whose PID
+//! namespace makes the pidfile's pid meaningless).
 //!
 //! The socket lives in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`, mode 0700)
 //! and is created 0600: one user's control channel. The pidfile stays for the
@@ -78,9 +80,15 @@ impl Control {
     }
 }
 
-/// The single-instance socket.
+/// The app's single-instance socket (window commands: show, settings, quit…).
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("rec-rs-control.sock")
+}
+
+/// The running recording's socket: held by whichever recorder is live (the app
+/// while it records, or a CLI `rec-rs record`), absent while nothing records.
+pub fn recorder_socket_path() -> PathBuf {
+    runtime_dir().join("rec-rs-recorder.sock")
 }
 
 /// What the listener answers for a command: `true` handled, `false` not a
@@ -99,9 +107,10 @@ impl Drop for Server {
     }
 }
 
-/// Answer control commands on [`socket_path`].
-pub fn serve(handler: Handler) -> std::io::Result<Server> {
-    serve_with(&socket_path(), handler)
+/// Answer the recording commands on [`recorder_socket_path`] (the app or a CLI
+/// recorder; `AddrInUse` means another recording is live).
+pub fn serve_recorder(handler: Handler) -> std::io::Result<Server> {
+    serve_with(&recorder_socket_path(), handler)
 }
 
 /// [`serve`] at an explicit path (tests).
@@ -225,13 +234,13 @@ pub fn claim_at(path: &Path, cmd: Control) -> Claim {
     }
 }
 
-/// Tell the running Rec (app or CLI recorder) to do `cmd`.
+/// Tell the *recording* to do `cmd` (stop, pause, resume, save replay), to the
+/// live recorder — the app or a CLI recording — wherever it is.
 ///
-/// `Ok(true)` = it handled the command, `Ok(false)` = it does not implement it,
-/// `Err` = nothing listens (or the socket is stale: see
-/// [`remove_stale_socket`]).
-pub fn send(cmd: Control) -> std::io::Result<bool> {
-    send_at(&socket_path(), cmd)
+/// `Ok(true)` = handled, `Ok(false)` = not a recorder command, `Err` = nothing
+/// records (or the socket is stale: see [`remove_stale_recorder_socket`]).
+pub fn send_to_recorder(cmd: Control) -> std::io::Result<bool> {
+    send_at(&recorder_socket_path(), cmd)
 }
 
 /// [`send`] to an explicit path (tests).
@@ -251,10 +260,10 @@ pub fn send_at(path: &Path, cmd: Control) -> std::io::Result<bool> {
     }
 }
 
-/// Remove a socket nothing listens on (a crash left it behind), so the next
-/// [`send`] fails fast and the caller can use the pidfile signal instead.
-pub fn remove_stale_socket() {
-    let path = socket_path();
+/// Remove a recorder socket nothing listens on (a crash left it behind), so the
+/// next command fails fast and the caller can use the pidfile signal instead.
+pub fn remove_stale_recorder_socket() {
+    let path = recorder_socket_path();
     if UnixStream::connect(&path).is_err() {
         let _ = std::fs::remove_file(&path);
     }

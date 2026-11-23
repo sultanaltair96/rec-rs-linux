@@ -67,7 +67,7 @@ case "${1:-}" in
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
-        echo "screen-exclude no-sink"
+        echo "screen-exclude no-sink app-cli-control"
         echo "opt-in: long-finalize (10 min)"
         echo "skipped: pattern-webcam scene-webcam"
         exit 0 ;;
@@ -600,6 +600,89 @@ if named long-finalize; then
     unset REC_DEBUG
 fi
 
+# An idle app must not block a CLI recording (upstream refuses only while a
+# recording is live), and `rec-rs stop` must reach whichever one records — here
+# the CLI, from a "second Flatpak instance" whose pidfile pid is foreign.
+if wanted app-cli-control; then
+    if ! command -v sway >/dev/null 2>&1; then
+        echo "SKIP  app-cli-control  (needs sway; the dev image has it)"; skip=$((skip+1))
+    else
+        d="$OUT/app-cli-control"
+        rm -rf "$d"; mkdir -p "$d/rt" "$d/out"; chmod 700 "$d/rt"
+        printf '{"output_dir": "%s", "resolution": "720p", "fps": 30, "mic_enabled": false, "system_audio": false}\n' \
+            "$d/out" >"$d/settings.json"
+        cat >"$d/run.sh" <<INNER
+#!/bin/sh
+export XDG_RUNTIME_DIR="$d/rt" REC_SETTINGS="$d/settings.json"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+sway >"$d/sway.log" 2>&1 &
+sway_pid=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/wayland-1" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+[ -S "\$XDG_RUNTIME_DIR/wayland-1" ] || { kill \$sway_pid; exit 10; }
+export WAYLAND_DISPLAY=wayland-1
+# The app, idle: it holds its control socket, not the recorder socket.
+"$REC" gui --test-pattern >"$d/app.log" 2>&1 &
+app=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/rec-rs-control.sock" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+# A CLI recording starts next to the idle app.
+"$REC" record -q --test-pattern --no-mic -t 30 -o "$d/out/cli.mov" >"$d/cli.log" 2>&1 &
+cli=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/rec-rs-recorder.sock" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+sleep 1.5
+# A second recorder refuses while the CLI records.
+if "$REC" record -q --test-pattern --no-mic -t 1 -o "$d/out/blocked.mov" >"$d/blocked.log" 2>&1; then
+    echo started >"$d/blocked"
+elif grep -q "another recorder is running" "$d/blocked.log"; then
+    echo refused >"$d/blocked"
+else
+    echo failed >"$d/blocked"
+fi
+# The pidfile's pid means nothing here (another PID namespace); stop must use
+# the recorder socket.
+printf '999999\n%s\n' "$d/out/cli.mov" >"$d/rt/rec-rs.pid"
+"$REC" stop >"$d/stop.out" 2>>"$d/cli.log"
+echo "stop rc=\$?" >"$d/stop.rc"
+wait \$cli 2>/dev/null || true
+sleep 0.3
+if kill -0 \$app 2>/dev/null; then echo alive >"$d/app.state"; else echo dead >"$d/app.state"; fi
+# The app still answers a second launch after the CLI's recording ended.
+"$REC" gui >"$d/second.log" 2>&1 || true
+kill -TERM \$app 2>/dev/null || true
+wait \$app
+echo "app exit=\$?" >"$d/exit"
+kill -TERM \$sway_pid 2>/dev/null || true
+sleep 0.5; kill -KILL \$sway_pid 2>/dev/null || true
+exit 0
+INNER
+        chmod +x "$d/run.sh"
+        if command -v dbus-run-session >/dev/null 2>&1; then
+            timeout "$TIMEOUT" dbus-run-session -- "$d/run.sh" >"$d/session.log" 2>&1 || true
+        else
+            timeout "$TIMEOUT" "$d/run.sh" >"$d/session.log" 2>&1 || true
+        fi
+        frames=0
+        [ -f "$d/out/cli.mov" ] &&
+            frames=$(ffprobe -v error -select_streams v -count_frames \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$d/out/cli.mov" 2>/dev/null || echo 0)
+        if [ -f "$d/out/cli.mov" ] && [ "$frames" -ge 60 ] &&
+           "$REC" probe "$d/out/cli.mov" >"$d/probe.txt" 2>&1 &&
+           [ "$(cat "$d/stop.out" 2>/dev/null)" = "$d/out/cli.mov" ] &&
+           grep -qx refused "$d/blocked" 2>/dev/null &&
+           grep -qx alive "$d/app.state" 2>/dev/null &&
+           grep -q "already running" "$d/second.log" 2>/dev/null &&
+           grep -q "app exit=0" "$d/exit" 2>/dev/null; then
+            echo "PASS  app-cli-control  (idle app + CLI recording $frames frames, stop over the socket with a foreign pid, second recorder refused, app survived)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  app-cli-control  (cli '$d/out/cli.mov' $frames frames, blocked '$(cat "$d/blocked" 2>/dev/null)', app '$(cat "$d/app.state" 2>/dev/null)'; see $d/app.log, $d/cli.log, $d/blocked.log, $d/session.log)"
+            fail=$((fail+1))
+        fi
+    fi
+fi
+
 # Cases that belong to later phases (they need a real device, the app or
 # streaming; the synthetic equivalents above cover the writer's side).
 
@@ -889,6 +972,14 @@ app=\$!
 sleep 7
 # A second launch hands over to the running app instead of starting another.
 "$REC" gui >"$d/second.log" 2>&1 || true
+# ...and a CLI recorder refuses while the app is recording (upstream's rule).
+if "$REC" record -q --test-pattern --no-mic -t 1 -o "$d/blocked.mov" >"$d/blocked.log" 2>&1; then
+    echo started >"$d/blocked"
+elif grep -q "another recorder is running" "$d/blocked.log"; then
+    echo refused >"$d/blocked"
+else
+    echo failed >"$d/blocked"
+fi
 # The shell controls reach the app through the pidfile and signals.
 "$REC" pause >"$d/controls.log" 2>&1 && echo paused >>"$d/controls.log" || echo "pause failed" >>"$d/controls.log"
 sleep 1
@@ -926,13 +1017,14 @@ INNER
            "$REC" probe "$file" >"$d/probe.txt" 2>&1 &&
            "$REC" probe "$quit_file" >"$d/probe-quit.txt" 2>&1 &&
            grep -q "already running" "$d/second.log" 2>/dev/null &&
+           grep -qx refused "$d/blocked" 2>/dev/null &&
            grep -q "paused" "$d/controls.log" 2>/dev/null &&
            grep -q "resumed" "$d/controls.log" 2>/dev/null &&
            grep -q "app running" "$d/app.log" 2>/dev/null &&
            grep -q "preview frame" "$d/app.log" 2>/dev/null &&
            grep -q "app exit=0" "$d/exit" 2>/dev/null &&
            [ ! -e "$d/rt/rec-rs.pid" ]; then
-            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, pause/resume/stop via the CLI, clean exit)"
+            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, a second recorder refused, pause/resume/stop via the CLI, clean exit)"
             pass=$((pass+1))
         else
             echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"

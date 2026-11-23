@@ -800,7 +800,7 @@ pub fn run(o: Options) -> Result<Stats> {
     // Flatpak's do): a second launch's `stop`/`pause`/`resume`/`save-replay`
     // reaches this recorder, and a live listener makes a second recorder refuse
     // to start. The signals stay as the fallback for a bare shell.
-    let _control = crate::app::control::serve(std::sync::Arc::new(|cmd| {
+    let _control = crate::app::control::serve_recorder(std::sync::Arc::new(|cmd| {
         use crate::app::control::Control;
         match cmd {
             Control::Stop => {
@@ -1063,13 +1063,13 @@ pub fn signal_running(sig: libc::c_int) -> Result<()> {
 /// crosses PID namespaces, so a second `flatpak run` reaches the recorder),
 /// then, when nothing listens, the pidfile signal as before.
 fn control(cmd: crate::app::control::Control, sig: libc::c_int) -> Result<()> {
-    match crate::app::control::send(cmd) {
+    match crate::app::control::send_to_recorder(cmd) {
         Ok(true) => Ok(()),
         Ok(false) => bail!("the running recorder does not handle `{}`", cmd.name()),
         Err(_) => {
             // No socket, or a stale one from a crash: drop it and use the
             // pidfile signal, which still works outside a namespace.
-            crate::app::control::remove_stale_socket();
+            crate::app::control::remove_stale_recorder_socket();
             signal_running(sig)
         }
     }
@@ -1104,11 +1104,11 @@ pub fn stop_running() -> Result<()> {
     let path = pidfile_path();
     let (pid, file) = running().map_err(|_| anyhow::anyhow!("no recording in progress"))?;
     let pid_live = unsafe { libc::kill(pid, 0) } == 0;
-    match crate::app::control::send(crate::app::control::Control::Stop) {
+    match crate::app::control::send_to_recorder(crate::app::control::Control::Stop) {
         Ok(true) => {}
         Ok(false) => bail!("the running recorder does not handle `stop`"),
         Err(_) => {
-            crate::app::control::remove_stale_socket();
+            crate::app::control::remove_stale_recorder_socket();
             if !pid_live {
                 let _ = std::fs::remove_file(&path);
                 bail!("no recording in progress (stale pidfile removed)");
