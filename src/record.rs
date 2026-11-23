@@ -349,10 +349,23 @@ impl Session {
                     noise,
                 });
                 self.description = synth.describe();
+                // Test hook (scripts/audio/integration.sh): take system audio
+                // from PipeWire instead of the pattern's own beeps.
+                let pattern_audio = match std::env::var("REC_PATTERN_SYSTEM_AUDIO").as_deref() {
+                    Err(_) | Ok("") => false,
+                    Ok("pipewire") => true,
+                    Ok(other) => {
+                        bail!("REC_PATTERN_SYSTEM_AUDIO={other}: only `pipewire` is supported")
+                    }
+                };
                 // Both halves of the pattern share one origin, so flash and
                 // beep stay aligned.
                 if o.system_audio {
-                    self.audio.push(Box::new(synth.audio(true)));
+                    if pattern_audio {
+                        self.audio.push(audio_capture::open_system()?);
+                    } else {
+                        self.audio.push(Box::new(synth.audio(true)));
+                    }
                 }
                 self.video = Some(Box::new(synth));
             }

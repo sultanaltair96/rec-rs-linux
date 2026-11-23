@@ -23,8 +23,11 @@ gstreamer = "0.24"
 gstreamer-app = "0.24"
 # Screen capture (phase 1A): the ScreenCast portal and PipeWire.
 ashpd = "0.12"
-pipewire = "0.10"
+pipewire = { version = "0.10", features = ["v0_3_44"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync"] }
+# Microphone and system audio, and the V4L2/portal camera (phase 1B).
+v4l = "0.14"
+zune-jpeg = { version = "0.4", default-features = false, features = ["std", "x86"] }
 x11rb = { version = "0.14", default-features = false, features = ["randr", "xfixes", "xtest"] }
 # The GPU compositor and scaler (phase 1C). The same wgpu version egui-wgpu
 # 0.36 uses, so the app shares one device with the compositor (phase 1E).

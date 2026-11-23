@@ -210,7 +210,10 @@ fn devices() -> Result<()> {
             "Output latency (system audio is shifted by this): {:.1} ms",
             l * 1000.0
         ),
-        None => println!("Output latency: unavailable (not implemented yet, phase 1B)"),
+        None => println!(
+            "Output latency: unavailable (no PipeWire sink reported a latency; \
+             set --system-audio-offset-ms to shift system audio yourself)"
+        ),
     }
     Ok(())
 }
@@ -222,13 +225,10 @@ fn permissions(request: bool, wait: u64) -> Result<()> {
         Ok(s) => println!("screen recording : {s}"),
         Err(e) => println!("screen recording : unavailable - {e:#}"),
     }
+    println!("microphone       : {}", capture::audio::permission_status());
     println!(
-        "microphone       : unknown (not implemented yet, phase {})",
-        capture::audio::PHASE
-    );
-    println!(
-        "camera           : unknown (not implemented yet, phase {})",
-        capture::camera::PHASE
+        "camera           : {}",
+        capture::camera::permission_status()
     );
     Ok(())
 }

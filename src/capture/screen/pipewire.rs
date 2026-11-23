@@ -32,11 +32,13 @@
 
 use std::io::Cursor;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use pipewire as pw;
@@ -128,6 +130,11 @@ struct StreamData {
     warned_no_bitmap: bool,
     /// The probe leaves the loop as soon as a format arrived.
     quit_on_format: Option<pw::main_loop::MainLoopRc>,
+    /// Leaves the loop when the stream fails, so a dead capture does not sit in
+    /// `run()` until someone stops it.
+    quit_on_error: Option<pw::main_loop::MainLoopRc>,
+    /// Tells the probe's watchdog that the answer arrived (tests reuse it).
+    probe_done: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// A running screen-cast stream.
@@ -136,8 +143,13 @@ pub struct Stream {
     fd: Option<OwnedFd>,
     crop: Option<Rect>,
     opts: CaptureOptions,
-    /// `pw_main_loop` of the capture thread, so `stop` can wake it.
-    main_loop: Arc<AtomicUsize>,
+    /// Asks the capture thread's PipeWire loop to leave `run()`.
+    ///
+    /// A channel rather than a `pw_main_loop *`: the callback runs *on the loop
+    /// thread*, so the loop cannot be freed while it is being asked to quit. A
+    /// stored pointer could: the loop thread frees its `MainLoopRc` when `run()`
+    /// returns, and quitting a freed loop is undefined behaviour.
+    quit: Option<pw::channel::Sender<()>>,
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
@@ -159,7 +171,7 @@ impl Stream {
             fd: Some(fd),
             crop,
             opts,
-            main_loop: Arc::new(AtomicUsize::new(0)),
+            quit: None,
             stop: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
             thread: None,
@@ -181,7 +193,8 @@ impl Stream {
             .ok_or_else(|| anyhow!("the portal's PipeWire remote was already consumed"))?;
         self.stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = sync_channel::<RawFrame>(QUEUE);
-        let main_loop = self.main_loop.clone();
+        let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+        self.quit = Some(quit_tx);
         let stop = self.stop.clone();
         let error = self.error.clone();
         let error2 = error.clone();
@@ -195,7 +208,7 @@ impl Stream {
             .spawn(move || process_frames(rx, sink, crop, opts))
             .context("spawning the screen frame thread")?;
         self.thread = Some(std::thread::spawn(move || {
-            let r = run(node_id, fd, tx, &main_loop, &stop, &error);
+            let r = run(node_id, fd, tx, quit_rx, &stop, &error);
             let _ = worker.join();
             if let Err(e) = r {
                 let mut slot = error2.lock().unwrap();
@@ -206,18 +219,19 @@ impl Stream {
                     *slot = Some(format!("{e:#}"));
                 }
             }
-            main_loop.store(0, Ordering::SeqCst);
+            #[cfg(test)]
+            LOOPS_EXITED.fetch_add(1, Ordering::SeqCst);
         }));
         Ok(())
     }
 
     fn halt(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::SeqCst);
-        // `pw_main_loop_quit` is documented thread safe; it is the only way to
-        // get a `!Send` MainLoop out of `run()` from here.
-        let at = self.main_loop.load(Ordering::SeqCst);
-        if at != 0 {
-            unsafe { pw::sys::pw_main_loop_quit(at as *mut _) };
+        if let Some(quit) = self.quit.take() {
+            // A `send` nobody reads is harmless: the channel owns its pipe, so
+            // this is a plain write, never a pointer into a freed loop. That is
+            // what makes stopping a capture that already died safe.
+            let _ = quit.send(());
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -253,14 +267,29 @@ fn run(
     node_id: u32,
     fd: OwnedFd,
     tx: SyncSender<RawFrame>,
-    main_loop: &Arc<AtomicUsize>,
+    quit: pw::channel::Receiver<()>,
     stop: &Arc<AtomicBool>,
     error: &Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
     pw::init();
     let main = pw::main_loop::MainLoopRc::new(None).context("creating the PipeWire main loop")?;
-    main_loop.store(main.as_raw_ptr() as usize, Ordering::SeqCst);
-    // `stop()` may have run before the loop existed.
+    // The session's stop request leaves the loop through the loop's own event
+    // source, so `halt()` never touches a loop it does not own. A stop that
+    // arrived before this point is already queued and fires on the first
+    // iteration; `stop` is checked too, for the case where the channel is not
+    // the reason.
+    let _quit = quit.attach(main.loop_(), {
+        let main = main.clone();
+        move |_| main.quit()
+    });
+    // Test hook: leave `run()` with the loop created and immediately freed, so
+    // a test can stop a capture whose loop is already gone without waiting for
+    // a compositor to drop a stream at the right moment. `cfg(test)` removes it
+    // from every real build.
+    #[cfg(test)]
+    if EXIT_BEFORE_RUN.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
     if stop.load(Ordering::SeqCst) {
         main.quit();
     }
@@ -278,6 +307,8 @@ fn run(
         error: error.clone(),
         warned_no_bitmap: false,
         quit_on_format: None,
+        quit_on_error: Some(main.clone()),
+        probe_done: None,
     };
     let listener = stream
         .add_local_listener_with_user_data(data)
@@ -286,6 +317,10 @@ fn run(
         .state_changed(|_, data, _, new| {
             if let pw::stream::StreamState::Error(e) = new {
                 set_error(&data.error, format!("PipeWire stream error: {e}"));
+                // A dead stream is not worth waiting in `run()` for.
+                if let Some(main) = &data.quit_on_error {
+                    main.quit();
+                }
             }
         })
         .register()
@@ -646,6 +681,14 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
     let size = Arc::new(Mutex::new(None::<(usize, usize)>));
     let error = Arc::new(Mutex::new(None::<String>));
     let (tx, _rx) = sync_channel(1);
+    // The watchdog leaves the loop through the loop's own event source, the
+    // same way `Stream::halt` does: no thread ever dereferences the loop.
+    let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+    let _quit = quit_rx.attach(main.loop_(), {
+        let main = main.clone();
+        move |_| main.quit()
+    });
+    let (probe_done, done_rx) = std::sync::mpsc::channel::<()>();
     let data = StreamData {
         format: VideoInfoRaw::new(),
         tx,
@@ -654,6 +697,8 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
         error: error.clone(),
         warned_no_bitmap: false,
         quit_on_format: Some(main.clone()),
+        quit_on_error: Some(main.clone()),
+        probe_done: Some(probe_done),
     };
     let size2 = size.clone();
     let error2 = error.clone();
@@ -665,13 +710,25 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
             }
             let s = data.format.size();
             *size2.lock().unwrap() = Some((s.width as usize, s.height as usize));
+            // Tell the watchdog the answer is in, then leave the loop.
+            if let Some(done) = data.probe_done.take() {
+                let _ = done.send(());
+            }
             if let Some(main) = data.quit_on_format.take() {
                 main.quit();
             }
         })
-        .state_changed(move |_, _, _, new| {
+        .state_changed(move |_, data, _, new| {
             if let pw::stream::StreamState::Error(e) = new {
                 set_error(&error2, format!("PipeWire stream error: {e}"));
+                // The watchdog must not keep waiting for a format that will
+                // never come.
+                if let Some(done) = data.probe_done.take() {
+                    let _ = done.send(());
+                }
+                if let Some(main) = &data.quit_on_error {
+                    main.quit();
+                }
             }
         })
         .register()
@@ -679,25 +736,17 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
     connect_stream(&stream, node_id)?;
     // A compositor that never offers a format must not hang the recorder
     // before it even starts.
-    let raw = main.as_raw_ptr() as usize;
-    let finished = Arc::new(AtomicBool::new(false));
-    let watcher_done = finished.clone();
     let watcher = std::thread::spawn(move || {
-        let deadline = Instant::now() + PROBE_TIMEOUT;
-        // Stop as soon as the format arrived (or the deadline passed): a
-        // watcher that kept sleeping would hold the whole recorder for the
-        // timeout even though the answer is already in.
-        while !watcher_done.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if !watcher_done.load(Ordering::SeqCst) {
-            // `pw_main_loop_quit` is documented thread safe, and a raw pointer
-            // is the only `Send` handle to a `!Send` main loop.
-            unsafe { pw::sys::pw_main_loop_quit(raw as *mut _) };
+        // The loop's callbacks signal completion; on the timeout the watchdog
+        // wakes the loop through the channel instead. A message that nobody
+        // reads (the loop already left `run()`) is a no-op on a pipe the
+        // channel owns.
+        if done_rx.recv_timeout(PROBE_TIMEOUT).is_err() {
+            let _ = quit_tx.send(());
         }
     });
     main.run();
-    finished.store(true, Ordering::SeqCst);
+    drop(_quit);
     drop(listener);
     let _ = stream.disconnect();
     drop(stream);
@@ -764,9 +813,24 @@ fn process_frames(
     }
 }
 
+/// How many capture loops have left `run()`, so a test can stop a stream
+/// strictly *after* its loop was freed (the ordering that used to be unsafe).
+#[cfg(test)]
+static LOOPS_EXITED: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes the next `run()` return as soon as its loop exists (see the tests).
+#[cfg(test)]
+static EXIT_BEFORE_RUN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn loops_exited() -> usize {
+    LOOPS_EXITED.load(Ordering::SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn a_frame_timestamp_must_be_on_our_clock() {
@@ -802,5 +866,151 @@ mod tests {
         for pod in &pods {
             assert!(Pod::from_bytes(pod).is_some());
         }
+    }
+
+    /// Stop a capture whose PipeWire loop is already gone.
+    ///
+    /// The hook makes the capture thread leave `run()` the instant its loop
+    /// exists, so the loop is created and freed before `halt` is called: the
+    /// ordering that used to call `pw_main_loop_quit` on freed memory. This
+    /// needs no portal, so it runs on every `cargo test`.
+    #[test]
+    fn stopping_a_capture_whose_loop_already_exited_is_safe() {
+        // A regular file is not a PipeWire socket; with the hook returning
+        // first, it is never even used as one.
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let sink: FrameSink = Arc::new(|_| {});
+        for i in 0..50 {
+            let before = loops_exited();
+            let mut stream = Stream::new(
+                1,
+                fd.try_clone().unwrap(),
+                None,
+                CaptureOptions::default(),
+                format!("dead-loop-{i}"),
+            );
+            EXIT_BEFORE_RUN.store(true, Ordering::SeqCst);
+            stream.begin(sink.clone()).unwrap();
+            // Wait until the thread has left `run()` *and dropped the loop*, so
+            // the ordering is fixed rather than raced.
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while loops_exited() == before && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                loops_exited() > before,
+                "the capture loop never left run() (cycle {i})"
+            );
+            // Stopping a capture that is already gone is a no-op: not a hang,
+            // and not a quit through a pointer into freed memory.
+            stream
+                .halt()
+                .unwrap_or_else(|e| panic!("stop after the loop exited failed: {e:#}"));
+        }
+    }
+
+    /// A live portal session, or `None` when the tests run without one (the
+    /// normal case: this needs `scripts/screen/headless.sh`).
+    fn live_portal() -> Option<super::super::portal::Prepared> {
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS")?;
+        super::super::portal::prepare(
+            super::super::Want::Monitor,
+            CaptureOptions::default(),
+            std::time::Duration::from_secs(20),
+        )
+        .ok()
+    }
+
+    /// 200 start/stop cycles against real screen-cast nodes, half of them with
+    /// streams that die on their own before `stop` runs.
+    ///
+    /// The second half is the reported bug: the loop thread leaves `run()` on a
+    /// stream error and frees its `MainLoopRc`, and only then is the capture
+    /// stopped. A quit through a stored pointer would run on freed memory; the
+    /// channel makes it a write into a pipe nobody reads. The test waits for the
+    /// loop to be gone first, so the order is fixed, not hoped for.
+    ///
+    /// A closed portal session is what produces the error deterministically:
+    /// its node disappears, PipeWire answers "no target node available" within
+    /// milliseconds, and the stream's error callback leaves the loop.
+    #[test]
+    fn two_hundred_start_stop_cycles_survive_dying_streams() {
+        let Some(prepared) = live_portal() else {
+            return;
+        };
+        let sink: FrameSink = Arc::new(|_| {});
+        let mut cycles = 0;
+        // 1) A working node: the loop runs until `halt` asks it to leave.
+        for i in 0..100 {
+            let fd = prepared.dup_fd().unwrap();
+            let mut stream = Stream::new(
+                prepared.node_id,
+                fd,
+                None,
+                CaptureOptions::default(),
+                format!("stress-live-{i}"),
+            );
+            stream.begin(sink.clone()).unwrap();
+            // Vary how long the loop has been running when the stop arrives.
+            match i % 4 {
+                1 => std::thread::sleep(std::time::Duration::from_millis(2)),
+                2 => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {}
+            }
+            let started = Instant::now();
+            stream
+                .halt()
+                .unwrap_or_else(|e| panic!("a healthy stream's stop failed at cycle {i}: {e:#}"));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "halt {i} hung for {:?}",
+                started.elapsed()
+            );
+            cycles += 1;
+        }
+        // 2) Close the portal session: its node goes away, so every stream on
+        // it errors out, the loop leaves on its own, and `halt` runs after the
+        // loop is gone - the ordering that used to be a use-after-free.
+        let dead_node = prepared.node_id;
+        let dead_fd = prepared.dup_fd().unwrap();
+        prepared.close();
+        for i in 0..100 {
+            let fd = dead_fd.try_clone().unwrap();
+            let mut stream = Stream::new(
+                dead_node,
+                fd,
+                None,
+                CaptureOptions::default(),
+                format!("stress-dead-{i}"),
+            );
+            stream.begin(sink.clone()).unwrap();
+            let target = loops_exited() + 1;
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while loops_exited() < target && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                loops_exited() >= target,
+                "the dead stream's loop never left run() (cycle {i})"
+            );
+            let started = Instant::now();
+            // The dead node's error is reported (not swallowed), and stopping
+            // returns instead of hanging or touching the freed loop.
+            let err = stream
+                .halt()
+                .expect_err("a stream on a closed session reports its error");
+            assert!(err.to_string().contains("PipeWire"), "cycle {i}: {err:#}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "halt {i} hung for {:?}",
+                started.elapsed()
+            );
+            cycles += 1;
+        }
+        assert_eq!(cycles, 200, "both halves run their 100 cycles");
+        eprintln!(
+            "screen capture stress: {cycles} start/stop cycles, {} loops exited, no crash",
+            loops_exited()
+        );
     }
 }

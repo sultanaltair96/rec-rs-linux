@@ -37,8 +37,11 @@ pub struct Caps {
     pub stream: bool,
 }
 
-/// Today's abilities: the app still has to start cleanly on a build where every
-/// backend after the writer is a stub, which is exactly what these say.
+/// Today's abilities. Cameras and microphones are usable (phase 1B), but the
+/// *session* exposes neither a camera name nor a live overlay/scene switch
+/// yet: the writer wires the camera into its emission loop and exposes those
+/// in phase 1G, so until then the app's camera scene records the screen and
+/// the overlay controls say which phase owes them.
 pub fn caps() -> Caps {
     Caps {
         camera: false,
@@ -52,7 +55,10 @@ pub fn caps() -> Caps {
 /// The phase that provides an app feature, for the UI's "not yet" hints.
 pub fn phase_note(feature: &str) -> String {
     match feature {
-        "camera" => "camera capture is not implemented yet (phase 1B)".into(),
+        "camera" => {
+            "the writer wires the camera into the recording in phase 1G (the camera itself is phase 1B)"
+                .into()
+        }
         // Spelled out so a rename in `gpu` cannot break the app's hints.
         "pip" | "scene" => {
             "the camera overlay and live scene switching need the compositor (phase 1C)".into()
@@ -287,7 +293,7 @@ mod tests {
         let pip = PipSpec::default();
         let note = phase_note("pip");
         assert!(note.contains("compositor"), "{note}");
-        assert!(phase_note("camera").contains("phase 1B"));
+        assert!(phase_note("camera").contains("phase 1G"));
         assert!(phase_note("stream").contains("phase 1D"));
         assert_eq!(pip, PipSpec::default());
         assert!(!caps().pip && !caps().camera && !caps().replay && !caps().stream);
