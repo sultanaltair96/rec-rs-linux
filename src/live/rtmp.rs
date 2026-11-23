@@ -851,6 +851,11 @@ struct Shared {
     pending_key: Option<(f64, Tag)>,
     /// When the held keyframe arrived, so a stream without audio still starts.
     pending_key_at: Option<Instant>,
+    /// Video that arrived after the held keyframe, and audio from the same
+    /// wait. They are queued, never dropped: a frame after the first keyframe
+    /// belongs to the stream, and dropping it would corrupt the GOP it is in.
+    pending_after: Vec<(f64, Tag)>,
+    pending_audio: Vec<(f64, Tag)>,
     /// Last timestamp sent per tag type (8 audio, 9 video): a server discards
     /// a sample older than the track's position ("received too late"), so a
     /// tag that would go back in time is dropped, not written.
@@ -862,11 +867,14 @@ struct Shared {
     /// tracks, so audio older than the video it already wrote is dropped
     /// ("received too late", which MediaMTX logs). The two encoders are
     /// separate pipelines and the audio one lags under load: video is dropped
-    /// rather than queued more than `MAX_AV_SKEW_MS` ahead of the audio, so the
-    /// tracks stay in step at the server (a stutter, not a drifting track).
+    /// rather than sent when the picture is more than `MAX_AV_SKEW_MS` ahead of
+    /// it, so the tracks stay in step at the server. Held, never dropped: an
+    /// encoded H.264 frame is only useful with the frames after it, so the only
+    /// thing this output ever sheds is a whole GOP (the congestion rule).
     newest_audio: Option<u32>,
-    /// Video tags dropped because the picture was too far ahead of the sound.
-    ahead_drops: u64,
+    /// When the newest audio tag arrived, so a stalled audio encoder cannot
+    /// hold the picture back forever.
+    newest_audio_at: Option<Instant>,
     /// Host time of the stream's start (the first audio packet next to the
     /// first keyframe), set once per connection by `maybe_start`.
     t0: Option<f64>,
@@ -892,6 +900,14 @@ const MAX_QUEUE_MS: u32 = 3000;
 /// One AAC-LC packet at 48 kHz, in seconds: how close the first audio packet
 /// has to be to the first keyframe to start the stream on it.
 const AAC_FRAME_SECS: f64 = 1024.0 / 48_000.0;
+
+/// How long the first keyframe waits for audio next to it before the stream
+/// starts on the keyframe alone (a source whose sound simply starts later).
+const START_WAIT: Duration = Duration::from_millis(300);
+
+/// Frames held while the first keyframe waits: bounded, so a source that never
+/// produces audio cannot grow the queue.
+const MAX_PENDING: usize = 120;
 
 /// How far the picture may run ahead of the sound before video is dropped
 /// instead of queued. A server writes one timestamp order across both tracks;
@@ -927,6 +943,17 @@ impl RtmpOutput {
             stop,
             thread: Some(thread),
         })
+    }
+}
+
+/// Split a batch into what can go out now and video that must wait for the
+/// sound. `ceiling` is the newest audio timestamp plus the allowed skew, or
+/// None when the audio is not moving. Audio always goes out; only *video* is
+/// held, and held in time order, so it goes out later rather than being lost.
+fn hold_for_audio(tags: Vec<Tag>, ceiling: Option<u32>) -> (Vec<Tag>, Vec<Tag>) {
+    match ceiling {
+        None => (tags, vec![]),
+        Some(c) => tags.into_iter().partition(|t| t.typ == 8 || t.ts <= c),
     }
 }
 
@@ -969,10 +996,13 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
             s.want_key = true;
             s.last_ts = [None; 2];
             s.newest_audio = None;
+            s.newest_audio_at = None;
             s.t0 = None;
             s.first_audio_pts = None;
             s.pending_key = None;
             s.pending_key_at = None;
+            s.pending_after.clear();
+            s.pending_audio.clear();
         }
         let mut headers_sent = false;
         let result: Result<()> = (|| {
@@ -997,6 +1027,29 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 // their order) — a server discards a sample older than its
                 // track (MediaMTX: "received too late, discarding").
                 tags.sort_by_key(|t| t.ts);
+                // The sound lags the picture at start (and under load) and a
+                // server writes one timestamp order across both tracks: the
+                // picture waits for the sound rather than being dropped. A
+                // dropped H.264 frame corrupts the rest of its GOP, so nothing
+                // short of a whole GOP is ever shed (the congestion rule in
+                // `packet`).
+                let ceiling = {
+                    let audio = lock.lock().unwrap();
+                    match (audio.newest_audio, audio.newest_audio_at) {
+                        (Some(a), Some(at)) if at.elapsed() < Duration::from_millis(500) => {
+                            Some(a + MAX_AV_SKEW_MS)
+                        }
+                        _ => None,
+                    }
+                };
+                let (tags, held) = hold_for_audio(tags, ceiling);
+                if !held.is_empty() {
+                    let mut s = lock.lock().unwrap();
+                    // Put them back in time order ahead of anything newer.
+                    let mut held = held;
+                    held.extend(s.queue.drain(..));
+                    s.queue = held.into();
+                }
                 if !headers_sent && let Some((hevc, record)) = &formats {
                     let meta = command(&[
                         Amf::Str("@setDataFrame".into()),
@@ -1032,7 +1085,23 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                         let mut s = lock.lock().unwrap();
                         let late = s.last_ts[slot].is_some_and(|last| t.ts < last);
                         if late {
+                            if std::env::var_os("REC_DEBUG").is_some() {
+                                eprintln!(
+                                    "rec: debug: rtmp: late {} tag at {} ms (last {})",
+                                    if t.typ == 9 { "video" } else { "audio" },
+                                    t.ts,
+                                    s.last_ts[slot].unwrap_or(0)
+                                );
+                            }
                             s.late_drops += 1;
+                            // A late *video* frame means the GOP it belongs to
+                            // is out of order: shed the rest of that GOP too,
+                            // never just the one frame (the frames after it
+                            // would not decode).
+                            if t.typ == 9 {
+                                s.queue.retain(|q| q.typ != 9);
+                                s.skip_to_key = true;
+                            }
                         } else {
                             s.last_ts[slot] = Some(t.ts);
                         }
@@ -1114,29 +1183,47 @@ fn maybe_start(shared: &Arc<(Mutex<Shared>, Condvar)>, latest_audio: Option<f64>
         return;
     };
     let audio = latest_audio.or(s.first_audio_pts);
-    let ready = match audio {
-        Some(a) => (a - key_pts).abs() <= AAC_FRAME_SECS + 0.01,
-        None => s
-            .pending_key_at
-            .is_some_and(|t| t.elapsed() > Duration::from_millis(300)),
-    };
-    if !ready {
+    let aligned = audio.is_some_and(|a| (a - key_pts).abs() <= AAC_FRAME_SECS + 0.01);
+    let timed_out = s.pending_key_at.is_some_and(|t| t.elapsed() > START_WAIT);
+    if !aligned && !timed_out {
         return;
     }
-    let t0 = audio.map_or(key_pts, |a| a.min(key_pts));
+    // Aligned: both tracks start together. Timed out: the sound starts later
+    // than the picture, so the timeline starts on the keyframe and the audio
+    // joins it at its own time.
+    let t0 = if aligned {
+        audio.map_or(key_pts, |a| a.min(key_pts))
+    } else {
+        key_pts
+    };
     let (key_pts, mut key) = s.pending_key.take().unwrap();
     key.ts = ((key_pts - t0) * 1000.0).round().max(0.0) as u32;
     s.pending_key_at = None;
     s.started = Some(Instant::now());
     s.audio_pts = audio;
     s.t0 = Some(t0);
+    // The keyframe first, then everything that waited, stamped from the
+    // timeline.
+    let after = std::mem::take(&mut s.pending_after);
+    let queued_audio = std::mem::take(&mut s.pending_audio);
+    s.queue.push_back(key);
+    // The keyframe that just started the stream is the keyframe the "drop
+    // until the next keyframe" state was waiting for: everything after it goes
+    // out (dropping it would corrupt the GOP).
+    s.skip_to_key = false;
+    for (pts, mut tag) in after.into_iter().chain(queued_audio) {
+        if pts < t0 - 1e-9 {
+            continue; // older than the stream
+        }
+        tag.ts = ((pts - t0) * 1000.0).round().max(0.0) as u32;
+        s.queue.push_back(tag);
+    }
     if std::env::var_os("REC_DEBUG").is_some() {
         eprintln!(
             "rec: debug: rtmp: stream starts with the keyframe {:+.1} ms from the audio",
             (key_pts - t0) * 1000.0
         );
     }
-    s.queue.push_back(key);
     cv.notify_one();
 }
 
@@ -1169,12 +1256,9 @@ impl Output for RtmpOutput {
                     return;
                 }
                 if s.t0.is_none() {
-                    if !p.keyframe {
-                        return;
-                    }
-                    // Held until an audio packet next to it arrives (see
-                    // `pending_key`); `maybe_start` takes it from here.
-                    if s.pending_key.is_none() {
+                    if p.keyframe && s.pending_key.is_none() {
+                        // Held until an audio packet next to it arrives (see
+                        // `pending_key`); `maybe_start` takes it from here.
                         s.pending_key = Some((
                             p.pts,
                             Tag {
@@ -1184,6 +1268,18 @@ impl Output for RtmpOutput {
                             },
                         ));
                         s.pending_key_at = Some(Instant::now());
+                    } else if s.pending_key.is_some() && s.pending_after.len() < MAX_PENDING {
+                        // A frame after the held keyframe belongs to the
+                        // stream: it waits with the keyframe instead of being
+                        // dropped (a dropped frame corrupts its whole GOP).
+                        s.pending_after.push((
+                            p.pts,
+                            Tag {
+                                typ: 9,
+                                ts: 0,
+                                body: Arc::new(flv_video(hevc, p.keyframe, &p.data)),
+                            },
+                        ));
                     }
                     cv.notify_one();
                     return;
@@ -1199,20 +1295,15 @@ impl Output for RtmpOutput {
                     s.skip_to_key = false;
                 }
                 let ts = ((p.pts - s.t0.unwrap()) * 1000.0).round().max(0.0) as u32;
-                // The picture must not run far ahead of the sound: a server's
-                // recorder writes one timestamp order and discards audio that
-                // is older than the video it already has.
-                if let Some(audio) = s.newest_audio
-                    && ts > audio + MAX_AV_SKEW_MS
-                {
-                    s.ahead_drops += 1;
-                    s.dropped += 1;
-                    return;
-                }
                 // Congestion: the queue spans too much time.
                 if let (Some(first), true) = (s.queue.front().map(|t| t.ts), !p.keyframe)
                     && ts.saturating_sub(first) > MAX_QUEUE_MS
                 {
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!(
+                            "rec: debug: rtmp: congestion at {ts} ms (queue front {first}): shedding the GOP"
+                        );
+                    }
                     s.queue.retain(|t| t.typ != 9);
                     s.skip_to_key = true;
                     s.dropped += 1;
@@ -1226,9 +1317,19 @@ impl Output for RtmpOutput {
             }
             PacketKind::Audio(AudioCodec::Aac) => {
                 if s.t0.is_none() {
-                    // Before the timeline exists, audio only feeds the start
-                    // decision (`maybe_start`, on the next tag).
+                    // Before the timeline exists, audio feeds the start
+                    // decision and waits with the keyframe.
                     s.first_audio_pts = s.first_audio_pts.or(Some(p.pts));
+                    if s.pending_key.is_some() && s.pending_audio.len() < MAX_PENDING {
+                        s.pending_audio.push((
+                            p.pts,
+                            Tag {
+                                typ: 8,
+                                ts: 0,
+                                body: Arc::new(flv_audio(&p.data)),
+                            },
+                        ));
+                    }
                     drop(s);
                     maybe_start(&self.shared, Some(p.pts));
                     cv.notify_one();
@@ -1243,6 +1344,7 @@ impl Output for RtmpOutput {
                     return;
                 }
                 s.newest_audio = Some(s.newest_audio.map_or(ts, |a| a.max(ts)));
+                s.newest_audio_at = Some(Instant::now());
                 s.audio_pts = Some(p.pts);
                 s.queue.push_back(Tag {
                     typ: 8,
@@ -1377,6 +1479,164 @@ mod tests {
         assert!(!hevc_allowed(&[h264_only]));
         let quiet = obj(&[("fpad", Amf::Bool(false))]);
         assert!(hevc_allowed(&[Amf::Str("_result".into()), quiet]));
+    }
+
+    /// An output with no connection: `packet` only queues, so the start burst
+    /// can be fed to it directly.
+    fn offline() -> RtmpOutput {
+        let shared = Arc::new((
+            Mutex::new(Shared {
+                state: "offline".into(),
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
+        RtmpOutput {
+            name: "test".into(),
+            shared,
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+
+    fn video_packet(pts: f64, key: bool) -> EncodedPacket {
+        EncodedPacket {
+            pts,
+            dts: pts,
+            keyframe: key,
+            data: Arc::from(vec![0u8; 64]),
+            kind: PacketKind::Video(crate::media_types::VideoCodec::H264),
+        }
+    }
+
+    fn audio_packet(pts: f64) -> EncodedPacket {
+        EncodedPacket {
+            pts,
+            dts: pts,
+            keyframe: true,
+            data: Arc::from(vec![0u8; 32]),
+            kind: PacketKind::Audio(AudioCodec::Aac),
+        }
+    }
+
+    fn formats() -> Formats {
+        Formats {
+            hevc: false,
+            record: vec![1, 0x64, 0, 0x28, 0xff, 0xe1, 0, 0, 0],
+            param_sets: vec![vec![0x67, 0x64, 0, 0x28]],
+            aac_cookie: vec![0x11, 0x90],
+            width: 1280,
+            height: 720,
+            ..Default::default()
+        }
+    }
+
+    /// The start burst with four destinations on one encode: the picture runs
+    /// ~150 ms ahead of the sound while the audio encoder warms up. Nothing may
+    /// be dropped — an encoded H.264 frame is only useful with the frames after
+    /// it, so a mid-GOP drop corrupts the picture up to the next keyframe. The
+    /// start waits for audio, and frames that run ahead are *held*, then sent.
+    #[test]
+    fn start_burst_never_drops_frames() {
+        let mut out = offline();
+        let f = formats();
+        // One keyframe at 10.000, then 60 frames (2 s at 30 fps); the audio
+        // starts 150 ms later and trails the picture by 150 ms throughout.
+        out.packet(&video_packet(10.0, true), &f);
+        let mut audio_done = 0;
+        // Frames 1..60 after the keyframe (frame 30 is the next keyframe).
+        for i in 1..=60 {
+            let t = 10.0 + i as f64 / 30.0;
+            out.packet(&video_packet(t, i == 30), &f);
+            // Audio is queued in bursts, always behind the video.
+            while audio_done as f64 * 0.021_333 + 10.15 <= t + 0.15 {
+                out.packet(&audio_packet(10.15 + audio_done as f64 * 0.021_333), &f);
+                audio_done += 1;
+            }
+        }
+        {
+            let s = out.shared.0.lock().unwrap();
+            assert_eq!(s.dropped, 0, "no frame may be dropped at start");
+            assert!(!s.skip_to_key, "the stream keeps flowing");
+            // The keyframe waits and every frame after it waits with it.
+            assert!(s.pending_key.is_some(), "the start waits for audio");
+            assert_eq!(
+                s.pending_after.len(),
+                60,
+                "all 60 frames after the keyframe are held, not dropped"
+            );
+        }
+        // A source whose sound never comes close to the keyframe still starts,
+        // on the keyframe, and every held frame goes out.
+        std::thread::sleep(START_WAIT + Duration::from_millis(20));
+        out.packet(&audio_packet(10.3), &f);
+        let s = out.shared.0.lock().unwrap();
+        let queued_video = s.queue.iter().filter(|t| t.typ == 9).count();
+        assert_eq!(queued_video, 61, "61 frames queued after the start");
+        assert_eq!(s.dropped, 0, "still nothing dropped");
+        // The keyframe starts the timeline at 0 and the frames follow at the
+        // frame grid.
+        let key = s.queue.iter().find(|t| t.typ == 9).unwrap().ts;
+        assert_eq!(key, 0, "the keyframe starts at 0");
+        let spans: Vec<u32> = s
+            .queue
+            .iter()
+            .filter(|t| t.typ == 9)
+            .map(|t| t.ts)
+            .collect();
+        assert!(
+            spans.windows(2).all(|w| w[1] > w[0]),
+            "frames stay in order: {spans:?}"
+        );
+        assert_eq!(spans.last(), Some(&2000), "2 s of frames");
+        assert!(
+            !s.skip_to_key,
+            "the start clears the drop-until-keyframe state"
+        );
+        drop(s);
+        // Frames after the start go out too (the regression this test is for:
+        // `skip_to_key` stayed set after the held keyframe started the stream,
+        // so the next ~1 s of frames was dropped mid-GOP).
+        for i in 61..=64 {
+            out.packet(&video_packet(10.0 + i as f64 / 30.0, false), &f);
+        }
+        let s = out.shared.0.lock().unwrap();
+        assert_eq!(s.dropped, 0, "still nothing dropped");
+        assert_eq!(
+            s.queue.iter().filter(|t| t.typ == 9).count(),
+            65,
+            "every frame after the start is queued"
+        );
+    }
+
+    /// Holding is what keeps the tracks in step: video beyond the audio's reach
+    /// goes back into the queue in time order, audio always goes out.
+    #[test]
+    fn the_picture_waits_for_the_sound() {
+        let tag = |typ: u8, ts: u32| Tag {
+            typ,
+            ts,
+            body: Arc::new(vec![]),
+        };
+        let tags = vec![
+            tag(8, 100),
+            tag(9, 120),
+            tag(8, 130),
+            tag(9, 150),
+            tag(9, 200),
+        ];
+        let (send, held) = hold_for_audio(tags, Some(130));
+        assert_eq!(
+            send.iter().map(|t| (t.typ, t.ts)).collect::<Vec<_>>(),
+            vec![(8, 100), (9, 120), (8, 130)]
+        );
+        assert_eq!(
+            held.iter().map(|t| (t.typ, t.ts)).collect::<Vec<_>>(),
+            vec![(9, 150), (9, 200)]
+        );
+        // With the audio stalled, nothing is held back forever.
+        let (send, held) = hold_for_audio(vec![tag(9, 900)], None);
+        assert_eq!((send.len(), held.len()), (1, 0));
     }
 
     #[test]
