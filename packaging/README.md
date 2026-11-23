@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 9.6 MB bundle (runtime shared) | 106 MB AppImage (GStreamer inside) |
+| Size | 9.5 MB bundle (runtime shared) | 101 MiB AppImage (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -178,7 +178,7 @@ opens the window (Xvfb + the runtime's Mesa, still up after 8 s). Result:
 `avenc_prores_ks`) and `probe` reporting `video h264 1920x1080 @ 60.000 fps` /
 HEVC.
 
-Bundle size: **3.5 MB** (`rec.flatpak`) — the runtime is shared. The manifest
+Bundle size: **9.5 MB** (`rec.flatpak`, 9,589,680 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -303,7 +303,7 @@ runtime's Mesa, opens its window in the same container — the difference is the
 host's rendering stack, not the package. A real Fedora desktop with a GPU
 driver is check 8 in the list below.
 
-Sizes: AppImage **101.3 MiB** (106,211,832 bytes), `.zsync` 178 KiB. Most of it
+Sizes: AppImage **101.3 MiB** (106,228,216 bytes), `.zsync` 178 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu and the embedded Inter fonts. That is
 the price of AAC, ProRes and the app in a single file; the Flatpak gets the
