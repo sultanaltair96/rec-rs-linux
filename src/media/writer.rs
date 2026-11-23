@@ -1572,7 +1572,18 @@ impl Writer {
         if std::env::var("REC_DEFRAG_OFF").is_ok_and(|v| v != "0") {
             return Ok(self.stats.clone());
         }
-        match mp4::finalize(&sink.path, &sink.layout, crash, keep.as_deref()) {
+        // The take's end on the output timeline: the last processed slot
+        // includes the slots the encoder refused, so the finalise can hold the
+        // last written frame to the end instead of leaving the video track
+        // short.
+        let video_end = self.out_slot as f64 / self.spec.fps as f64;
+        match mp4::finalize(
+            &sink.path,
+            &sink.layout,
+            crash,
+            keep.as_deref(),
+            Some(video_end),
+        ) {
             Ok(report) => {
                 self.stats.finalize_millis = report.millis;
                 self.stats.fragments = report.fragments;
