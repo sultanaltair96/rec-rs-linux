@@ -123,9 +123,15 @@ fi
 # headless, so the chooser is a two-line script: it reads the options and picks
 # the headless output. (Its "whitelisted" choosers are dmenu-likes, which would
 # need a terminal or a bar.)
+# Every invocation is logged, so a test can prove that the picker really ran
+# again (a stored restore token would make the portal skip it).
+SCREEN_CHOOSER_LOG="$LOG/chooser.log"
+: >"$SCREEN_CHOOSER_LOG"
+export SCREEN_CHOOSER_LOG
 cat >"$CONFIG/choose.sh" <<'EOF'
 #!/bin/sh
 # stdin: one "Monitor: NAME" line per output. Answer with the headless one.
+echo picked >>"$SCREEN_CHOOSER_LOG"
 while IFS= read -r line; do
     case "$line" in
         *HEADLESS*) printf '%s\n' "$line"; exit 0 ;;
