@@ -249,9 +249,45 @@ impl Drop for TestCamera {
     }
 }
 
+/// A source that opens and runs but never delivers a buffer, like a device
+/// that is connected but dead. `REC_SYNTH_MIC=silent` selects it, so the
+/// writer's "a requested source never delivered" path can be tested.
+pub struct SilentMic {
+    running: bool,
+}
+
+impl AudioSource for SilentMic {
+    fn kind(&self) -> AudioKind {
+        AudioKind::Mic
+    }
+
+    fn describe(&self) -> String {
+        "silent microphone (never delivers)".into()
+    }
+
+    fn start(&mut self, _sink: AudioSink) -> Result<()> {
+        self.running = true;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.running = false;
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        self.running
+    }
+}
+
 /// The synthetic microphone, when `REC_SYNTH_MIC` is set (tests only).
+/// `REC_SYNTH_MIC=silent` gives a device that never delivers.
 pub fn mic_from_env() -> Option<Box<dyn AudioSource>> {
-    std::env::var_os("REC_SYNTH_MIC").map(|_| Box::new(MicBeep::new()) as Box<dyn AudioSource>)
+    let value = std::env::var("REC_SYNTH_MIC").ok()?;
+    if value == "silent" {
+        return Some(Box::new(SilentMic { running: false }));
+    }
+    Some(Box::new(MicBeep::new()))
 }
 
 /// The synthetic camera, when `REC_SYNTH_CAM` is set (tests only).

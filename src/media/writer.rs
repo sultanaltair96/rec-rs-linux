@@ -802,10 +802,13 @@ impl Writer {
             AudioKind::System => Target::System,
             AudioKind::Mic => Target::Mic,
         };
-        self.write_track(target, out_s, &part);
-        match kind {
-            AudioKind::System => self.stats.audio_sys_buffers += 1,
-            AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+        if self.write_track(target, out_s, &part) {
+            match kind {
+                AudioKind::System => self.stats.audio_sys_buffers += 1,
+                AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+            }
+        } else {
+            self.stats.audio_drops += 1;
         }
     }
 
@@ -822,8 +825,11 @@ impl Writer {
             overruns = m.overruns;
         }
         for (t, frames) in chunks {
-            self.write_track(Target::Mix, t, &frames);
-            self.stats.audio_mix_buffers += 1;
+            if self.write_track(Target::Mix, t, &frames) {
+                self.stats.audio_mix_buffers += 1;
+            } else {
+                self.stats.audio_drops += 1;
+            }
         }
         if self.mixer.is_some() {
             self.stats.audio_clipped_samples = clipped;
@@ -910,16 +916,18 @@ impl Writer {
 
     /// Write 48 kHz stereo frames to the track that holds `target`, keeping it
     /// on the output timeline (a gap becomes silence, an overlap is trimmed).
-    fn write_track(&mut self, target: Target, pts: f64, frames: &[[f32; 2]]) {
+    /// Returns true when a buffer was written; the caller counts a track that
+    /// never received one (qtmux only writes a trak once it has a sample).
+    fn write_track(&mut self, target: Target, pts: f64, frames: &[[f32; 2]]) -> bool {
         if frames.is_empty() {
-            return;
+            return false;
         }
         let limit_secs = self.limit.map(|l| l as f64 / self.spec.fps as f64);
         let Some(sink) = self.sink.as_mut() else {
-            return;
+            return false;
         };
         let Some(track) = sink.tracks.iter_mut().find(|t| t.target == target) else {
-            return;
+            return false;
         };
         let rate = mixer::RATE;
         // The track continues from the last buffer written: fill a gap (late
@@ -937,8 +945,7 @@ impl Writer {
             // cannot stretch a 2 s recording.
             self.stats.audio_resyncs += 1;
             if gap > MAX_RESYNC_SECS {
-                self.stats.audio_drops += 1;
-                return;
+                return false;
             }
             start = pts;
             track.next = Some(pts);
@@ -947,7 +954,7 @@ impl Writer {
         } else if gap < -SNAP_SECS {
             skip = (-gap * rate).round() as usize;
             if skip >= frames.len() {
-                return;
+                return false;
             }
         }
         let body = &frames[skip..];
@@ -955,12 +962,12 @@ impl Writer {
         // ends where the video grid does.
         let body = if let Some(limit) = limit_secs {
             if start >= limit {
-                return;
+                return false;
             }
             pad = pad.min(((limit - start) * rate).floor().max(0.0) as usize);
             let body_start = start + pad as f64 / rate;
             if body_start >= limit {
-                return;
+                return false;
             }
             let room = ((limit - body_start) * rate).floor().max(0.0) as usize;
             &body[..body.len().min(room)]
@@ -968,7 +975,7 @@ impl Writer {
             body
         };
         if body.is_empty() && pad == 0 {
-            return;
+            return false;
         }
         let body_start = start + pad as f64 / rate;
         let mut ok = true;
@@ -982,9 +989,9 @@ impl Writer {
         if ok {
             track.next = Some(body_start + body.len() as f64 / rate);
         } else {
-            self.stats.audio_drops += 1;
             self.check_bus();
         }
+        ok
     }
 
     /// Latest capture time the next slot to be emitted may show.
@@ -1315,8 +1322,10 @@ impl Writer {
             // Preview-only session.
             return Ok(self.stats.clone());
         };
-        // A track that never got audio would make an empty track; give it a
-        // moment of silence so the layout is intact.
+        // A track that never got audio would make an empty track: qtmux only
+        // writes a trak once it has a sample, so a short clip with a slow
+        // source lost it silently. Give every requested track a moment of
+        // silence and say so; the layout is then intact whatever the device did.
         for t in &mut sink.tracks {
             let written = match t.target {
                 Target::Mix => self.stats.audio_mix_buffers,
@@ -1324,6 +1333,14 @@ impl Writer {
                 Target::Mic => self.stats.audio_mic_buffers,
             };
             if written == 0 {
+                let what = match t.target {
+                    Target::Mix => "mix",
+                    Target::System => "system audio",
+                    Target::Mic => "microphone",
+                };
+                eprintln!(
+                    "rec: warning: no {what} arrived; writing a silent {what} track so the layout is intact"
+                );
                 let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480], t.channels as usize);
             }
         }
@@ -1535,12 +1552,23 @@ pub fn video_encoder_candidates(codec: Codec) -> &'static [&'static str] {
             "avenc_libx265",
             "avenc_hevc",
         ],
-        Codec::Prores => &["avenc_prores_ks"],
+        // ffmpeg has two ProRes encoders: the "Apple" one (prores_aw, also
+        // registered as avenc_prores) is several times faster than Kostya's
+        // (prores_ks) and is what a CPU can record in real time; ks stays as
+        // the fallback for a build without it.
+        Codec::Prores => &["avenc_prores_aw", "avenc_prores", "avenc_prores_ks"],
     }
 }
 
 /// AAC encoder elements to try, most capable first.
-pub const AUDIO_ENCODER_CANDIDATES: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc", "faac"];
+///
+/// `avenc_aac` is preferred over `fdkaacenc`: measured on a 40 ms 1 kHz beep
+/// train, fdkaacenc reproduces the first beep exactly but encodes the later
+/// ones 1.2-1.5 dB hot (a pure tone through it standalone is exact, so this is
+/// its behaviour on the gated stream a recording produces), and a recorder
+/// with faders must not change levels. ffmpeg's encoder is level-accurate and
+/// its 1024-sample priming is what the edit list skips.
+pub const AUDIO_ENCODER_CANDIDATES: &[&str] = &["avenc_aac", "fdkaacenc", "voaacenc", "faac"];
 
 /// Samples an AAC encoder holds back before it emits its first frame (its
 /// priming, the MDCT look-ahead). The file keeps those frames and the finalise
@@ -1686,9 +1714,16 @@ fn make_encoder(
             "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
                 el.set_property_from_str("rate-control", "cbr");
             }
-            // ffmpeg's ProRes encoder defaults to 422 HQ; upstream writes
-            // plain 422 ("standard"), and editors expect that.
-            "avenc_prores_ks" => set(&el, "profile", "standard"),
+            // ffmpeg's ProRes encoders default to 422 HQ; upstream writes
+            // plain 422 ("standard"), and editors expect that. ProRes is
+            // intra-only and a 1080p60 frame needs all the parallelism it can
+            // get: prores_ks goes from 3.5 to 15 fps with slice threads.
+            "avenc_prores_ks" | "avenc_prores_aw" | "avenc_prores" => {
+                set(&el, "profile", "standard");
+                if el.find_property("threads").is_some() {
+                    set(&el, "threads", "auto");
+                }
+            }
             _ => {}
         }
         if let Some(format) = probe_format
@@ -2103,8 +2138,13 @@ mod tests {
         assert_eq!(video_encoder_candidates(Codec::H264)[0], "vah264enc");
         assert!(video_encoder_candidates(Codec::H264).contains(&"openh264enc"));
         assert!(video_encoder_candidates(Codec::Hevc).contains(&"x265enc"));
-        assert_eq!(video_encoder_candidates(Codec::Prores), ["avenc_prores_ks"]);
-        assert_eq!(AUDIO_ENCODER_CANDIDATES[0], "fdkaacenc");
+        // The fast ffmpeg ProRes encoder first, Kostya's as the fallback.
+        assert_eq!(
+            video_encoder_candidates(Codec::Prores)[0],
+            "avenc_prores_aw"
+        );
+        assert!(video_encoder_candidates(Codec::Prores).contains(&"avenc_prores_ks"));
+        assert_eq!(AUDIO_ENCODER_CANDIDATES[0], "avenc_aac");
     }
 
     #[test]
