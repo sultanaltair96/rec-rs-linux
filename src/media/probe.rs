@@ -17,6 +17,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+use crate::media::mp4;
+
 /// What one demuxed stream is.
 #[derive(Clone, Debug)]
 struct Stream {
@@ -69,7 +71,18 @@ pub fn probe(file: &Path) -> Result<()> {
         .map_err(|e| anyhow!("{}: {e}", abs.display()))?
         .to_string();
     println!("file      : {}", abs.display());
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: reading mp4 boxes");
+    }
+    let movie =
+        mp4::read(&abs).with_context(|| format!("reading the boxes of {}", abs.display()))?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: mp4 boxes ok; structure");
+    }
     let (duration, mut streams) = structure(&abs)?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: structure ok; decode");
+    }
     let decoded = decode(&uri)?;
     if std::env::var_os("REC_DEBUG").is_some() {
         for (i, d) in decoded.iter().enumerate() {
@@ -98,8 +111,57 @@ pub fn probe(file: &Path) -> Result<()> {
         "duration  : {:.3}s",
         duration.map(|d| d.seconds_f64()).unwrap_or(0.0)
     );
+    // The MP4 track layout (alternate group, enabled flag, edit list) is not
+    // something qtdemux exposes as caps, so it comes from the boxes themselves.
+    println!(
+        "fragmented: {} (movie timescale {}, {:.3}s)",
+        if movie.fragmented { "yes" } else { "no" },
+        movie.movie_timescale,
+        movie.duration as f64 / movie.movie_timescale.max(1) as f64
+    );
     for (i, s) in streams.iter().enumerate() {
-        println!("track {i}  : {} {} {}", s.media, s.codec, s.format);
+        let layout = movie.tracks.get(i).map(|t| {
+            let mut l = format!(
+                "  [mp4 #{} {} alt-group {} {} samples",
+                t.track_id,
+                if t.enabled { "enabled" } else { "disabled" },
+                t.alternate_group,
+                t.samples
+            );
+            for e in &t.edits {
+                if e.media_time >= 0 {
+                    l += &format!(
+                        " elst media_time={} duration={}",
+                        e.media_time, e.segment_duration
+                    );
+                } else {
+                    l += &format!(" elst empty={}", e.segment_duration);
+                }
+            }
+            l + "]"
+        });
+        println!(
+            "track {i}  : {} {} {}{}",
+            s.media,
+            s.codec,
+            s.format,
+            layout.as_deref().unwrap_or("")
+        );
+    }
+    if movie.tracks.len() != streams.len() {
+        // The demuxer and the box parser disagree (an unusual file): show the
+        // box view too rather than guessing which is right.
+        for (i, t) in movie.tracks.iter().enumerate() {
+            println!(
+                "mp4 {i}    : {} #{} {} alt-group {} {} samples, {} edits",
+                t.handler.label(),
+                t.track_id,
+                if t.enabled { "enabled" } else { "disabled" },
+                t.alternate_group,
+                t.samples,
+                t.edits.len()
+            );
+        }
     }
     let mut ok = playable;
     // Decode lines follow the tracks: the nth video stream is the nth decoded
@@ -146,17 +208,29 @@ fn structure(path: &Path) -> Result<(Option<gst::ClockTime>, Vec<Stream>)> {
     let found2 = found.clone();
     let pipe = pipeline.clone();
     demux.connect_pad_added(move |_demux, pad| {
+        let debug = std::env::var_os("REC_DEBUG").is_some();
         if let Some(caps) = pad.current_caps().or_else(|| Some(pad.query_caps(None)))
             && let Some(s) = describe(&caps)
         {
+            if debug {
+                eprintln!("rec: debug: structure pad {} {s:?}", pad.name());
+            }
             found2.lock().unwrap().push(s);
         }
-        // Consume the stream so the pipeline prerolls and runs to EOS.
+        // Consume the stream so the pipeline reaches EOS. The sinks are added
+        // while the pipeline runs: `sync=false` keeps them off the pipeline
+        // clock and `async=false` keeps them out of preroll, so a late pad
+        // cannot leave the whole pipeline waiting for one it will never get.
         if let Ok(sink) = gst::ElementFactory::make("fakesink").build()
             && let Ok(sink_pad) = sink.static_pad("sink").context("fakesink sink pad")
             && pipe.add(&sink).is_ok()
             && pad.link(&sink_pad).is_ok()
         {
+            sink.set_property("sync", false);
+            sink.set_property("async", false);
+            if debug {
+                eprintln!("rec: debug: structure linked {}", pad.name());
+            }
             let _ = sink.sync_state_with_parent();
         }
     });
@@ -234,6 +308,7 @@ fn decode(uri: &str) -> Result<Vec<Decoded>> {
             return;
         };
         sink.set_property("sync", false);
+        sink.set_property("async", false);
         let Ok(queue) = gst::ElementFactory::make("queue").build() else {
             return;
         };

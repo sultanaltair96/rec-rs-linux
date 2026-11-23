@@ -458,13 +458,13 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
         system_offset_ms: a.system_audio_offset_ms,
         mic_offset_ms: a.mic_offset_ms,
         write: !a.no_record,
+        preview: None,
         live,
         streams: a
             .stream
             .iter()
             .map(|d| live::resolve_destination(d))
             .collect::<Result<Vec<_>>>()?,
-        preview: None,
     };
     Ok(opts)
 }

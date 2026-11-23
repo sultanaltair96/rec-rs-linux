@@ -29,7 +29,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `-w/--cam/--webcam [DEVICE]` | Webcam overlay, default or device | V4L2 (`/dev/video*`), or the xdg-desktop-portal Camera inside Flatpak; id/number/name substring, `default` = first camera | 1B | partial | source: unit `camera::v4l2::tests::device_matching`, `camera::format::tests::*`, `camera::convert::tests::*`; real hardware and the overlay wiring are listed under "Needs a real desktop" (source done, 1G wires it) |
 | `--scene` | screen, screen-cam, cam | Same enum and default rule | 0 | done | unit `tests::scene_option` |
 | `--pip-size/-corner/-shape/-roundness/-border/-border-color/-shadow/-pos/-no-mirror` | Overlay geometry and style | Same parsing, clamping and geometry | 0 | done | unit `tests::overlay_options`, `compose::tests::corners_and_free_positions`, `snapping`, `shape_coverage` |
-| `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values; phase 0 writes stems only (mix is 1C) | 0 (parse), 1C (mix) | partial | parses: unit `settings::tests::record_args_parse_with_the_cli`; writer warns when a mix is requested |
+| `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values and track layout; one track when only one source is present | 1G | done | selftest `tracks` (4 tracks: video, mix, system, mic), `audio-tracks` (mix: 2 tracks; stems: video + 2 enabled stems) |
 | `--system-gain`, `--mic-gain` | dB per source, −60 = silence, +24 max, in every track | Same fader maths applied in the writer | 0 | done | selftest `gain` (`--ref=-6 --expect=-12`); unit `mixer::tests::volume_gain`, `fader_glides_and_passes_unity_through` |
 | `--system-audio-offset-ms`, `--mic-offset-ms` | Sync shifts; system default = output latency | Same; the default sink's latency is read once at start from PipeWire and passed to the writer as the system offset | 0 (shift), 1B (latency) | done | unit `capture::audio::pipewire::tests::collector_combines_the_latency_parts`, `node_latency_property_is_a_fraction_or_frames`; integration `devices` prints 5.3 ms for a 256/48000 sink; unit (offsets applied in `push_audio`); selftest `sync` |
 | `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes: embedded (drawn by the compositor), hidden, metadata (we composite the bitmap). X11: the cursor is composited from XFixes and clicks are the button bits of `QueryPointer`, drawn as a ring that grows and fades | 1A | partial | unit `cursor::tests::a_ring_is_a_ring_not_a_disc`, `ring_grows_fades_and_expires`, `cursor_is_composited_at_its_hotspot`; `x11::tests::a_click_draws_a_ring_at_the_pointer` (real X server, XTEST click). Wayland: no button events through a portal, so `--clicks` warns and records the cursor only |
@@ -182,34 +182,35 @@ images, so this is a description of the diff from the code and sizes):
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
 | Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer: x264enc (H.264 High), x265enc (HEVC Main), `avenc_prores_ks` (ProRes 422); VA-API on a GPU host | 0 (software), 1C (hardware) | done | selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`, `h264-bitrate`; `ffprobe` reports h264/High and hevc/Main |
-| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240, chroma averaged over each 2x2 block); the encoder declares the tags | 1C (conversion), 1G (caps) | partial | unit `gpu::tests::the_output_is_bt709_limited_range` (white 235, black 16, red 63/102/240); `gpu::yuv::tests::known_bars`, cross-checked against ffmpeg's swscale |
+| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240); for CPU frames the encoder capsfilter pins primaries/transfer/matrix BT.709 and limited range | 1C (conversion), 1G (caps) | done | unit `gpu::tests::the_output_is_bt709_limited_range`, `gpu::yuv::tests::known_bars`; selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`: ffprobe reports `bt709/bt709/bt709` and `color_range=tv` for all three codecs |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |
-| Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | Planned: AAC-LC 48 k stereo 256 kb/s | 1C | todo | — |
-| System stem: AAC 48 kHz stereo 256 kb/s | Yes (track 3) | AAC-LC 48 k stereo 256 kb/s, written | 0 | done | selftest tracks count (2: video + system); `ffprobe` audio aac 48000 stereo |
-| Mic stem: AAC 48 kHz mono 192 kb/s | Yes (track 4) | Planned with the mic track (mono) | 1B/1C | todo | — |
-| Track grouping: alternate group with the mix as default | Yes | Muxer track grouping (`mp4mux` input groups) | 1C | todo | — |
+| Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | AAC-LC 48 kHz stereo 256 kb/s from the mix bus, the enabled track of the audio alternate group | 1G | done | selftest `tracks`: ffprobe `aac, 48000 Hz, 2 ch, 255999 b/s` at index 1, probe `enabled alt-group 1` |
+| System stem: AAC 48 kHz stereo 256 kb/s | Yes (track 3) | AAC-LC 48 kHz stereo 256 kb/s, its own encoder | 0 (track), 1G (faders/mix) | done | selftest `tracks`: index 2, disabled alternative in group 1, system beep at −12 dB with `--system-gain=-12` |
+| Mic stem: AAC 48 kHz mono 192 kb/s | Yes (track 4) | AAC-LC 48 kHz mono 192 kb/s (the device's own sample per frame) | 1B (capture), 1G (track) | done | selftest `tracks`: index 3, `1 ch`, `192000 b/s`, disabled alternative; the synthetic 1.5 kHz beep is the proof it carries the mic and not the system source |
+| Track grouping: alternate group with the mix as default | Yes | The finalise writes `tkhd` alternate_group and enabled flags into the moov (qtmux cannot) | 1G | done | unit `mp4::tests::finalize_builds_a_regular_movie_and_keeps_the_media_bytes`; selftest `tracks`: probe reports `alt-group 1`, mix `enabled`, both stems `disabled`; `audio-tracks stems` has no group and all tracks enabled |
 | Single clock, audio never stretched | Yes | Same: CLOCK_MONOTONIC everywhere, resampling only for device rates | 0 | done | selftest `sync` (offsets 0.0 ms) |
-| Flash/beep sync 0.0 ms in the file, including across pauses | Yes | 0.0 ms on every beep but the first, +9.9 ms on the first (see note) | 0 | partial | selftest `sync`, `pause-resume`, `audio-gaps` |
+| Flash/beep sync 0.0 ms in the file, including across pauses | Yes | 0.0 ms on every beep, the first included (the AAC priming is skipped by an edit list) | 1G | done | selftest `sync` (`--max-ms 1`), `pause-resume`, `audio-gaps`: mean +0.0 ms, range [+0.0, +0.0] |
 | Levels: fader and mute before everything, ≤20 ms ramp, 0 dB untouched | Yes | Same ramp and ordering in the writer | 0 | done | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
 | System audio latency shift (output device latency) | CoreAudio | PipeWire default sink's `Latency`/`ProcessLatency`, else `node.latency`, read once at start | 1B | done | unit `collector_combines_the_latency_parts`, `node_latency_property_is_a_fraction_or_frames`; integration `devices` prints 5.3 ms; writer applies the offset |
-| Webcam lag adaptation (emission waits for the slowest source) | Yes | The camera delivers host-clock frames from the V4L2 buffer time; the writer's adaptive lag is 1G's | 0 (lag), 1B (camera), 1G (adaptation) | partial | unit `camera::convert::tests::*` (timestamp clock); writer `lag()`; selftest frame grid |
-| Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments | `mp4mux`/`qtmux` `fragment-duration=2000`; SIGKILL leaves a playable file | 0 | done | crash test: SIGKILL at 4.5 s → 4.0 s file that `ffmpeg -f null` decodes |
+| Webcam lag adaptation (emission waits for the slowest source) | Yes | Arrival-latency peak per source, decaying 50 ms/s, sets the emission lag (0.05–0.3 s) | 1G (adaptation), 1B (camera) | done | unit `media::writer::tests::camera_latency_widens_the_lag_and_decays`; selftest `camera-lag` (synthetic camera 80 ms late: 120/120 frames, no drift); needs a real desktop for a real 70–120 ms camera |
+| Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments while recording, then a regular moov | `fragment-duration=2000` while recording; `media::mp4::finalize` appends a regular moov that indexes the samples where they lie and flips the fragments to `free` (no media bytes move) | 1G | done | selftest `crash` (SIGKILL at 4.5 s: 238 frames, fragmented, decodes), `finalize-crash` (kill between the append and the flip: all 120 frames; mid-flip: playable), `defrag` (same sample count and identical ffmpeg framemd5 as the kept fragmented copy; final file has no `moof`/`mvex`) |
 | Edge to edge: frame has the source's aspect, no bars, never cropped | Yes | Same `fill`/`same_aspect` maths | 0 | done | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` |
 | Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a clamp in the upload shader, compositing the window over the clamped edge | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`), `gpu::tests::the_corner_fill_replaces_transparent_window_corners` |
-| Camera settles 2 s before the file starts | Yes | `CAMERA_SETTLE_SECS = 2.0` and `CameraSource::settle_remaining()` are the 1B API; the writer's `wait_for_camera` gate is wired by 1G | 1B/1G | partial | unit `camera::tests::size_and_aspect_are_known_before_the_first_frame` (2 s constant); 1G wires the gate |
+| Camera settles 2 s before the file starts | Yes | `wait_for_camera` holds the first screen frame until the camera's `settle_remaining()` has elapsed (gives up after 3 s more) | 1B (settle API), 1G (gate) | done | unit `media::writer::tests::the_camera_gate_holds_the_start_until_the_camera_settles`, `…gives_up_on_a_camera_that_never_delivers`; selftest `camera`: wall 4.2 s for 2 s settle + 2 s file, first frame is the camera's red |
 | Audio quality: 48 kHz capture, windowed-sinc resampler continuous across buffers | Yes | Same resampler maths (ported) | 0 | done | unit `mixer::tests::resamples_seamlessly`, `resampler_removes_content_above_nyquist`, `small_jitter_snaps_to_continuous` |
-| Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter | 0 (maths), 1C (mix track) | partial | unit `mixer::tests::limiting` |
+| Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter on the mix bus; the stems are not limited (upstream's float path) | 0 (maths), 1G (mix track) | done | unit `mixer::tests::limiting`; selftest `tracks`/`gain` measure the mix and both stems |
 | Pause cuts whole frame slots, audio at the exact sample, no gap, no drift | Yes | Same `Pauses` timeline in the writer | 0 | done | unit `media::pauses::tests::output_slots_stay_contiguous_across_pauses`, `keep_cuts_captures_at_pause_boundaries`; selftest `pause-resume` (300 frames, sync holds) |
 | `--duration` exact in output frames, pauses don't count | Yes | Same | 0 | done | selftest `pause-resume`, `sync` |
 
 **AAC priming note.** AVFoundation writes the MP4 edit list that makes decoders skip an AAC
-encoder's priming samples; GStreamer's `qtmux`/`mp4mux` 1.26 cannot. The writer therefore drops the
-priming frames (`fdkaacenc` 2048 samples, `avenc_aac` 1024) and re-stamps the rest, which removes
-the 42.7 ms offset every beep otherwise has. The first kept frame lacks decoder history, so the very
-first ~10 ms of audio in a file fades in: measured 0.0 ms on beeps 2..N and +9.9 ms on beep 1.
-Phase 1C can improve this once the writer owns the audio path (an `elst` writer or a GStreamer
-version that does it).
+encoder's priming samples; GStreamer's `qtmux`/`mp4mux` 1.26 cannot. The finalise in
+`src/media/mp4.rs` writes it instead: each audio track gets an `edts`/`elst` whose `media_time` is
+the encoder's priming (fdkaacenc 2048 samples, avenc_aac 1024, scaled to the track's timescale), and
+`REC_AAC_PRIMING` overrides it. Readers that honour edit lists (ffmpeg, QuickTime) start at the
+first real sample, so the first beep in a file is at 0.0 ms too. `rec-rs probe` reports the edit
+list per track; GStreamer's own decode shows the unskipped priming, which is why the probe's decode
+line starts at 0.043 s for an audio track.
 
 ## Streaming
 
@@ -242,14 +243,15 @@ version that does it).
 | System audio | Yes | PipeWire default sink monitor | 1B | done | selftest `pattern-system-audio` (48 kHz and 44.1 kHz: 5 beeps at −6 dBFS, spacing 1.000 s); integration `system-48k`/`system-44k` |
 | Microphone | Yes | PipeWire `Audio/Source` capture at the device's own rate | 1B | done | selftest `pattern-mic`; integration `mic-default`, `mic-by-name`, `mic-unplug` |
 | Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | V4L2/portal source (1B) + wgpu compositor (1C); the recorder wires them (1G) | 1B/1C/1G | partial | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; camera source units; goldens `screen-cam-*`; real camera under "Needs a real desktop" |
-| Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
+| Separate audio tracks | Up to 4 | Mix + 2 stems | 1G | done | selftest `tracks` (4 tracks with real AAC 256/256/192 kb/s), `audio-tracks` |
 | Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | done | selftest `gain`; unit `fader_glides_and_passes_unity_through`, `app::ui_tests::the_level_can_be_typed`, `a_muted_channel_greys_its_meter` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
 | Hardware H.264/HEVC | VideoToolbox | VA-API on a GPU host; the container has no GPU, so it records with x264enc/x265enc (the writer skips VA without /dev/dri and trial-encodes it otherwise) | 1C | todo | dev/ELEMENTS.md |
-| ProRes | 422 | `avenc_prores_ks` 422 | 0 | done | selftest `pattern-prores` |
+| ProRes | 422 | `avenc_prores_ks`, profile pinned to 422 `standard` | 0 (element), 1G (profile) | done | selftest `pattern-prores`: ffprobe `prores/Standard`, BT.709, `.mov` only |
 | 10-bit / HDR | No | No | — | n-a | matches upstream |
-| Constant frame rate | Exact grid | Exact grid, also when the encoder is slower than the grid: four frames may wait in the app source and the pacer blocks, so every slot is written and memory stays bounded (4K HEVC: 120 frames at 60/1, 1.2 GB peak) | 0 | done | selftest + ffprobe PTS; selftest `pattern-4k-hevc` (120 frames at 60/1) |
-| Crash-safe files | Fragments every 2 s | Fragments every 2 s | 0 | done | crash test decodes |
+| Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
+| Crash-safe files | Fragments every 2 s | Fragments every 2 s, finalised in place | 1G | done | selftest `crash`, `finalize-crash`, `defrag` |
+| Bounded memory when the encoder cannot keep up | AVAssetWriterInput is asked `isReadyForMoreMediaData`; a busy encoder drops the frame | appsrc and every queue are bounded (2 video frames, 8 audio buffers); a full appsrc means the grid slot is dropped and counted, never buffered | 1G | done | unit `media::writer::tests::a_silent_or_far_future_source_cannot_grow_memory` (30 s at 1080p60 with a silent and a 1000 s-ahead source: RSS growth < 300 MB), `a_broken_audio_clock_cannot_stretch_the_file`, `mixer::tests::a_far_future_chunk_cannot_grow_the_mix_buffer`; selftest `pattern-4k-long` (20 s 4K60 noise: peak RSS 1.1 GB, 14.8 fps, 904 frames dropped on this CPU-only host) |
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes; the app's button and `rec-rs pause`/`resume` hit the same session | 0 (CLI), 1E (app) | done | selftest `pause-resume`, `gui` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
@@ -282,19 +284,20 @@ version that does it).
 
 Done (proved by tests or self-test cases): the CLI surface, settings and the settings-to-arguments
 path, pause timeline and pause/resume end to end, the frame-rate grid, faders/gain ramps and the
-resampler and limiter maths, overlay geometry/masks/shadows, the test-pattern source, the H.264 and
-ProRes writer with an AAC system track and crash-safe fragments, `probe`, the platform preset maths,
-the pidfile/signal control, and the sync/level/self-test scripts.
+resampler and limiter maths, overlay geometry/masks/shadows, the test-pattern source, the writer's
+track layout (video, mix, system stem, mic stem, alternate group with the mix enabled), the AAC
+priming edit list, BT.709 tags on every codec, the fragment-to-regular-movie finalise with both of
+its crash windows, the camera gate and lag adaptation, the native-size scaler, bounded memory when
+the encoder falls behind, `probe` (tracks, alternate group, enabled flags, edit lists, full
+decode), the platform preset maths, the pidfile/signal control, and the sync/level/self-test
+scripts.
 
-Partial (a named part is missing, listed per row): mix and mic tracks, BT.709 colour tagging,
-webcam lag adaptation, hardware encoding.
+Partial (a named part is missing, listed per row): hardware encoding (VA-API is selected and
+trial-encoded when `/dev/dri` exists; the container has no GPU, so x264/x265 are what the self-tests
+prove), and what can only be checked on a real desktop (a real V4L2 camera and its 70–120 ms
+latency, see the rows above).
 
-Known items owned by phase 1C (not fixed here): the first ~10 ms of audio in a file fades in
-because the AAC priming frames are dropped instead of trimmed with an MP4 edit list (+9.9 ms on the
-first beep, 0.0 ms after), and the self-test's sync threshold is 20 ms rather than upstream's 1 ms
-for that reason.
-
-Todo (phase 1): all capture, the GPU compositor, the app, replay/streaming, packaging.
+Todo (phase 1): the app, replay/streaming, packaging.
 
 ## Screen capture (phase 1A)
 
