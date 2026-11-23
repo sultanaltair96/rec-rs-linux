@@ -18,6 +18,12 @@
 set -eu
 cd "$(dirname "$0")/../.."
 
+# The `cargo test` cases below build the whole crate in debug; with one rustc
+# per host CPU that exceeded the dev container's 4 GB cgroup (G20c). dev.sh
+# derives the same default from the container's CPUs and memory; keep the bound
+# when this script runs outside it.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+
 # WirePlumber and PipeWire want a session bus; give the test its own so it
 # never talks to (or is disturbed by) a desktop.
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
