@@ -66,43 +66,68 @@ pub struct CameraRequest {
     pub device: Option<String>,
 }
 
-/// A running watch on the `/dev/video*` set (phase 1E's camera hotplug).
+/// A running camera hotplug watch (phase 1E's camera list refresh).
 ///
-/// Dropping it stops the watch. In a Flatpak sandbox there are no device nodes
-/// to watch: the portal has no camera-added signal, so the app refreshes that
-/// list on demand (or when a recording starts) instead.
+/// Two backends run side by side: inotify on `/dev/video*` for a normal
+/// desktop, and the portal's PipeWire camera nodes when the sandbox hides the
+/// device nodes. Dropping it stops both.
 pub struct DeviceWatch {
-    inner: v4l2::Watch,
+    inotify: Option<v4l2::Watch>,
+    portal: Option<portal::Watch>,
 }
 
 impl DeviceWatch {
-    /// Stop watching and join the watcher thread.
-    pub fn stop(self) {
-        self.inner.stop();
+    /// Stop watching and join the watcher threads.
+    pub fn stop(mut self) {
+        if let Some(w) = self.inotify.take() {
+            w.stop();
+        }
+        if let Some(w) = self.portal.take() {
+            w.stop();
+        }
     }
 }
 
 impl std::fmt::Debug for DeviceWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("camera::DeviceWatch")
-            .finish_non_exhaustive()
+            .field("inotify", &self.inotify.is_some())
+            .field("portal", &self.portal.is_some())
+            .finish()
     }
 }
 
-/// Call `cb` when a `/dev/video*` capture node appears or disappears (a webcam
-/// plugged in or unplugged). The watch is an inotify watch on `/dev`; events
-/// are coalesced over 250 ms, so a UVC camera's picture and metadata nodes
-/// produce one callback. The callback runs on the watcher thread and must not
-/// block (reload the camera list, wake the UI).
+/// Call `cb` when a camera appears or disappears: an inotify watch on
+/// `/dev/video*` for a normal desktop, and the portal's PipeWire camera nodes
+/// when `/dev/video*` is not visible (a Flatpak). Both run when both are
+/// available; each coalesces its own burst, and the callback runs on a watcher
+/// thread, so it must not block (reload the camera list, wake the UI).
 ///
-/// The watch lives until the returned [`DeviceWatch`] is dropped, and requires
-/// inotify (Linux, always available in the dev container). Pair it with
-/// [`crate::capture::audio::watch_devices`]; 1E starts both and refreshes its
-/// source lists.
-pub fn watch_devices(cb: impl Fn() + Send + 'static) -> Result<DeviceWatch> {
-    Ok(DeviceWatch {
-        inner: v4l2::watch_dir(std::path::Path::new("/dev"), cb)?,
+/// This is what makes a camera plugged in after the app started appear without
+/// a manual refresh: 1E already calls it and reloads on the callback.
+///
+/// The watch lives until the returned [`DeviceWatch`] is dropped. It is an
+/// error only when neither backend can be started. Pair it with
+/// [`crate::capture::audio::watch_devices`].
+pub fn watch_devices(cb: impl Fn() + Send + Sync + 'static) -> Result<DeviceWatch> {
+    let cb = std::sync::Arc::new(cb);
+    // A normal desktop: /dev/video* nodes. In a Flatpak this watch exists but
+    // never fires for a camera, which is why the portal watch is needed too.
+    let inotify = v4l2::watch_dir(std::path::Path::new("/dev"), {
+        let cb = cb.clone();
+        move || cb()
     })
+    .ok();
+    // A Flatpak (or a portal-only camera): the nodes of the portal's remote.
+    let portal = portal::watch_devices({
+        let cb = cb.clone();
+        move || cb()
+    })
+    .ok();
+    if inotify.is_none() && portal.is_none() {
+        bail!("camera hotplug is unavailable: inotify on /dev and the camera portal both failed");
+    }
+    Ok(DeviceWatch { inotify, portal })
 }
 
 /// The cameras `--webcam` and the app list.
@@ -119,7 +144,19 @@ pub fn cameras() -> Result<Vec<CameraInfo>> {
     if out.is_empty() && portal::in_sandbox() {
         out = portal::cameras().unwrap_or_default();
     }
-    Ok(out)
+    Ok(dedup_cameras(out))
+}
+
+/// One entry per camera.
+///
+/// The portal can expose the same v4l2 node more than once while a previous
+/// remote connection is winding down (two connections, one camera), and both
+/// entries carry the same node name. Sorting also makes the list stable for
+/// the app's sidebar.
+fn dedup_cameras(mut cameras: Vec<CameraInfo>) -> Vec<CameraInfo> {
+    cameras.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    cameras.dedup_by(|a, b| a.id == b.id);
+    cameras
 }
 
 /// Start capturing `req`. The returned source is stopped; the session calls
@@ -429,6 +466,43 @@ mod tests {
             assert!(!c.id.is_empty());
             assert!(!c.name.is_empty());
         }
+    }
+
+    #[test]
+    fn duplicate_portal_nodes_collapse_to_one_entry() {
+        let cams = vec![
+            CameraInfo {
+                id: "v4l2_input.pci-0000_04_00.3-usb-0_2_1.2".into(),
+                name: "B525 HD Webcam (V4L2)".into(),
+            },
+            CameraInfo {
+                id: "v4l2_input.pci-0000_04_00.3-usb-0_2_1.2".into(),
+                name: "B525 HD Webcam (V4L2)".into(),
+            },
+            CameraInfo {
+                id: "/dev/video3".into(),
+                name: "Another Camera".into(),
+            },
+        ];
+        let out = dedup_cameras(cams);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "/dev/video3", "sorted by name first");
+        assert_eq!(out[1].id, "v4l2_input.pci-0000_04_00.3-usb-0_2_1.2");
+    }
+
+    #[test]
+    #[ignore = "needs a camera portal with a camera (real desktop; run inside the Flatpak)"]
+    fn the_camera_watch_reports_the_portal_camera() {
+        // The public watch 1E uses: inotify has nothing to see inside the
+        // Flatpak, so this proves the portal's PipeWire node watch fires.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = watch_devices(move || {
+            let _ = tx.send(());
+        })
+        .expect("starting the camera watch");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(watch);
+        assert!(got, "the camera watch did not report the portal camera");
     }
 
     #[test]

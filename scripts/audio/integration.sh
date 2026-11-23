@@ -211,6 +211,20 @@ if wanted missing; then
     fi
 fi
 
+# Camera portal: the zbus objects must be created and dropped inside the Tokio
+# runtime. A session bus without a camera backend still builds the Camera proxy
+# and takes the error path, which is where the real Flatpak aborted.
+if wanted portal; then
+    name=portal
+    if CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo test --quiet \
+           portal_objects_are_dropped_inside_the_runtime -- --ignored --nocapture \
+           >"$OUT/$name.check" 2>&1; then
+        ok "$name" "camera portal objects create and drop inside the runtime"
+    else
+        bad "$name" "the camera portal drop path panicked" "$OUT/$name.check"
+    fi
+fi
+
 # The audio hotplug watch 1E consumes: a new sink must notify within 5 s.
 if wanted watch; then
     name=watch

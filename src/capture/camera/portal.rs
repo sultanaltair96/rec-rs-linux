@@ -39,9 +39,9 @@ use pw::spa::param::ParamType;
 use pw::spa::param::format::{MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
+use pw::spa::pod::Pod;
 use pw::spa::pod::serialize::PodSerializer;
-use pw::spa::pod::{Pod, Value};
-use pw::spa::utils::{Direction, Fraction, Rectangle, SpaTypes};
+use pw::spa::utils::{Direction, SpaTypes};
 
 use super::convert::{self, CameraClock, YuvMatrix};
 use super::v4l2::FrameSizeCell;
@@ -89,33 +89,32 @@ fn portal_error(e: ashpd::Error) -> anyhow::Error {
     anyhow!("the camera portal: {e}")
 }
 
-fn proxy() -> Result<Camera<'static>> {
-    runtime()
-        .block_on(async { Camera::new().await })
-        .map_err(portal_error)
-}
-
-fn present(camera: &Camera<'static>) -> Result<bool> {
-    runtime()
-        .block_on(async { camera.is_present().await })
-        .map_err(portal_error)
-}
-
-fn open_remote(camera: &Camera<'static>) -> Result<OwnedFd> {
-    runtime()
-        .block_on(async { camera.open_pipe_wire_remote().await })
-        .map_err(portal_error)
-}
+// Everything ashpd/zbus hands out (`Camera`, its `Request`, the proxies) must
+// be created, used and **dropped inside one `runtime().block_on`**. zbus's
+// executor reaches for the Tokio 1.x reactor when a proxy or request is
+// dropped; a Camera returned from block_on and dropped on a plain capture
+// thread panics there, and a panic in a destructor while cleaning up aborts the
+// process (seen on a real desktop: exit 134 during camera open). Each function
+// below therefore finishes its whole portal conversation inside the future and
+// lets only plain data (booleans, fds, node descriptions) escape.
 
 /// The cameras the portal exposes. The portal asks for access only on the first
 /// session; listing may come back empty before that, in which case the portal
 /// itself is offered as a single "portal" camera (a stream without a node id).
 pub(super) fn cameras() -> Result<Vec<CameraInfo>> {
-    let camera = proxy()?;
-    if !present(&camera)? {
+    let fd = runtime().block_on(async {
+        let camera = Camera::new().await.map_err(portal_error)?;
+        if !camera.is_present().await.map_err(portal_error)? {
+            return Ok::<Option<OwnedFd>, anyhow::Error>(None);
+        }
+        let fd = camera.open_pipe_wire_remote().await.map_err(portal_error)?;
+        Ok(Some(fd))
+        // `camera` (and the proxy inside it) drops here, on the runtime.
+    })?;
+    let Some(fd) = fd else {
         return Ok(vec![]);
-    }
-    let nodes = match open_remote(&camera).and_then(enumerate_remote) {
+    };
+    let nodes = match enumerate_remote(fd) {
         Ok(nodes) if !nodes.is_empty() => nodes,
         _ => vec![PortalNode {
             node_id: 0,
@@ -134,35 +133,52 @@ pub(super) fn cameras() -> Result<Vec<CameraInfo>> {
 
 /// One line for `rec-rs permissions` when there is no `/dev/video*`.
 pub(super) fn status() -> Option<String> {
-    match proxy() {
-        Ok(camera) => match present(&camera) {
-            Ok(true) => Some("ok (camera portal: a camera is present)".to_string()),
-            Ok(false) => Some("unavailable (the camera portal reports no camera)".to_string()),
-            Err(e) => Some(format!("unavailable ({e})")),
-        },
-        // Not a portal session: the caller says "no /dev/video*" instead.
-        Err(_) => None,
-    }
+    runtime().block_on(async {
+        match Camera::new().await {
+            Ok(camera) => match camera.is_present().await {
+                Ok(true) => Some("ok (camera portal: a camera is present)".to_string()),
+                Ok(false) => Some("unavailable (the camera portal reports no camera)".to_string()),
+                Err(e) => Some(format!("unavailable ({e})")),
+            },
+            // Not a portal session: the caller says "no /dev/video*" instead.
+            Err(_) => None,
+        }
+        // `camera` drops here, inside the runtime.
+    })
 }
 
 /// A portal camera source, or None when the portal has no camera (or is not
 /// there at all) so the caller can report the usual "no camera found".
 pub(super) fn open_source(sel: Option<&str>) -> Result<Option<CameraSource>> {
-    let Ok(camera) = proxy() else {
+    // One portal conversation, entirely inside the runtime: the Camera, the
+    // AccessCamera Request and their proxies are dropped before the future
+    // returns. Two remote fds come out: one to enumerate (consumed by the
+    // watcher thread), one kept for the stream.
+    let fds = runtime().block_on(async {
+        let camera = match Camera::new().await {
+            Ok(camera) => camera,
+            Err(_) => return Ok::<_, anyhow::Error>(None),
+        };
+        if !camera.is_present().await.map_err(portal_error)? {
+            return Ok(None);
+        }
+        // `request_access` waits for the portal's response (ashpd prepares the
+        // Response signal inside the call): the first run shows the desktop's
+        // camera dialog, later runs return immediately. A refusal is a real
+        // error, not "no camera found". The returned Request is dropped here.
+        camera
+            .request_access()
+            .await
+            .map_err(|e| anyhow!("the camera portal refused access: {e}"))?;
+        let list = camera.open_pipe_wire_remote().await.map_err(portal_error)?;
+        let stream = camera.open_pipe_wire_remote().await.map_err(portal_error)?;
+        Ok(Some((list, stream)))
+        // `camera` drops here, inside the runtime.
+    })?;
+    let Some((list_fd, stream_fd)) = fds else {
         return Ok(None);
     };
-    if !present(&camera)? {
-        return Ok(None);
-    }
-    // `request_access` waits for the portal's response (ashpd prepares the
-    // Response signal inside the call): the first run shows the desktop's
-    // camera dialog, later runs return immediately. A refusal is a real error,
-    // not "no camera found".
-    runtime()
-        .block_on(async { camera.request_access().await })
-        .map_err(|e| anyhow!("the camera portal refused access: {e}"))?;
-    let fd = open_remote(&camera)?;
-    let nodes = enumerate_remote(fd)?;
+    let nodes = enumerate_remote(list_fd)?;
     let chosen = match sel {
         Some(sel) => pick(&nodes, sel),
         None => nodes.first(),
@@ -170,8 +186,7 @@ pub(super) fn open_source(sel: Option<&str>) -> Result<Option<CameraSource>> {
     let Some(node) = chosen else {
         return Ok(None);
     };
-    // A fresh connection for the stream: the enumeration closed its own.
-    let fd = open_remote(&camera)?;
+    let fd = stream_fd;
     let native = (1280usize, 720usize);
     Ok(Some(CameraSource {
         id: node.name.clone(),
@@ -180,7 +195,7 @@ pub(super) fn open_source(sel: Option<&str>) -> Result<Option<CameraSource>> {
             fd: Arc::new(fd),
             node_id: Some(node.node_id),
         }),
-        format_label: "portal camera, 720p until it negotiates".to_string(),
+        format_label: "portal camera".to_string(),
         native: Arc::new(Mutex::new(native)),
         sink: None,
         thread: None,
@@ -189,6 +204,164 @@ pub(super) fn open_source(sel: Option<&str>) -> Result<Option<CameraSource>> {
         running: false,
         started: None,
     }))
+}
+
+/// A running watch on the portal's PipeWire camera nodes.
+pub(super) struct Watch {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watch {
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// Watch the camera nodes of the portal's PipeWire remote.
+///
+/// Inside a Flatpak `/dev/video*` is not visible, so inotify cannot see a
+/// camera being plugged in. The portal's remote is an ordinary PipeWire
+/// connection as far as the registry is concerned: a newly created camera node
+/// (media.role=Camera) arrives as a `global` event, and unplugging it as
+/// `global_remove`. The watch opens its own remote (no AccessCamera here: the
+/// app must not show a permission dialog just because it started; the grant is
+/// persistent once a recording has used the camera) and coalesces the burst a
+/// hotplug produces into one callback.
+///
+/// Every zbus object is dropped inside the runtime, like the rest of this
+/// module.
+pub(super) fn watch_devices(cb: impl Fn() + Send + 'static) -> Result<Watch> {
+    let fd = runtime().block_on(async {
+        let camera = Camera::new().await.map_err(portal_error)?;
+        let fd = camera.open_pipe_wire_remote().await.map_err(portal_error)?;
+        Ok::<OwnedFd, anyhow::Error>(fd)
+        // `camera` drops here, inside the runtime.
+    })?;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("camera-portal-watch".into())
+        .spawn(move || watch_thread(fd, cb, thread_stop, ready_tx))
+        .context("starting the portal camera watch")?;
+    match ready_rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => Ok(Watch {
+            stop,
+            thread: Some(thread),
+        }),
+        Ok(Err(e)) => bail!("{e}"),
+        Err(_) => bail!("the portal camera watch did not start within 3 s"),
+    }
+}
+
+fn watch_thread(
+    fd: OwnedFd,
+    cb: impl Fn() + Send + 'static,
+    stop: Arc<AtomicBool>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    pw::init();
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = ready.send(Err(format!("creating a PipeWire main loop: {e}")));
+            return;
+        }
+    };
+    let context = match pw::context::ContextRc::new(&mainloop, None) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(format!("creating a PipeWire context: {e}")));
+            return;
+        }
+    };
+    let core = match context.connect_fd_rc(fd, None) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(format!(
+                "opening the camera portal's PipeWire remote: {e}"
+            )));
+            return;
+        }
+    };
+    let registry = match core.get_registry_rc() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ready.send(Err(format!("opening the camera portal's registry: {e}")));
+            return;
+        }
+    };
+    let ids = Rc::new(RefCell::new(std::collections::HashSet::<u32>::new()));
+    let dirty = Rc::new(std::cell::Cell::new(false));
+    let _registry_listener = registry
+        .add_listener_local()
+        .global({
+            let ids = ids.clone();
+            let dirty = dirty.clone();
+            move |global| {
+                if global.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                let Some(props) = global.props else {
+                    return;
+                };
+                // The portal marks its camera nodes with media.role=Camera;
+                // media.class Video/Source is the same node's type.
+                let camera = props.get("media.role") == Some("Camera")
+                    || (props.get("media.class") == Some("Video/Source")
+                        && props.get("node.name").is_some_and(|n| n.contains("camera")));
+                if camera {
+                    ids.borrow_mut().insert(global.id);
+                    dirty.set(true);
+                }
+            }
+        })
+        .global_remove({
+            let ids = ids.clone();
+            let dirty = dirty.clone();
+            move |id| {
+                if ids.borrow_mut().remove(&id) {
+                    dirty.set(true);
+                }
+            }
+        })
+        .register();
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        let stop = stop.clone();
+        let dirty = dirty.clone();
+        move |_| {
+            if stop.load(Ordering::SeqCst) {
+                mainloop.quit();
+                return;
+            }
+            if dirty.replace(false) {
+                cb();
+            }
+        }
+    });
+    timer.update_timer(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_millis(200)),
+    );
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    mainloop.run();
 }
 
 /// Match a requested camera against the portal's nodes: id/name exactly, then a
@@ -303,6 +476,95 @@ fn list_remote(fd: OwnedFd) -> Result<Vec<PortalNode>> {
     Ok(out)
 }
 
+/// The EnumFormat parameters the camera stream offers: one pod per raw layout
+/// the converters know. No size, no frame rate: the camera's own default is
+/// what it can actually deliver.
+fn format_pods() -> Vec<Vec<u8>> {
+    use pw::spa::param::format::FormatProperties;
+    use pw::spa::pod::{Object, Property, Value};
+    use pw::spa::utils::Id;
+
+    [
+        VideoFormat::BGRx,
+        VideoFormat::BGRA,
+        VideoFormat::RGBA,
+        VideoFormat::YUY2,
+        VideoFormat::NV12,
+        VideoFormat::I420,
+    ]
+    .into_iter()
+    .filter_map(|format| {
+        let object = Object {
+            type_: SpaTypes::ObjectParamFormat.as_raw(),
+            id: ParamType::EnumFormat.as_raw(),
+            properties: vec![
+                Property::new(
+                    FormatProperties::MediaType.as_raw(),
+                    Value::Id(Id(MediaType::Video.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::MediaSubtype.as_raw(),
+                    Value::Id(Id(MediaSubtype::Raw.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::VideoFormat.as_raw(),
+                    Value::Id(Id(format.as_raw())),
+                ),
+            ],
+        };
+        let values = PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(object))
+            .ok()?
+            .0
+            .into_inner();
+        Some(values)
+    })
+    .collect()
+}
+
+/// Buffer requirements, like GStreamer's pipewiresrc sends: without this the
+/// v4l2 camera source is handed a client-node port with zero buffers and
+/// rejects the link ("error use input buffers: -22").
+fn buffers_pod() -> Vec<u8> {
+    use pw::spa::pod::{ChoiceValue, Object, Property, Value};
+    use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    let range = |default: i32, min: i32, max: i32| {
+        Value::Choice(ChoiceValue::Int(Choice::<i32>(
+            ChoiceFlags::empty(),
+            ChoiceEnum::<i32>::Range { default, min, max },
+        )))
+    };
+    let mem_types = (1 << pw::spa::sys::SPA_DATA_MemFd) | (1 << pw::spa::sys::SPA_DATA_MemPtr);
+    let data_type = Value::Choice(ChoiceValue::Int(Choice::<i32>(
+        ChoiceFlags::empty(),
+        ChoiceEnum::<i32>::Flags {
+            default: mem_types,
+            flags: vec![mem_types],
+        },
+    )));
+    let object = Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![
+            Property::new(pw::spa::sys::SPA_PARAM_BUFFERS_buffers, range(8, 2, 32)),
+            Property::new(
+                pw::spa::sys::SPA_PARAM_BUFFERS_blocks,
+                range(0, 1, i32::MAX),
+            ),
+            Property::new(pw::spa::sys::SPA_PARAM_BUFFERS_size, range(0, 1, i32::MAX)),
+            Property::new(
+                pw::spa::sys::SPA_PARAM_BUFFERS_stride,
+                range(0, 0, i32::MAX),
+            ),
+            Property::new(pw::spa::sys::SPA_PARAM_BUFFERS_dataType, data_type),
+        ],
+    };
+    PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(object))
+        .expect("serialising the camera Buffers pod")
+        .0
+        .into_inner()
+}
+
 pub(super) fn capture_thread(
     cam: PortalCamera,
     sink: FrameSink,
@@ -365,15 +627,20 @@ fn run_capture(
         .add_local_listener_with_user_data(state.clone())
         .state_changed({
             let mainloop = mainloop.downgrade();
-            move |_stream, st, _old, new| match new {
-                pw::stream::StreamState::Error(e) => {
-                    fail(&mainloop, &format!("the camera portal stream failed: {e}"));
-                    let _ = &st;
+            move |_stream, st, old, new| {
+                if std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!("rec: debug: portal camera stream {old:?} -> {new:?}");
                 }
-                pw::stream::StreamState::Unconnected if st.borrow().ready_sent => {
-                    fail(&mainloop, "the portal camera was disconnected");
+                match new {
+                    pw::stream::StreamState::Error(e) => {
+                        fail(&mainloop, &format!("the camera portal stream failed: {e}"));
+                        let _ = &st;
+                    }
+                    pw::stream::StreamState::Unconnected if st.borrow().ready_sent => {
+                        fail(&mainloop, "the portal camera was disconnected");
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         })
         .param_changed(|_stream, st, id, param| {
@@ -391,6 +658,20 @@ fn run_capture(
             }
             let mut info = VideoInfoRaw::new();
             if info.parse(param).is_ok() {
+                if std::env::var_os("REC_DEBUG").is_some() {
+                    let size = info.size();
+                    let fps = info.framerate();
+                    eprintln!(
+                        "rec: debug: portal camera format {:?} {}x{} @ {}/{} range {} matrix {}",
+                        info.format(),
+                        size.width,
+                        size.height,
+                        fps.num,
+                        fps.denom,
+                        info.color_range(),
+                        info.color_matrix()
+                    );
+                }
                 st.borrow_mut().info = info;
             }
         })
@@ -403,73 +684,23 @@ fn run_capture(
         .register()
         .map_err(|e| anyhow!("listening to the camera stream: {e}"))?;
 
-    // Ask for the uncompressed layouts a portal camera normally provides.
-    let obj = pw::spa::pod::object!(
-        SpaTypes::ObjectParamFormat,
-        ParamType::EnumFormat,
-        pw::spa::pod::property!(
-            spa::param::format::FormatProperties::MediaType,
-            Id,
-            MediaType::Video
-        ),
-        pw::spa::pod::property!(
-            spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            MediaSubtype::Raw
-        ),
-        pw::spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA,
-            VideoFormat::RGBA,
-            VideoFormat::YUY2,
-            VideoFormat::NV12,
-            VideoFormat::I420
-        ),
-        pw::spa::pod::property!(
-            spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            Rectangle {
-                width: 1280,
-                height: 720
-            },
-            Rectangle {
-                width: 160,
-                height: 120
-            },
-            Rectangle {
-                width: 1920,
-                height: 1080
-            }
-        ),
-        pw::spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            Fraction { num: 30, denom: 1 },
-            Fraction { num: 0, denom: 1 },
-            Fraction { num: 60, denom: 1 }
-        ),
-    );
-    let values = PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj))
-        .map_err(|e| anyhow!("building the camera format: {e:?}"))?
-        .0
-        .into_inner();
-    let pod =
-        Pod::from_bytes(&values).ok_or_else(|| anyhow!("internal: malformed camera format"))?;
-    let mut params = [pod];
+    // Offer the layouts one pod at a time, like the screen-cast path: a node
+    // advertises one discrete format per parameter, and a single pod carrying
+    // a Choice/Range selection makes the client-node negotiate a format whose
+    // buffer size never gets resolved (the server then reports "use input
+    // buffers: -22" and the camera dies before its first frame). Size and
+    // frame rate are left to the camera, exactly like the screen stream.
+    let mut pods = format_pods();
+    pods.push(buffers_pod());
+    let mut params: Vec<&Pod> = pods.iter().filter_map(|p| Pod::from_bytes(p)).collect();
     stream
         .connect(
             Direction::Input,
             cam.node_id,
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::ALLOC_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .map_err(|e| anyhow!("connecting the camera stream: {e}"))?;
@@ -653,6 +884,64 @@ mod tests {
             name: name.into(),
             description: description.into(),
         }
+    }
+
+    #[test]
+    fn the_stream_offers_raw_formats_and_an_explicit_buffers_param() {
+        use pw::spa::pod::Value;
+        use pw::spa::pod::deserialize::PodDeserializer;
+
+        let formats = format_pods();
+        assert_eq!(formats.len(), 6, "BGRx, BGRA, RGBA, YUY2, NV12, I420");
+        for bytes in &formats {
+            let (_, value) =
+                PodDeserializer::deserialize_from::<Value>(bytes).expect("format pod deserializes");
+            let Value::Object(object) = value else {
+                panic!("format pod is not an object");
+            };
+            assert_eq!(object.type_, SpaTypes::ObjectParamFormat.as_raw());
+            assert!(
+                object.properties.iter().any(|p| {
+                    p.key == pw::spa::param::format::FormatProperties::VideoFormat.as_raw()
+                }),
+                "a format pod without Video:format"
+            );
+        }
+        // A v4l2 source rejects a client-node port with no Buffers param
+        // ("error use input buffers: -22"); the camera stream must send one.
+        let bytes = buffers_pod();
+        let (_, value) =
+            PodDeserializer::deserialize_from::<Value>(&bytes).expect("buffers pod deserializes");
+        let Value::Object(object) = value else {
+            panic!("buffers pod is not an object");
+        };
+        assert_eq!(object.type_, SpaTypes::ObjectParamBuffers.as_raw());
+        assert_eq!(object.id, ParamType::Buffers.as_raw());
+        for key in [
+            pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+            pw::spa::sys::SPA_PARAM_BUFFERS_blocks,
+            pw::spa::sys::SPA_PARAM_BUFFERS_size,
+            pw::spa::sys::SPA_PARAM_BUFFERS_stride,
+            pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+        ] {
+            assert!(
+                object.properties.iter().any(|p| p.key == key),
+                "missing buffers property {key}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a D-Bus session (scripts/audio/integration.sh portal)"]
+    fn portal_objects_are_dropped_inside_the_runtime() {
+        // A session bus without a Camera backend still constructs the `Camera`
+        // zbus proxy and then drops it on the error path. That destructor needs
+        // the Tokio reactor: before the fix it ran on the bare test thread and
+        // panicked with "there is no reactor running" (an abort in the real
+        // Flatpak). Reaching the end of these calls without a panic is the
+        // regression test.
+        let _ = cameras();
+        let _ = status();
     }
 
     #[test]
