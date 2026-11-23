@@ -6,8 +6,12 @@ own demuxers and decoders, so it works unchanged on Linux.
 
 Finds the frames where the picture flashes to white and the onsets of beeps in
 each audio track, pairs each flash with the nearest beep, and reports the
-offset (audio minus video, ms). Sources: `rec-rs record --test-pattern`
-(pipeline check) or a played-back flash/beep clip (end-to-end capture check).
+offset (audio minus video, ms). A flash is placed at its frame's presentation
+time, not at `index / fps`: when the encoder refused a slot the file has a
+dropped-frame gap, and index / fps would report that content as early (it made
+a correctly synced VA-API recording look 183 ms off). Sources: `rec-rs record
+--test-pattern` (pipeline check) or a played-back flash/beep clip (end-to-end
+capture check).
 
 Usage: synccheck.py FILE [--max-ms 20] [--audio 0,1] [--region x,y,w,h (0..1 fractions)]
 Exit status 1 if no flashes are paired or any |offset| exceeds --max-ms.
@@ -21,6 +25,14 @@ def probe(path):
     j = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-of", "json", path]))
     return j["streams"]
 
+def frame_pts(path):
+    """Presentation time of every decoded frame, in display order."""
+    raw = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "frame=pts_time", "-of", "csv=p=0", path])
+    # Some ffprobe versions end a field with a comma under csv=p=0.
+    vals = [v for v in (x.strip().rstrip(",") for x in raw.decode().split()) if v and v != "N/A"]
+    return sorted(float(v) for v in vals)
+
 def flashes(path, fps, start, region):
     vf = "scale=64:36"
     if region:
@@ -30,10 +42,11 @@ def flashes(path, fps, start, region):
                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
     n = 64 * 36
     lum = [sum(raw[i:i + n]) / n for i in range(0, len(raw) - n + 1, n)]
+    pts = frame_pts(path)
     out, prev = [], 0.0
     for i, l in enumerate(lum):
         if l > 180 and prev < 140:
-            out.append(start + i / fps)
+            out.append(pts[i] if i < len(pts) else start + i / fps)
         prev = l
     return out, len(lum)
 
