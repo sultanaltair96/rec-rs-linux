@@ -163,11 +163,14 @@ const QUEUE_MAX: usize = 7;
 /// software encoder (a 4K BGRA frame is 33 MB) must not spend.
 const VIDEO_QUEUE_FRAMES: u64 = 2;
 
-/// Bytes an audio appsrc may hold: 17 buffers of 10 ms stereo f32 (170 ms).
-const AUDIO_QUEUE_BYTES: u64 = 64 * 1024;
+/// Bytes an audio appsrc may hold: about 0.7 s of 10 ms stereo f32 buffers.
+/// Large enough that a busy muxer rides out a stall without dropping a chunk
+/// in the middle of a beep (a dropped buffer ends the previous one abruptly,
+/// which is a quiet click), still a hard memory bound per track.
+const AUDIO_QUEUE_BYTES: u64 = 256 * 1024;
 
 /// Buffers an audio appsrc/queue may hold.
-const AUDIO_QUEUE_BUFFERS: u32 = 8;
+const AUDIO_QUEUE_BUFFERS: u32 = 32;
 
 /// How far behind its time a slot may fall while the encoder is busy before it
 /// is dropped instead of retried (upstream's `MAX_BACKLOG_SECS`).
@@ -308,6 +311,11 @@ pub struct Writer {
     mixer: Option<Mixer>,
     /// The mix bus for the live encode (real time, keeps running while paused).
     live_mixer: Option<Mixer>,
+    /// Wall-clock time each source last delivered a chunk. Filler silence is
+    /// only for a source that is *gone* (nothing for STARVE_SECS), never for
+    /// one that is alive but behind in media time (a backlog burst): filling
+    /// in the middle of a burst pushed the track late and spliced it.
+    source_seen: [f64; 2],
     /// The shared live encode (replay buffer, streams; phase 1D).
     live: Option<Arc<live::Live>>,
     /// Where every emitted frame is offered (the app's preview; phase 1E).
@@ -401,6 +409,7 @@ impl Writer {
             }),
             mixer: None,
             live_mixer: None,
+            source_seen: [0.0; 2],
             live: None,
             preview: None,
             last_preview: 0.0,
@@ -694,6 +703,12 @@ impl Writer {
         if let Some(sink) = self.sink.as_ref() {
             let _ = sink.pipeline.set_state(gst::State::Playing);
         }
+        let started = crate::media_types::now();
+        for i in 0..2 {
+            if self.audio_wanted[i] {
+                self.source_seen[i] = started;
+            }
+        }
         if self.audio_wanted.iter().any(|w| *w) {
             if self
                 .sink
@@ -721,6 +736,7 @@ impl Writer {
         if !self.audio_wanted[i] || chunk.frames() == 0 {
             return;
         }
+        self.source_seen[i] = crate::media_types::now();
         let Some(t0) = self.t0 else {
             // Keep it until the clock starts; the part after t0 is used.
             self.preroll.push_back((kind, chunk.clone()));
@@ -890,7 +906,21 @@ impl Writer {
         let out_time = limit.map_or(out_time, |l| out_time.min(l));
         let mut filled = 0u64;
         let mut failed = false;
+        let wall = crate::media_types::now();
         for track in &mut sink.tracks {
+            let source_alive = match track.target {
+                Target::System => wall - self.source_seen[0] < STARVE_SECS,
+                Target::Mic => wall - self.source_seen[1] < STARVE_SECS,
+                Target::Mix => {
+                    (0..2).any(|i| self.audio_wanted[i] && wall - self.source_seen[i] < STARVE_SECS)
+                }
+            };
+            if source_alive {
+                // The source is delivering, just behind in media time (a
+                // backlog burst). Its own samples must fill this range; filler
+                // here would push the track late and splice the burst.
+                continue;
+            }
             let start = track.next.unwrap_or(0.0);
             // Only a track that is genuinely overdue gets filler: a source
             // that is merely late (under load, a burst of past-pts chunks) must
