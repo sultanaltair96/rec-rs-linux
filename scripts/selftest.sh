@@ -746,7 +746,7 @@ if wanted stream-whip; then
     if [ "$status" -eq 0 ] && [ -s "$OUT/stream-whip.log" ]; then
         # Five sessions in a row, every mean within ±15 ms.
         offs=$(grep -h '^PASS  whip-run' "$OUT/stream-whip.log" \
-               | sed 's/^PASS  whip-run-[0-9]*  (A\/V offset mean //; s/ ms)$//' | paste -sd ' ' -)
+               | sed 's/^PASS  whip-run-[0-9]*  (A\/V offset mean \([-+0-9.]*\).*/\1/' | paste -sd ' ' -)
         echo "PASS  stream-whip  (5 sessions, A/V offsets: $offs ms)"
         pass=$((pass+1))
     elif [ "$status" -eq 3 ]; then

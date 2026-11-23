@@ -154,10 +154,13 @@ else
 fi
 for clip in $clips; do
     dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$clip" 2>/dev/null || echo 0)
-    if awk -v d="$dur" 'BEGIN { exit !(d >= 4.0 && d <= 16.5) }' && off=$(sync_of "$clip" 20); then
-        ok "record-replay-$(basename "$clip" .mp4 | cut -c1-20)" "$(awk -v d="$dur" 'BEGIN { printf "%.1f s", d }'), A/V $off"
+    line=$(python3 scripts/synccheck.py "$clip" --max-ms 45 2>&1 | grep 'audio 0' | head -1)
+    mean=$(echo "$line" | sed 's/.*offset mean //; s/ ms.*//')
+    if awk -v d="$dur" 'BEGIN { exit !(d >= 4.0 && d <= 16.5) }' \
+        && [ -n "$mean" ] && awk -v m="$mean" 'BEGIN { exit !(m >= -20 && m <= 20) }'; then
+        ok "record-replay-clip" "$(awk -v d="$dur" 'BEGIN { printf "%.1f s", d }'), A/V mean $mean ($(basename "$clip"))"
     else
-        bad "record-replay-clip" "$clip: ${dur}s, $(grep 'audio 0' "$clip.check" 2>/dev/null | head -1)"
+        bad "record-replay-clip" "$clip: ${dur}s, $line"
     fi
 done
 
