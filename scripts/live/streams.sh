@@ -95,30 +95,53 @@ case_multi() {
     check_and_count whip "$(newest_recording "$dir/recordings/d")" 40
 }
 
-# --- one WHIP endpoint ------------------------------------------------------
+# --- WHIP: five consecutive sessions, each within ±15 ms --------------------
+# The start of a WHIP session is where a server-side A/V offset comes from (each
+# track's first packet sets its timeline), so one run says little: five runs in a
+# row must all land in the same place.
 case_whip() {
     dir="$OUT/whip"
     rm -rf "$dir"
     mkdir -p "$dir"
     start_server "$dir" "$dir/mediamtx.log"
-    if run_harness whip 12 "" http://127.0.0.1:8889/w/ch/whip; then
-        if grep -q 'live: stream whip://.* live .* ever-live yes' "$OUT/whip.out"; then
-            ok stream-whip "WHIP published, A/V aligned"
+    worst=0
+    runs=0
+    for run in 1 2 3 4 5; do
+        if run_harness "whip$run" 8 "" "http://127.0.0.1:8889/w$run/whip"; then
+            if grep -q 'live: stream whip://.* live .* ever-live yes' "$OUT/whip$run.out"; then
+                runs=$((runs + 1))
+            else
+                bad "whip-run-$run" "the WHIP destination never went live"
+            fi
         else
-            bad stream-whip "the WHIP destination never went live"
+            bad "whip-run-$run" "the harness failed"
         fi
+        file=$(newest_recording "$dir/recordings/w$run")
+        if [ -z "$file" ]; then
+            bad "whip-run-$run" "the server recorded nothing"
+            continue
+        fi
+        if ! python3 scripts/synccheck.py "$file" --max-ms 15 >"$file.check" 2>&1; then
+            off=$(grep 'audio 0' "$file.check" | head -1 | sed 's/.*offset //; s/,.*//')
+            bad "whip-run-$run" "A/V offset ${off:-unmeasurable}"
+            continue
+        fi
+        off=$(grep 'audio 0' "$file.check" | head -1 | sed 's/.*offset //; s/,.*//')
+        ok "whip-run-$run" "A/V offset $off"
+    done
+    if [ "$runs" -eq 5 ]; then
+        ok whip-sessions "5/5 WHIP sessions published"
     else
-        bad stream-whip "the harness failed"
+        bad whip-sessions "$runs/5 WHIP sessions published"
     fi
-    stop_server "$dir"
-    file=$(newest_recording "$dir/recordings/w")
-    check_and_count whip-sync "$file" 40
-    codec=$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$file" 2>/dev/null || true)
+    codec=$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 \
+        "$(newest_recording "$dir/recordings/w5")" 2>/dev/null || true)
     if [ "$codec" = opus ]; then
         ok whip-audio "audio is Opus, as WebRTC requires"
     else
         bad whip-audio "audio codec is '${codec:-none}'"
     fi
+    stop_server "$dir"
 }
 
 # --- HEVC over enhanced RTMP, then the H.264 fallback ----------------------

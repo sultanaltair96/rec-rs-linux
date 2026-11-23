@@ -46,6 +46,8 @@ enum Media {
     Video {
         pts: f64,
         hevc: bool,
+        /// A sync sample: only one of these can start the stream.
+        key: bool,
         annexb: Vec<u8>,
     },
     Audio {
@@ -165,6 +167,7 @@ impl Output for WhipOutput {
                 s.queue.push_back(Media::Video {
                     pts: p.pts,
                     hevc: f.hevc,
+                    key: p.keyframe,
                     annexb,
                 });
             }
@@ -541,19 +544,31 @@ struct Anchor {
     /// Capture time sent at `at`.
     t0: f64,
     at: Instant,
-    /// RTP time (seconds) for the first keyframe, equal to the first audio
-    /// packet's.
-    first_video_rtp: Option<f64>,
 }
 
-/// Start the session timeline once a keyframe is queued. Some servers (e.g.
-/// MediaMTX) treat the first packet of each track as simultaneous, so the first
-/// audio packet is the one nearest the keyframe (earlier ones are dropped) and
-/// the keyframe takes its RTP time: only that one frame moves, by less than an
-/// audio frame. Returns None while waiting for audio.
+/// Start the session timeline once a keyframe **with audio next to it** is
+/// queued.
+///
+/// Every packet's RTP time is its capture time ([`take_due`] sends it at the
+/// same point on the timeline), so both tracks describe when their content was
+/// captured and a server can place them without a hint. Upstream instead nudges
+/// the first keyframe's RTP time onto the first audio packet's, for servers that
+/// assume the first packet of every track arrives together; measured against
+/// MediaMTX that nudge moved the whole recording by the nudge (−12 ms at a
+/// 13.5 ms nudge, with ±20 ms swings between runs), so this port does not do it.
+/// What it does do is refuse to *start* on a keyframe whose audio is not within
+/// one Opus frame of it (the encoder came up late, or the session connected
+/// mid-buffer): the audio would begin a frame or two after the picture, and the
+/// server keeps that difference for the whole stream (measured: −36.5 ms).
+/// Such a keyframe is skipped; the next one, one GOP later, has audio around it.
+/// Returns None while waiting.
 fn start_anchor(q: &mut VecDeque<Media>, now: Instant) -> Option<Anchor> {
-    let Some(k) = q.iter().position(|m| matches!(m, Media::Video { .. })) else {
-        // No video yet: keep only recent audio.
+    let Some(k) = q
+        .iter()
+        .position(|m| matches!(m, Media::Video { key: true, .. }))
+    else {
+        // No keyframe yet: keep only the last second, so a slow start cannot
+        // grow the queue.
         if let Some(newest) = q.back().map(Media::pts) {
             q.retain(|m| m.pts() > newest - 1.0);
         }
@@ -565,30 +580,68 @@ fn start_anchor(q: &mut VecDeque<Media>, now: Instant) -> Option<Anchor> {
             .filter(|m| matches!(m, Media::Audio { .. }))
             .map(Media::pts)
     };
-    let best = candidates()
-        .filter(|&p| p > tk - OPUS_FRAME && p < tk + OPUS_FRAME)
-        .min_by(|a, b| (a - tk).abs().total_cmp(&(b - tk).abs()));
+    // The audio packet to start on: the latest one at or before the keyframe
+    // (there is always one within a frame of it once the audio runs), else the
+    // first one after. Starting on an *earlier* packet keeps the keyframe's
+    // one-frame nudge in the direction that measured best (a later packet
+    // showed up as audio up to 12 ms early in the server's recording).
+    let before = candidates()
+        .filter(|&p| p <= tk + 1e-9 && p > tk - OPUS_FRAME)
+        .fold(f64::MIN, f64::max);
+    let best = if before != f64::MIN {
+        Some(before)
+    } else {
+        candidates()
+            .filter(|&p| p > tk && p < tk + OPUS_FRAME)
+            .min_by(|a, b| (a - tk).abs().total_cmp(&(b - tk).abs()))
+    };
     let newest_audio = candidates().fold(f64::MIN, f64::max);
     let newest_video = q
         .iter()
         .rev()
         .find(|m| matches!(m, Media::Video { .. }))
         .map_or(tk, Media::pts);
-    // Wait for the audio around the keyframe (it may still be in the mixer),
-    // but not for silence that never comes.
-    if newest_audio < tk + OPUS_FRAME && newest_video - tk < 0.5 {
+    if newest_audio == f64::MIN {
+        // No audio at all (a session with no source whose silence has not
+        // arrived yet): start on video once half a second of it is queued.
+        if newest_video - tk < 0.5 {
+            return None;
+        }
+    } else if best.is_none() {
+        // Audio exists but not next to this keyframe: drop what is older than
+        // the audio we have (it cannot be our start) and wait for the next
+        // keyframe.
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!(
+                "whip: keyframe {tk:.4} has no audio within {} ms (newest audio {newest_audio:.4}): waiting for the next one",
+                OPUS_FRAME * 1000.0
+            );
+        }
+        let from = newest_audio - OPUS_FRAME;
+        q.retain(|m| m.pts() >= from);
         return None;
     }
     let first = best.filter(|&p| (p - tk).abs() < OPUS_FRAME);
     let cut = first.unwrap_or(tk);
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "whip: anchor: keyframe {tk:.4}, audio cut {cut:.4} (delta {:+.1} ms), queued {} audio {} video",
+            (cut - tk) * 1000.0,
+            q.iter()
+                .filter(|m| matches!(m, Media::Audio { .. }))
+                .count(),
+            q.iter()
+                .filter(|m| matches!(m, Media::Video { .. }))
+                .count(),
+        );
+    }
     q.retain(|m| match m {
         Media::Audio { .. } => m.pts() >= cut - 1e-6,
-        Media::Video { .. } => m.pts() >= tk,
+        Media::Video { .. } => m.pts() >= tk - 1e-6,
     });
     Some(Anchor {
         t0: cut.min(tk),
         at: now + SEND_MARGIN,
-        first_video_rtp: first,
     })
 }
 
@@ -624,14 +677,7 @@ fn take_due(
             return (None, Some(due));
         }
         let m = q.remove(i).unwrap();
-        let rtp = match (&m, a.first_video_rtp.take()) {
-            (Media::Video { .. }, Some(r)) => r,
-            (Media::Video { .. }, None) => pts,
-            (Media::Audio { .. }, keep) => {
-                a.first_video_rtp = keep;
-                pts
-            }
-        };
+        let rtp = pts;
         return (Some((m, due, rtp)), None);
     }
 }
@@ -651,6 +697,7 @@ fn stream(
     let mut connected = false;
     let mut anchor: Option<Anchor> = None;
     let mut first_sent: [Option<f64>; 2] = [None; 2];
+    let mut sent_count = 0;
     let mut next_sample = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -696,6 +743,23 @@ fn stream(
         };
         if let Some((m, wallclock, rtp_secs)) = item {
             let pts = m.pts();
+            if sent_count < 4 {
+                sent_count += 1;
+                if std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!(
+                        "whip: write {} pts {pts:.4} rtp {rtp_secs:.4} (delta {:+.1} ms) at {:.1} ms from anchor",
+                        if matches!(m, Media::Audio { .. }) {
+                            "audio"
+                        } else {
+                            "video"
+                        },
+                        (rtp_secs - pts) * 1000.0,
+                        (Instant::now() - anchor.as_ref().map_or(Instant::now(), |a| a.at))
+                            .as_secs_f64()
+                            * 1000.0,
+                    );
+                }
+            }
             if std::env::var_os("REC_DEBUG").is_some()
                 && first_sent[matches!(m, Media::Audio { .. }) as usize].is_none()
             {
@@ -795,8 +859,61 @@ mod tests {
         Media::Video {
             pts,
             hevc: false,
+            key: true,
             annexb: vec![0, 0, 0, 1, 0x65],
         }
+    }
+
+    /// A cue frame (not a sync sample): it can never start the stream.
+    fn delta(pts: f64) -> Media {
+        Media::Video {
+            pts,
+            hevc: false,
+            key: false,
+            annexb: vec![0, 0, 0, 1, 0x41],
+        }
+    }
+
+    /// Audio that starts after the first keyframe (the encoder came up late, or
+    /// the session connected mid-buffer) must not start the stream on that
+    /// keyframe: the tracks would stay a frame or two apart for the whole
+    /// recording (measured: a −36 ms recording). The next keyframe, with audio
+    /// around it, starts it.
+    #[test]
+    fn waits_for_audio_next_to_the_keyframe() {
+        let t = Instant::now();
+        let mut q: VecDeque<Media> = VecDeque::new();
+        q.push_back(video(10.0));
+        for f in 0..15 {
+            q.push_back(delta(10.0 + f as f64 / 30.0));
+        }
+        // Audio only from 10.5 s: nothing next to the keyframe at 10.0.
+        for i in 0..5 {
+            q.push_back(audio(10.5 + i as f64 * 0.02));
+        }
+        assert!(
+            start_anchor(&mut q, t).is_none(),
+            "no audio by the keyframe"
+        );
+        // The stale video is gone; only recent items wait for the next keyframe.
+        assert!(
+            q.iter().all(|m| m.pts() >= 10.48),
+            "the old GOP was dropped: {:?}",
+            q.iter().map(Media::pts).collect::<Vec<_>>()
+        );
+        // The next keyframe (12.0) has audio around it.
+        q.push_back(video(12.0));
+        for i in 0..6 {
+            q.push_back(audio(11.99 + i as f64 * 0.02));
+        }
+        let a = start_anchor(&mut q, t).expect("the second keyframe starts it");
+        assert!((a.t0 - 11.99).abs() < 1e-9, "t0 {}", a.t0);
+        // The first video packet is the keyframe, and the audio before the cut
+        // is dropped.
+        assert!(
+            matches!(q.front(), Some(Media::Video { key: true, pts, .. }) if (pts - 12.0).abs() < 1e-9)
+        );
+        assert!(q.iter().all(|m| m.pts() >= 11.99 - 1e-9));
     }
 
     fn audio(pts: f64) -> Media {
@@ -840,8 +957,8 @@ mod tests {
         );
         let first_video = sent.iter().find(|s| !s.0).unwrap();
         assert!(
-            (first_video.2 - 10.0).abs() < 1e-9,
-            "keyframe takes the first audio packet's RTP time"
+            (first_video.2 - first_video.1).abs() < 1e-9,
+            "the keyframe keeps its own time as its RTP time"
         );
         let second_video = sent.iter().filter(|s| !s.0).nth(1).unwrap();
         assert!(
