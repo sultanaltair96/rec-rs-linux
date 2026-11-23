@@ -247,7 +247,7 @@ version that does it).
 | Hardware H.264/HEVC | VideoToolbox | VA-API on a GPU host; the container has no GPU, so it records with x264enc/x265enc (the writer skips VA without /dev/dri and trial-encodes it otherwise) | 1C | todo | dev/ELEMENTS.md |
 | ProRes | 422 | `avenc_prores_ks` 422 | 0 | done | selftest `pattern-prores` |
 | 10-bit / HDR | No | No | — | n-a | matches upstream |
-| Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
+| Constant frame rate | Exact grid | Exact grid, also when the encoder is slower than the grid: four frames may wait in the app source and the pacer blocks, so every slot is written and memory stays bounded (4K HEVC: 120 frames at 60/1, 1.2 GB peak) | 0 | done | selftest + ffprobe PTS; selftest `pattern-4k-hevc` (120 frames at 60/1) |
 | Crash-safe files | Fragments every 2 s | Fragments every 2 s | 0 | done | crash test decodes |
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes; the app's button and `rec-rs pause`/`resume` hit the same session | 0 (CLI), 1E (app) | done | selftest `pause-resume`, `gui` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |

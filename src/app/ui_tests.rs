@@ -12,14 +12,45 @@ use egui_kittest::kittest::Queryable;
 
 use super::widgets::{self as w};
 
-/// wgpu device creation and teardown on Mesa's lavapipe is not safe to run on
-/// several threads at once (the test binary crashed with SIGSEGV every few
-/// runs). Every test that builds a harness holds this, so one GPU context
-/// exists at a time; the whole suite still takes about a second.
+/// Creating and destroying wgpu devices on Mesa's lavapipe from several
+/// threads (and next to the compositor's own test device) crashed the test
+/// binary with SIGSEGV every few runs. The UI tests therefore share one
+/// device, created once and never dropped, and hold a lock while they use it.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn gpu() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The one device every UI harness renders on.
+fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    use std::sync::OnceLock;
+    static SETUP: OnceLock<egui_wgpu::WgpuSetup> = OnceLock::new();
+    SETUP
+        .get_or_init(|| {
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+            );
+            let adapter = pollster::block_on(
+                instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+            )
+            .expect("a wgpu adapter for the UI tests (Mesa's lavapipe in the dev image)");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("rec-ui-tests"),
+                    required_limits:
+                        wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                    ..Default::default()
+                }))
+                .expect("a wgpu device for the UI tests");
+            egui_wgpu::WgpuSetup::Existing(egui_wgpu::WgpuSetupExisting {
+                instance,
+                adapter,
+                device,
+                queue,
+            })
+        })
+        .clone()
 }
 use super::{Cmd, Device, Meter, State, ui};
 use crate::settings::{Settings, StreamDest};
@@ -56,7 +87,7 @@ where
     let mut h = Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
-        .wgpu()
+        .wgpu_setup(wgpu_setup())
         .build_ui_state(
             move |ui, st: &mut State| {
                 if first.replace(false) {
@@ -78,6 +109,13 @@ fn main_harness(st: State) -> Harness<'static, State> {
 
 fn settings_harness(st: State) -> Harness<'static, State> {
     themed_harness(egui::vec2(520.0, 820.0), ui::settings_window, st)
+}
+
+#[test]
+fn test_threads_env_is_set() {
+    // Guard: `.cargo/config.toml` serialises the test binary (see its comment),
+    // so the compositor's and the UI's wgpu devices never race on lavapipe.
+    assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("1"));
 }
 
 #[test]

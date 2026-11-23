@@ -66,7 +66,27 @@ check pattern-prores --test-pattern -t 2 --codec prores --no-mic
 # HEVC Main (x265enc, RPM Fusion's gst-plugins-bad-freeworld).
 check pattern-hevc --test-pattern -t 2 --codec hevc --no-mic
 # 4K60 through the automatic codec choice: hevc above 1080p, upstream's rule.
-check pattern-4k-hevc --test-pattern --noise -r 4k -t 2 --no-mic
+# A software 4K HEVC encoder runs at a few frames a second, so this also proves
+# the writer keeps the constant-frame-rate grid (all 120 slots) while its queue
+# stays bounded (1.2 GB peak here, not the 4+ GB an unbounded app source took).
+if wanted pattern-4k-hevc; then
+    f="$OUT/pattern-4k-hevc.mov"
+    frames=0; rate=0
+    if timeout "$TIMEOUT" "$REC" record -q -o "$f" --test-pattern --noise -r 4k -t 2 --no-mic \
+           >/dev/null 2>"$OUT/pattern-4k-hevc.log" \
+       && "$REC" probe "$f" >"$OUT/pattern-4k-hevc.probe" 2>&1 \
+       && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/pattern-4k-hevc.log"; then
+        frames=$(ffprobe -v error -select_streams v -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f")
+        rate=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$f")
+    fi
+    if [ "$frames" = 120 ] && [ "$rate" = "60/1" ]; then
+        echo "PASS  pattern-4k-hevc  ($(grep -c '^track' "$OUT/pattern-4k-hevc.probe") tracks, $frames frames at $rate, queue bounded)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  pattern-4k-hevc  ($frames frames at '$rate', want 120 at 60/1; see $OUT/pattern-4k-hevc.log / .probe)"
+        fail=$((fail+1))
+    fi
+fi
 
 # Bitrate and profile: a 1080p60 H.264 recording asked for 8 Mb/s must land
 # within 25% of it, at profile High (upstream's H.264 profile; the
