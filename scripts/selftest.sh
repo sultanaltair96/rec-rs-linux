@@ -53,6 +53,7 @@ case "${1:-}" in
         echo "tracks audio-tracks sync audio-gaps pause-resume gain h264-bitrate"
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
+        echo "screen-exclude"
         echo "opt-in: long-finalize (10 min)"
         echo "pattern-mic pattern-system-audio"
         echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay"
@@ -708,6 +709,31 @@ screen_test screen-token headless.sh token 1280 720 0
 screen_test screen-x11 xvfb.sh x11 1280 800 30
 # X11: --window <app> captures one client's own surface.
 screen_test screen-window xvfb.sh window 400 300 30
+# Own windows (G3): REC_EXCLUDE_WINDOWS=<id>. On X11 the only animating window
+# is painted out, so the recording must be a still frame; a portal stream cannot
+# exclude anything and says so.
+if wanted screen-exclude; then
+    if [ -z "$screen_harness" ]; then
+        echo "SKIP  screen-exclude  (needs sway, Xvfb and dbus-run-session: run under scripts/dev.sh)"
+        skip=$((skip+1))
+    elif REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" scripts/screen/xvfb.sh \
+             scripts/screen/cases.sh exclude-x11 >/dev/null 2>"$OUT/screen-exclude.harness.log" \
+         && REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" scripts/screen/headless.sh \
+             scripts/screen/cases.sh exclude-portal >/dev/null 2>>"$OUT/screen-exclude.harness.log"; then
+        total=$(frames_total "$OUT/screen-exclude.mp4")
+        distinct=$(frames_distinct "$OUT/screen-exclude.mp4")
+        if [ "$total" -ge 30 ] && [ "$distinct" -eq 1 ]; then
+            echo "PASS  screen-exclude  ($total frames, $distinct distinct: the excluded window is painted out; portal note printed)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  screen-exclude  ($total frames, $distinct distinct: the excluded window is still in the picture; see $OUT/screen-exclude.log)"
+            fail=$((fail+1))
+        fi
+    else
+        echo "FAIL  screen-exclude  (see $OUT/screen-exclude.harness.log)"
+        fail=$((fail+1))
+    fi
+fi
 
 # The app: start the real GUI (window on headless sway, the software renderer)
 # recording the test pattern, add a second launch (it must hand over to the
