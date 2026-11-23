@@ -53,10 +53,10 @@ case "${1:-}" in
         echo "tracks audio-tracks sync audio-gaps pause-resume gain h264-bitrate"
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
+        echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "screen-exclude no-sink"
         echo "opt-in: long-finalize (10 min)"
-        echo "pattern-mic pattern-system-audio"
-        echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay"
+        echo "skipped: pattern-webcam scene-webcam"
         exit 0 ;;
 esac
 
@@ -745,6 +745,70 @@ if wanted screen-exclude; then
     fi
 fi
 
+# The replay buffer: 20 s with --replay 15, saved with `rec-rs save-replay`,
+# checked for length, keyframe start, playability, sync and the memory report.
+if wanted replay; then
+    if scripts/live/replay.sh >"$OUT/replay.log" 2>&1 && [ -s "$OUT/replay.log" ]; then
+        echo "PASS  replay  ($(grep -m1 '^PASS  replay-length' "$OUT/replay.log" | sed 's/^PASS  replay-length  (//; s/)$//'))"
+        pass=$((pass+1))
+    else
+        echo "FAIL  replay  (see $OUT/replay.log)"; fail=$((fail+1))
+    fi
+fi
+
+# Streaming against a local MediaMTX: two RTMP paths and an RTMPS one from one
+# encode, and a reconnect after the server restarts. MediaMTX is downloaded at
+# test time into the cache (outside the repo) and records every path, so the
+# checks measure what the server received. Exit 3 means it could not be
+# downloaded (offline): that is a SKIP, not a failure.
+if wanted stream-rtmp; then
+    status=0
+    scripts/live/streams.sh --rtmp >"$OUT/stream-rtmp.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ] && [ -s "$OUT/stream-rtmp.log" ]; then
+        echo "PASS  stream-rtmp  ($(grep -m1 '^PASS  rtmp-a' "$OUT/stream-rtmp.log" | sed 's/^PASS  rtmp-a  (//; s/)$//'); $(grep -c '^PASS  rtmp\|^PASS  rtmps' "$OUT/stream-rtmp.log") recordings checked)"
+        pass=$((pass+1))
+    elif [ "$status" -eq 3 ]; then
+        echo "SKIP  stream-rtmp  (MediaMTX could not be downloaded)"; skip=$((skip+1))
+    else
+        echo "FAIL  stream-rtmp  (see $OUT/stream-rtmp.log)"; fail=$((fail+1))
+    fi
+fi
+
+# WHIP: SDP POST, ICE/DTLS/SRTP, H.264 + Opus, A/V aligned, recorded by the
+# server and measured with the sync check.
+if wanted stream-whip; then
+    status=0
+    scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ] && [ -s "$OUT/stream-whip.log" ]; then
+        # Five sessions in a row, every mean within ±15 ms.
+        offs=$(grep -h '^PASS  whip-run' "$OUT/stream-whip.log" \
+               | sed 's/^PASS  whip-run-[0-9]*  (A\/V offset mean \([-+0-9.]*\).*/\1/' | paste -sd ' ' -)
+        echo "PASS  stream-whip  (5 sessions, A/V offsets: $offs ms)"
+        pass=$((pass+1))
+    elif [ "$status" -eq 3 ]; then
+        echo "SKIP  stream-whip  (MediaMTX could not be downloaded)"; skip=$((skip+1))
+    else
+        echo "FAIL  stream-whip  (see $OUT/stream-whip.log)"; fail=$((fail+1))
+    fi
+fi
+
+# The real recorder, end to end: a file, RTMP + WHIP from the same encode, a
+# replay buffer with two `save-replay` clips written while recording, a
+# pause/resume in the middle, and a `--no-record` run that streams without a
+# file. This is the case that proves the writer's live tap.
+if wanted live-e2e; then
+    status=0
+    scripts/live/e2e.sh >"$OUT/live-e2e.log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ] && [ -s "$OUT/live-e2e.log" ]; then
+        echo "PASS  live-e2e  ($(grep -c '^PASS' "$OUT/live-e2e.log") checks: file $(grep -m1 '^PASS  record-file' "$OUT/live-e2e.log" | sed 's/^PASS  record-file  (//; s/)$//'); $(grep -m1 '^PASS  record-sync' "$OUT/live-e2e.log" | sed 's/^PASS  record-sync  (//; s/)$//'); two save-replay clips; --no-record writes no file)"
+        pass=$((pass+1))
+    elif [ "$status" -eq 3 ]; then
+        echo "SKIP  live-e2e  (MediaMTX could not be downloaded)"; skip=$((skip+1))
+    else
+        echo "FAIL  live-e2e  (see $OUT/live-e2e.log)"; fail=$((fail+1))
+    fi
+fi
+
 # The app: start the real GUI (window on headless sway, the software renderer)
 # recording the test pattern, add a second launch (it must hand over to the
 # running instance), stop it with `rec-rs stop` and check the finalized file.
@@ -854,9 +918,6 @@ fi
 
 later pattern-webcam  "no camera on the CI host (needs a real desktop; PARITY.md has the checklist)"
 later scene-webcam    "needs a real desktop: a camera over the screen (the synthetic one is covered by 'camera')"
-later replay          "phase 1D: replay buffer"
-later stream-rtmp     "phase 1D: RTMP"
-later stream-whip     "phase 1D: WHIP"
 
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

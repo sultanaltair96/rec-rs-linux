@@ -92,6 +92,10 @@ pub struct Settings {
     pub clicks: bool,
     /// Preview at half resolution and 15 fps.
     pub preview_low_power: bool,
+    /// Hide Rec's own window while a display recording runs: a portal capture
+    /// cannot exclude it (phase 1E, upstream's ScreenCaptureKit content
+    /// filter). Off = the window stays, and is in the picture.
+    pub hide_window_when_recording: bool,
     /// Keep the last `replay_secs` of the live encode in memory.
     pub replay_enabled: bool,
     pub replay_secs: u32,
@@ -146,6 +150,7 @@ impl Default for Settings {
             cursor: true,
             clicks: false,
             preview_low_power: false,
+            hide_window_when_recording: true,
             replay_enabled: false,
             replay_secs: 60,
             stream_dests: live::SERVICES

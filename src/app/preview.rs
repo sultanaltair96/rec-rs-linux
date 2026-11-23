@@ -17,9 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use egui::ColorImage;
 
-use crate::media_types::{FrameSink, PixelFormat, VideoFrame};
+#[cfg(test)]
+use crate::media_types::PixelFormat;
+use crate::media_types::{FrameSink, VideoFrame};
 
 /// The pixel size to render a `fw`x`fh` frame at for the preview area: its
 /// aspect ratio fitted into the area, never larger than the frame. Low power
@@ -128,6 +131,7 @@ impl Tap {
         *self.target.lock().unwrap() = (w, h);
     }
 
+    #[cfg(test)]
     pub fn target(&self) -> (u32, u32) {
         *self.target.lock().unwrap()
     }
@@ -137,8 +141,13 @@ impl Tap {
         self.slot.lock().unwrap().take()
     }
 
-    /// The new frame as an egui texture for the current preview area, with its
+    /// The new frame as an egui image for the current preview area, with its
     /// size in pixels. `None` when the frame is malformed.
+    ///
+    /// The app draws frames with `preview_gpu` (G10); this CPU path stays as
+    /// the reference the unit tests check, and its YUV maths is what the
+    /// shader implements.
+    #[cfg(test)]
     pub fn image(&self, frame: &VideoFrame) -> Option<(ColorImage, [u32; 2])> {
         let (w, h) = target_size(
             frame.width,
@@ -155,6 +164,7 @@ impl Tap {
 ///
 /// A packed frame is resampled and swizzled in one pass: a 4K capture at
 /// preview size then costs the preview's pixels, not the frame's.
+#[cfg(test)]
 pub fn image(frame: &VideoFrame, size: (usize, usize)) -> Option<(ColorImage, [u32; 2])> {
     let (dw, dh) = size;
     if dw < 2 || dh < 2 || !frame.is_well_formed() {
@@ -194,6 +204,7 @@ pub fn image(frame: &VideoFrame, size: (usize, usize)) -> Option<(ColorImage, [u
 
 /// Bilinear resample of a packed BGRA (or RGBA) plane, straight to egui
 /// colours: one pass, no intermediate RGBA frame.
+#[cfg(test)]
 fn resample_packed(
     plane: &crate::media_types::Plane,
     sw: usize,
@@ -238,6 +249,7 @@ fn resample_packed(
 }
 
 /// Any supported frame as tight RGBA at its own size.
+#[cfg(test)]
 fn to_rgba(frame: &VideoFrame) -> Option<(usize, usize, Vec<u8>)> {
     let (w, h) = (frame.width, frame.height);
     let mut out = Vec::with_capacity(w * h * 4);
@@ -295,7 +307,10 @@ fn to_rgba(frame: &VideoFrame) -> Option<(usize, usize, Vec<u8>)> {
     Some((w, h, out))
 }
 
-/// One BT.709 limited-range YUV sample as RGB (what a screen capture delivers).
+/// One BT.709 limited-range YUV sample as RGB (what a screen capture
+/// delivers). The preview shader (`shaders/preview.wgsl`) uses the same
+/// constants.
+#[cfg(test)]
 pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     let y = (y as f32 - 16.0) * (255.0 / 219.0);
     let u = u as f32 - 128.0;
@@ -308,6 +323,7 @@ pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 }
 
 /// Bilinear RGBA resample from `sw`x`sh` to `dw`x`dh` (pixel centres aligned).
+#[cfg(test)]
 fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(dw * dh * 4);
     let fx = sw as f64 / dw as f64;
@@ -338,6 +354,21 @@ fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::media_types::{PixelFormat, Plane};
+
+    fn nv12_frame(w: usize, h: usize) -> VideoFrame {
+        let y = Plane::new(vec![120u8; w * h], w);
+        let uv = Plane::new(
+            vec![128u8; w.div_ceil(2) * 2 * h.div_ceil(2)],
+            w.div_ceil(2) * 2,
+        );
+        VideoFrame {
+            pts: 1.0,
+            width: w,
+            height: h,
+            format: PixelFormat::Nv12,
+            planes: vec![y, uv],
+        }
+    }
 
     fn bgra_frame(w: usize, h: usize, px: [u8; 4]) -> VideoFrame {
         let mut data = Vec::new();
@@ -447,23 +478,53 @@ mod tests {
         assert_eq!(size, [640, 360]);
     }
 
-    /// What a preview frame costs (run in release:
+    /// What a preview frame costs now (run in release:
     /// `cargo test --release app::preview::tests::preview_cost -- --ignored --nocapture`).
-    /// The compositor's texture (phase 2) removes this CPU copy entirely.
+    /// The CPU only copies the frame's planes into the queue; the conversion and
+    /// scaling happen in `preview_gpu`'s shader (G10). Before G10 this path cost
+    /// 6.61 ms (1080p) and 8.15 ms (4K) per frame.
     #[test]
     #[ignore]
     fn preview_cost() {
-        let (tap, _sink) = Tap::new(Arc::new(|| {}));
-        tap.set_target(704, 396);
-        for (w, h) in [(1920usize, 1080usize), (3840, 2160)] {
-            let f = bgra_frame(w, h, [10, 20, 30, 255]);
-            let n = 20;
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())).ok()
+        else {
+            eprintln!("SKIP: no wgpu adapter for the preview cost test");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("SKIP: no wgpu device for the preview cost test");
+            return;
+        };
+        let mut painter = super::super::preview_gpu::PreviewPainter::new(
+            &device,
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let n = 30;
+        for (w, h, format) in [
+            (1920usize, 1080usize, PixelFormat::Bgra),
+            (1920, 1080, PixelFormat::Nv12),
+            (3840, 2160, PixelFormat::Bgra),
+            (3840, 2160, PixelFormat::Nv12),
+        ] {
+            let frame = match format {
+                PixelFormat::Bgra => bgra_frame(w, h, [10, 20, 30, 255]),
+                _ => nv12_frame(w, h),
+            };
+            // One upload first: the first call allocates the textures.
+            let mut enc = device.create_command_encoder(&Default::default());
+            painter.upload(&device, &mut enc, &frame);
             let t = std::time::Instant::now();
             for _ in 0..n {
-                std::hint::black_box(tap.image(&f));
+                let mut enc = device.create_command_encoder(&Default::default());
+                std::hint::black_box(painter.upload(&device, &mut enc, &frame));
             }
             println!(
-                "{w}x{h} -> 704x396: {:.2} ms/frame",
+                "{w}x{h} {} -> upload: {:.2} ms/frame",
+                format.label(),
                 t.elapsed().as_secs_f64() * 1000.0 / n as f64
             );
         }

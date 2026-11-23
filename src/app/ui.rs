@@ -310,9 +310,13 @@ fn preview(ui: &mut Ui, st: &mut State) {
         // (black corners), and the frame already has the source's shape.
         let r = CornerRadius::ZERO;
         let live = st.recording.is_some() || st.preview.is_some();
-        match &st.preview_tex {
-            Some(id) if live => {
-                egui::Image::new((*id, size)).paint_at(ui, rect);
+        match &st.preview_frame {
+            Some(frame) if live => {
+                // Converted and scaled on the GPU (G10).
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    super::preview_gpu::PreviewCallback::new(frame.clone()),
+                ));
             }
             _ => {
                 ui.painter()
@@ -1470,6 +1474,12 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         ui.checkbox(
             &mut s.preview_low_power,
             "Low power (half resolution, 15 fps)",
+        );
+        ui.end_row();
+        ui.label("Window");
+        ui.checkbox(
+            &mut s.hide_window_when_recording,
+            "Hide Rec's window while recording",
         );
         ui.end_row();
     });
