@@ -10,7 +10,7 @@ Terminal=false
 Categories=AudioVideo;Recorder;
 Keywords=record;recorder;screen;capture;screencast;video;camera;mic;
 StartupNotify=true
-StartupWMClass=io.github.sultanaltair96.Rec
+StartupWMClass=rec-rs
 Actions=StartRecording;Settings;
 
 [Desktop Action StartRecording]

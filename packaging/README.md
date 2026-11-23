@@ -303,8 +303,10 @@ same image and runs the same `AppRun`.
 ## Desktop integration
 
 * **Desktop entry** `io.github.sultanaltair96.Rec.desktop`: `Exec=rec-rs gui`,
-  `StartupWMClass` = the app id, categories `AudioVideo;Recorder;`, and the two
-  upstream Dock-menu equivalents as actions:
+  `StartupWMClass=rec-rs` (winit's default app id is the binary name; phase 1E
+  must keep that or update this line and the AppImage's `rec-rs.desktop`),
+  categories `AudioVideo;Recorder;`, and the two upstream Dock-menu equivalents
+  as actions:
   `Start Recording` → `rec-rs gui --start-recording`, `Settings` →
   `rec-rs gui --settings`.
 * **AppStream metainfo**: description, feature list, homepage/bugtracker/VCS
