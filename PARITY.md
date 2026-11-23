@@ -36,16 +36,16 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `-t/--duration` | Exact, counted in output frames; pauses don't count | Identical: grid slots + `reached_limit` | 0 | done | selftest `sync` (300 frames for `-t 5`), selftest `pause-resume` (300 frames with a 2 s pause) |
 | `--mic-backend` | `sck` or `avcapture` (macOS) | `pipewire` (default) or `pulse`; `sck`/`avcapture` map with a message | 0 | done | unit `record::tests::mic_backend_maps_upstream_values` |
 | `--test-pattern [--noise]` | Flash + beep source for self-tests | Same, CPU frames, BGRA/I420 | 0 | done | unit `synth::tests::pattern_timeline`, `beep_starts_on_each_second`, `source_emits_on_the_grid`; selftest `pattern-1080-h264` |
-| `--replay SECS` | 15–300 s replay buffer | Planned on the live encode | 1D | todo | range validated in `prepare` (unit) and the run fails with phase 1D |
-| `--stream DEST` (repeatable) | RTMP(S)/WHIP, platform shortcuts | Same URLs and presets, built-in clients | 1D | todo | unit `live::tests::services_expand_and_are_recognized`, `shared_preset_fits_every_destination` |
-| `--no-record` | Replay/stream only | Same rule (needs replay or stream) | 1D | todo | unit `tests::bad_arguments_are_rejected` |
-| `--live-resolution/--stream-bitrate/--stream-codec/--keyframe/--vbr/--audio-bitrate` | Live encode controls | Same parsing, presets and clamping | 0 (parse/config), 1D (encode) | partial | unit `settings::tests::live_encode_fits_every_enabled_destination` |
+| `--replay SECS` | 15–300 s replay buffer | Packet ring of the live encode, trimmed a GOP at a time, memory reported, saved by `save-replay` | 1D | done | selftest `replay` (20 s run, 15 s window, clip 16.0 s, keyframe start, +5.7 ms A/V); unit `live::replay::tests::keeps_the_window_from_a_keyframe`, `live::tests::replay_saves_a_playable_mp4` |
+| `--stream DEST` (repeatable) | RTMP(S)/WHIP, platform shortcuts | Same URLs and presets, built-in clients; one encode feeds all of them | 1D | done | unit `live::tests::services_expand_and_are_recognized`, `shared_preset_fits_every_destination`; selftest `stream-rtmp` (2 RTMP + 1 RTMPS from one encode) |
+| `--no-record` | Replay/stream only | Same rule (needs replay or stream) | 1D (live side), 1G (writer without a file) | partial | unit `tests::bad_arguments_are_rejected`; the live path runs with no writer at all in the `live-selftest` harness (`scripts/live/`), the end-to-end `record --no-record` waits for the writer's tap (1G) |
+| `--live-resolution/--stream-bitrate/--stream-codec/--keyframe/--vbr/--audio-bitrate` | Live encode controls | Same parsing, presets and clamping, applied by the live encoder (videoscale, key-int-max, CBR or ABR) | 0 (parse/config), 1D (encode) | done | unit `settings::tests::live_encode_fits_every_enabled_destination`, `live::tests::encode_size_fits_the_box`; selftest `stream-rtmp` (720p30 from one encode) |
 | `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout. Displays and windows come from RandR/EWMH (also under XWayland); a Wayland session without X11 prints that the system picker chooses instead of an empty list. Cameras are V4L2 capture nodes (path + card name), microphones PipeWire sources (node name + description), and the default sink's latency is printed | 0 (shape), 1A/1B | partial | selftest `screen-x11` for displays; integration `devices` matches `Rec-Test-Mic [rec_test_mic]` and `Output latency ... 5.3 ms`; script `scripts/audio/integration.sh` |
 | `probe FILE` command | AVFoundation: playable, tracks, codecs, full sample decode, non-zero exit on error | GStreamer: qtdemux structure + `uridecodebin` decode of every sample | 0 | done | selftest uses it on every case (`.probe` files); `ffmpeg -v error -f null` cross-check |
 | `permissions [--request]` | TCC status and prompts | ScreenCast version, source types, cursor modes, whether a grant is stored, whether PipeWire runs. `--request` runs the portal dialog once and stores the restore token (0600, `$XDG_STATE_HOME/rec-rs/portal-token`). The microphone line reports PipeWire and the number of inputs; the camera line reports `/dev/video*` or the portal | 1A/1B | partial | unit `portal::tests::cursor_modes_fall_back_to_what_the_portal_offers`; selftest `screen-token`; integration `no-pipewire` (no session: `devices` says unavailable, exit 0); container report shows the mic/camera lines |
 | `stop` / `pause` / `resume` | pidfile + SIGUSR1/SIGUSR2/SIGTERM | pidfile in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`), SIGINT to stop | 0 | done | unit `record::tests::pidfile_lives_in_the_runtime_dir`, `no_recorder_means_a_clear_error`; selftest `pause-resume` runs `pause`/`resume`; `stop` demo in the phase report |
-| `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux); buffer is 1D | 0 (signal), 1D (buffer) | partial | unit `record::tests::save_replay_signal_is_a_real_time_signal` |
-| `stream-key DEST [--delete]` | Keychain | Secret Service (`secret-service` crate), `REC_STREAM_KEY` meanwhile | 1D | todo | the command fails with phase 1D and names the env override |
+| `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux) to the pidfile's recorder; the clip is written on a background thread | 0 (signal), 1D (buffer) | done | selftest `replay` (`rec-rs save-replay` next to a running encode wrote and verified the clip); unit `record::tests::save_replay_signal_is_a_real_time_signal` |
+| `stream-key DEST [--delete]` | Keychain | Secret Service (the `keyring` crate), keyed per destination, read with echo off; `REC_STREAM_KEY` overrides for one run and nothing ever goes to a file | 1D | done | unit `live::keyring::tests::round_trip`, `secret_service_round_trip` (real service when the session has one); manual check below for a desktop keyring |
 | `gui [--start-recording] [--settings] [--window ID]` | The app | egui/wgpu app | 1E | todo | command exists and fails with phase 1E |
 
 ## Main window and app behaviour
@@ -68,17 +68,17 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Fader range −∞..+24 dB, drag/click/scroll/double-click/type | Yes | Same | 1E | todo | unit `mixer::tests::volume_gain` (range and silence) |
 | Level changes apply live to every track (and replay/streams) | Yes, ≤20 ms ramp | Writer follows live (`set_volumes`); ≤20 ms envelope | 0 (ramp), 1E (widget) | partial | unit `fader_glides_and_passes_unity_through` |
 | Reveal last / open folder | Yes | `xdg-open` on the output folder | 1E | todo | — |
-| Replay buffer 15–300 s with memory use, Save Replay | Yes | Planned on the live encode | 1D | todo | — |
-| Stream to YouTube/Twitch/Kick + custom servers, Go Live all-at-once, all-or-nothing | Yes | Same destinations and presets, built-in RTMP/WHIP | 1D | todo | unit `live::tests::shared_preset_fits_every_destination` |
-| Per-destination live status (duration, bitrate, drops, reconnect) and LIVE 2/3 | Yes | Same from the output status | 1D | todo | — |
-| One encode for every destination, within all limits | Yes | Same `shared_preset` logic | 0 (choice), 1D (encode) | partial | unit `shared_preset_fits_every_destination`, `settings::tests::live_encode_fits_every_enabled_destination` |
-| Replay/stream run with or without a recording, survive recording start/stop, gaps bridged | Yes | Same design (live encode independent of the session) | 1D | todo | — |
+| Replay buffer 15–300 s with memory use, Save Replay | Yes | Same ring and save, memory reported in the status line | 1D | done | selftest `replay`; unit `live::tests::replay_saves_a_playable_mp4` (held 15–17 s, H.264+AAC, both tracks 14–17 s) |
+| Stream to YouTube/Twitch/Kick + custom servers, Go Live all-at-once, all-or-nothing | Yes | Same destinations and presets, built-in RTMP/RTMPS/WHIP; a destination that cannot start stops the ones before it | 1D | done | unit `live::tests::shared_preset_fits_every_destination`, `live::tests::outputs_start_all_or_nothing`; selftest `stream-rtmp` (four destinations from one encode). The three services' RTMPS URLs and presets are unit-tested; streaming to the real services was not done (see the known gaps) |
+| Per-destination live status (duration, bitrate, drops, reconnect) and LIVE 2/3 | Yes | `live::OutputStatus` per destination; the CLI status line shows state, bitrate and drops, the app reads the same list | 1D | done (CLI) | selftest `stream-rtmp` (`4/4 destinations live at once`), `stream-whip`; the LIVE 2/3 badge itself is the app's (1E) |
+| One encode for every destination, within all limits | Yes | Same `shared_preset` logic; one GStreamer encode fans out to the ring and every output | 0 (choice), 1D (encode) | done | unit `shared_preset_fits_every_destination`, `live::tests::short_gaps_are_filled`; selftest `stream-rtmp` (two RTMP paths, RTMPS and WHIP from one encode) |
+| Replay/stream run with or without a recording, survive recording start/stop, gaps bridged | Yes | Same design: the live encode owns its queues and encoder and knows nothing of the writer; short holes get a repeated frame and silence (up to 3 s), longer ones restart the timeline | 1D | partial | unit `live::tests::short_gaps_are_filled`, `silence_stands_in_for_missing_audio`; `live-selftest` runs the encode with no writer at all. Surviving a recording start/stop needs the writer's tap (1G) |
 | Settings window: folder, container | Yes | Same, persisted as JSON | 0 (model), 1E (window) | partial | unit `settings::tests::json_roundtrip_and_defaults_for_missing_fields`, `prores_forces_mov` |
 | Resolution, frame rate, codec, bitrate settings | Yes | Same settings → record args | 0 | done | unit `settings::tests::record_args_parse_with_the_cli` |
 | Cursor and click settings | Yes | Portal cursor modes | 1A | todo | — |
 | Audio device and track layout settings | Yes | PipeWire devices; `microphones()` (with the default first) feeds the mixer list | 1B (devices), 1E (UI) | partial | unit `audio_levels_do_not_restart_capture`, `capture::audio::tests::mic_matching`; integration `devices` |
 | Camera device + overlay settings | Yes | V4L2 device selection + the same overlay model | 1B (device), 1C (overlay), 1E (UI) | partial | unit `overlay_settings_round_trip_through_the_cli`, `camera::v4l2::tests::device_matching`; real hardware under "Needs a real desktop" |
-| Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model | 1D | todo | unit `settings::tests::live_encode_fits_every_enabled_destination` |
+| Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model: `LiveConfig` (re)builds the encoders with a keyframe and restarts the replay ring | 1D (model), 1E (UI lock) | partial | unit `settings::tests::live_encode_fits_every_enabled_destination`, `live::tests::encode_size_fits_the_box`; the app's lock is 1E |
 | Settings persist in Application Support | `~/Library/Application Support/rec-rs/settings.json` | `$XDG_CONFIG_HOME/rec-rs/settings.json` | 0 | done | unit `settings::tests::settings_live_in_the_xdg_config_dir` |
 | Dock icon, app menu (Settings ⌘,, Hide ⌘H, Quit ⌘Q, Window menu) | Yes | Native window menu + `.desktop` actions | 1E/1F | todo | — |
 | Closing the window keeps the app running and stops the preview | Yes | Tray-resident app | 1E | todo | — |
@@ -128,16 +128,16 @@ version that does it).
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| One shared live encode for replay + every stream | VideoToolbox/AudioConverter | GStreamer encode to appsink, fanned out | 1D | todo | — |
-| H.264 High / HEVC Main10, no B-frames, 2 s keyframes, CBR or ABR | Yes | Same via the live encoder | 1D | todo | preset maths: unit `live::tests::platform_presets` |
-| Enhanced RTMP HEVC (`hvc1`), fallback to H.264 | Yes | Same negotiation | 1D | todo | — |
-| Live size scaled from the recording size | Lanczos | wgpu Lanczos, shared with the recording | 1C/1D | partial | scaler done: unit `gpu::tests::lanczos_matches_a_cpu_reference`; the live encode that will reuse it is 1D |
-| Replay buffer trims a GOP at a time, re-encodes audio, syncs in QuickTime and ffmpeg | Yes | Same on the packet buffer | 1D | todo | — |
-| RTMP/RTMPS client with TLS, drop a GOP when behind, reconnect with backoff | Built-in, Security.framework | Built-in port with rustls | 1D | todo | — |
-| WHIP (str0m, ICE/DTLS/SRTP, H.264+Opus, DELETE on stop, 5 s silence → reconnect) | Yes | str0m with a Linux crypto backend | 1D | todo | — |
-| Platform bitrate/size presets (YouTube/Twitch/Kick), lowest across destinations | Yes | Identical maths (ported) | 0 | done | unit `live::tests::platform_presets`, `shared_preset_fits_every_destination` |
-| Stream keys in the OS key store, `REC_STREAM_KEY` override | Keychain | Secret Service, env override | 1D | todo | `resolve_destination` accepts `REC_STREAM_KEY` today |
-| Tested against MediaMTX (RTMP, RTMPS, WHIP) | Yes | MediaMTX in the dev container | 1D | todo | — |
+| One shared live encode for replay + every stream | VideoToolbox/AudioConverter | GStreamer encode to appsink, fanned out by the hub | 1D | done | unit `live::tests::short_gaps_are_filled`, `live::tests::replay_saves_a_playable_mp4`; selftest `stream-rtmp`, `stream-whip` |
+| H.264 High / HEVC Main10, no B-frames, 2 s keyframes, CBR or ABR | Yes | H.264 High (x264enc, `tune=zerolatency`, `bframes=0`) and HEVC **Main** — this image's x265 is 8-bit, so Main10 needs a 10-bit encoder (VA-API on a GPU host); the encode logs which one it got. CBR (`pass=cbr` + VBV) or ABR (`--vbr`); keyframes from `--keyframe` | 1D | partial (Main10) | selftest `stream-rtmp` (`ffprobe` reports h264/High), `stream-hevc` (MediaMTX's recording is hevc/Main with the A/V offset measured); unit `live::video::tests::encodes_keyframes_on_schedule`, `parameter_sets_and_records`; preset maths unit `live::tests::platform_presets` |
+| Enhanced RTMP HEVC (`hvc1`), fallback to H.264 | Yes | `fourCcList` offer, `hvc1` SequenceStart and CodedFramesX; a server that lists its codecs without `hvc1`, or keeps failing HEVC, switches the shared encode to H.264 with a note | 1D | done | selftest `stream-hevc` (HEVC recorded by MediaMTX; fallback run records H.264 with the note); unit `live::rtmp::tests::hevc_negotiation`, `flv_bodies` |
+| Live size scaled from the recording size | Lanczos | Live pipeline scales with GStreamer `videoscale method=lanczos` to the encode size (never upscaled, even dimensions); the recording's own scaler is the GPU one (1C), so the two are independent but both Lanczos | 1C/1D | done | unit `live::tests::encode_size_fits_the_box`; selftest `stream-rtmp` streams 720p30 out of the same encode |
+| Replay buffer trims a GOP at a time, re-encodes audio, syncs in QuickTime and ffmpeg | Yes | Same: video passed through (AVCC/HVCC), audio decoded and re-encoded with the new encoder's priming + one frame dropped and the rest re-stamped | 1D | done | selftest `replay` (+5.7 ms measured by `synccheck.py` on the saved clip; first packet has the keyframe flag); unit `live::replay::tests::keeps_the_window_from_a_keyframe` |
+| RTMP/RTMPS client with TLS, drop a GOP when behind, reconnect with backoff | Built-in, Security.framework | Same client ported to rustls (ring provider, webpki roots); 3 s queue that drops video a GOP at a time; 1 s → 30 s backoff | 1D | done | selftest `stream-rtmp` (RTMP + RTMPS, reconnect after a server restart: 3 reconnects, live at the end; A/V +0.2 ms); unit `live::rtmp::tests::{amf_round_trip,urls,chunking_round_trips_through_the_reader,flv_bodies}` |
+| WHIP (str0m, ICE/DTLS/SRTP, H.264+Opus, DELETE on stop, 5 s silence → reconnect) | Yes | Same: str0m on its pure-Rust `rust-crypto` backend, SDP POST over ureq+rustls with the key as a Bearer token, packets sent at capture time, A/V-aligned start, DELETE on stop, reconnect after 5 s of silence | 1D | done | selftest `stream-whip` (MediaMTX records H.264 + Opus, A/V +1.5 ms); unit `live::whip::tests::{urls,session_starts_aligned_and_paced,starts_without_audio}` |
+| Platform bitrate/size presets (YouTube/Twitch/Kick), lowest across destinations | Yes | Identical maths (ported), and the encode honours the chosen size/bitrate | 0 (maths), 1D (encode) | done | unit `live::tests::platform_presets`, `shared_preset_fits_every_destination`; `live-selftest` prints the preset it picked (`5.0 Mb/s` for a custom server at 720p30) |
+| Stream keys in the OS key store, `REC_STREAM_KEY` override | Keychain | Secret Service (`keyring` crate, `sync-secret-service`), keyed per destination URL, read with echo off; `REC_STREAM_KEY` for one run; a clear error when no Secret Service is running, never a plaintext file | 1D | done | unit `live::keyring::tests::round_trip` (in-memory adapter), `secret_service_round_trip` (real service when the session has one; `REC_KEYRING_TEST=1` requires it); manual check below |
+| Tested against MediaMTX (RTMP, RTMPS, WHIP) | Yes | MediaMTX is downloaded at test time into a cache outside the repo; RTMP, RTMPS (self-signed certificate generated at test time) and WHIP run at once from one encode, and it records every path for the checks | 1D | done | selftest `stream-rtmp` (2 RTMP + 1 RTMPS + WHIP, all four recordings probe and are +0.2/−3.1 ms), `stream-whip`; `scripts/live/mediamtx.sh` |
 
 ## OBS comparison rows rec-rs claims
 
@@ -164,8 +164,8 @@ version that does it).
 | Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
 | Crash-safe files | Fragments every 2 s | Fragments every 2 s | 0 | done | crash test decodes |
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes (CLI done; app 1E) | 0 | done | selftest `pause-resume` |
-| Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
-| Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
+| Replay buffer 15–300 s | Yes | Done: 15–300 s in memory, memory reported, `save-replay` writes an MP4 | 1D | done | selftest `replay` |
+| Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Done: built-in RTMP/RTMPS and WHIP, one encode for every destination, enhanced-RTMP HEVC with H.264 fallback, reconnect with backoff | 1D | done | selftest `stream-rtmp`, `stream-whip`, `stream-hevc` (not a case of its own; run by `scripts/live/streams.sh`) |
 | Screen scaling: GPU Lanczos | Metal MPS, which antialiases a downscale | wgpu Lanczos (a = 3), separable, per plane in the encoded domain, **stretched by the reduction factor** so a downscale antialiases, edge clamp, never upscaling | 1C | done | unit `gpu::tests::lanczos_matches_a_cpu_reference` (≤2/255 against an independent CPU implementation), `downscaling_a_one_pixel_pattern_leaves_only_its_mean` (a 1-px 5K pattern leaves 0.7/255 ripple inside the frame, against 121.7 for an unstretched kernel; ffmpeg's own swscale/zimg reach 22.6/29.7 at the replicated edge against our 22.7), `the_scaler_matches_ffmpeg_lanczos` (PSNR 50.3 dB 4K→1080p, 51.4 dB 5K→1080p against swscale's Lanczos; 58.1/57.0 dB against zimg), `a_small_screen_is_not_upscaled`; golden `screen-4k-to-1080`; measured 77 ms/frame 4K→1080p and 116 ms 5K→1080p on lavapipe (`tests/golden/README.md`) |
 | Live preview | Yes | wgpu preview | 1E | todo | — |
 | Level meters with peak hold, after the fader | Yes | Same | 1E | todo | unit `mixer::tests::volume_gain` (meter gain) |
@@ -183,8 +183,8 @@ version that does it).
 | No application capture or multi-display capture | Yes | Same | — | n-a |
 | Region capture is CLI-only | Yes | Same (the app may add it later) | 1E | todo |
 | No audio filters, hotkeys not configurable | Yes | Same | — | n-a |
-| Streaming: no SRT/multitrack, same encode for all, live ≤ recording size, changing settings needs a restart | Yes | Same limitations (parity, not a gap to fix) | 1D | todo |
-| HEVC to YouTube tested only against a local server | Yes | Same testing honestly reported | 1D | todo |
+| Streaming: no SRT/multitrack, same encode for all, live ≤ recording size, changing settings needs a restart | Yes | Same limitations (parity, not a gap to fix) | 1D | n-a |
+| HEVC to YouTube tested only against a local server | Yes | Same testing honestly reported: enhanced-RTMP HEVC is verified against MediaMTX and by the unit-tested `fourCcList` negotiation, not against YouTube itself | 1D | done (as upstream) |
 | 8-bit SDR only | Yes | Same | — | n-a |
 | Webcam overlay burned into the video | Yes | Same: the compositor runs before the encoder | 1C | partial | the compositor is done and pixel-tested; the writer calls it (1G) |
 | Output latency read once at start | Yes | Same (PipeWire sink params at start; a device switch needs a restart, like upstream) | 1B | done | unit `collector_combines_the_latency_parts`; integration `devices` |
@@ -225,6 +225,36 @@ What runs headless in the dev container, on every `scripts/selftest.sh` run:
 | `screen-x11` | Xvfb 1280x800 | RandR enumeration (`devices` lists `[1]`), a root-window capture at the native size with motion, no portal involved |
 | `screen-window` | Xvfb + a GStreamer window | `--window gstreamer` captures that client's own 400x300 drawable, with motion |
 | `cargo test` under `scripts/screen/xvfb.sh` | Xvfb | 8 X11 unit tests, 5 of them against the live server: monitor/window enumeration, a window captured with its own pixels, `--region` capturing the pixels it names (red/blue halves), a click ring from a real XTEST click, and the region geometry |
+
+### Needs a real desktop (streaming and stream keys)
+
+The container has no Secret Service in a normal `scripts/dev.sh` shell (the unit test
+skips and says so), no GPU for VA-API Main10, and no account on a real streaming
+service. These are the checks to run on a real machine:
+
+1. **Secret Service.** In a desktop session (GNOME/KDE or any keyring daemon):
+   `rec-rs stream-key twitch` prompts with echo off, never prints the key, and
+   `secret-tool search service 'rec-rs stream key'` shows it under the normalised
+   destination. `REC_STREAM_KEY=... rec-rs record --stream twitch --no-record -t 5`
+   uses the env override for that run only. Stop the keyring daemon and run
+   `rec-rs stream-key twitch` again: it must say no Secret Service is running and
+   must not create any file.
+2. **Real services.** Go live to YouTube, Twitch and Kick for 30 s each:
+   the service reports a healthy stream, its own player is in sync with a
+   hand-clap/beep test, and the CLI status line shows `live` with a bitrate near the
+   preset. Then all three at once: one encode, three `live` lines.
+3. **HEVC Main10.** On a GPU host (`/dev/dri` passed through, VA-API working), stream
+   with `--codec hevc`: `rec-rs` must log the VA-API HEVC encoder and, with a
+   10-bit-capable one, Main10; YouTube (enhanced RTMP) must accept it. This is the
+   one streaming row that is partial: the dev image's x265 is 8-bit, so it produces
+   HEVC Main and says so.
+4. **RTMPS against a real certificate.** `--stream rtmps://a.rtmps.youtube.com/live2`
+   must verify the certificate normally; `REC_INSECURE_TLS=1` must be the only way
+   a self-signed one is accepted (it is never set by default).
+5. **Replay while recording.** `rec-rs record --replay 60 --stream twitch`: pause and
+   resume the recording, run `rec-rs save-replay` twice, and check both clips play in
+   QuickTime/mpv and unexpected settings changes are refused while live (the app's
+   lock, phase 1E).
 
 ### Needs a real desktop
 

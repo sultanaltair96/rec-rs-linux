@@ -1448,6 +1448,57 @@ mod tests {
         }
     }
 
+    /// The tap is the capture thread's hand-off: it must never grow with a slow
+    /// encoder, and it must keep the newest frames (a stream wants the current
+    /// picture, not a backlog).
+    #[test]
+    fn the_tap_keeps_the_newest_frames_only() {
+        let tap = Tap::default();
+        for i in 0..10 {
+            tap.push_video(test_frame(i as f64 / 30.0, 0x40));
+        }
+        let (video, _) = tap.take(Duration::from_millis(1));
+        assert_eq!(video.len(), MAX_TAP_FRAMES, "the tap is bounded");
+        assert!(
+            (video.last().unwrap().pts - 9.0 / 30.0).abs() < 1e-9,
+            "the newest frame survived"
+        );
+        assert!(video[0].pts > 0.0, "the oldest were dropped");
+        assert_eq!(tap.dropped().0, (10 - MAX_TAP_FRAMES) as u64);
+
+        // Two seconds of 10 ms audio is the other bound.
+        for i in 0..300 {
+            let samples = vec![0.0; 480 * 2];
+            tap.push_audio(AudioChunk::stereo(i as f64 * 0.01, 48_000, samples));
+        }
+        let (_, audio) = tap.take(Duration::from_millis(1));
+        let held: usize = audio.iter().map(|c| c.frames()).sum();
+        assert!(held <= MAX_TAP_AUDIO, "{held} audio frames held");
+        assert!(
+            (audio.last().unwrap().pts - 2.99).abs() < 1e-6,
+            "the newest buffer survived"
+        );
+        assert!(tap.dropped().1 > 0, "old audio buffers were dropped");
+    }
+
+    /// Nothing is encoded while no live output is active.
+    #[test]
+    fn nothing_is_queued_without_an_output() {
+        let live = Live::new();
+        assert!(!live.active());
+        live.push_video(&test_frame(1.0, 0x40));
+        live.push_audio(&AudioChunk::stereo(1.0, 48_000, vec![0.0; 960]));
+        let (video, audio) = live.shared.tap.take(Duration::from_millis(1));
+        assert!(video.is_empty() && audio.is_empty());
+        live.set_replay(Some(15.0));
+        assert!(live.active());
+        live.push_video(&test_frame(2.0, 0x40));
+        let (video, _) = live.shared.tap.take(Duration::from_millis(1));
+        assert_eq!(video.len(), 1, "an active encode takes the tap");
+        live.set_replay(None);
+        assert!(!live.active());
+    }
+
     /// Go Live is all or nothing: when a destination cannot start, the ones
     /// before it are stopped and removed, and the ones after it never start.
     #[test]
