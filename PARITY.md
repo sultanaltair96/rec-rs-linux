@@ -15,7 +15,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| `record` command | Records screen + system audio + mic + webcam | Same, through PipeWire/V4L2 sources and the GStreamer writer | 0 (CLI), 1A/1B (sources) | partial | unit `tests::goal_command_line_parses`; selftest `pattern-1080-h264` (test-pattern source) |
+| `record` command | Records screen + system audio + mic + webcam | Same, through PipeWire/V4L2 sources and the GStreamer writer | 0 (CLI), 1A/1B (sources) | partial | unit `tests::goal_command_line_parses`; selftest `pattern-1080-h264` (test-pattern), `pattern-mic` and `pattern-system-audio` (real PipeWire audio); the camera overlay is wired by 1G |
 | `-o/--out/--output` | Output file, `.mov` or `.mp4`, default `~/Movies/rec-<ts>.mov` | Same flags; default `$XDG_VIDEOS_DIR`/`~/Videos/rec-<ts>.mov` | 0 | done | unit `tests::default_output_is_under_the_videos_dir`, `util::tests::timestamps_are_safe_file_names` |
 | `-d/--display N` | Display number from `devices`, default 1 | 1-based among RandR monitors on X11 (1 = primary, even when the server names none). On Wayland the portal's picker decides and a note says so; the picked display is named in the log when XWayland's monitor list identifies it | 1A | partial | unit `x11::tests::a_monitor_and_a_window_are_enumerated`; selftest `screen-x11` (`devices` lists `[1] id screen`); why not exact on Wayland: see the phase 1A notes |
 | `--window W` | Window id or app/title substring | X11: EWMH `_NET_CLIENT_LIST` + `_NET_WM_NAME`/`WM_CLASS`, id or case-insensitive app/title substring, largest match wins (upstream's rule), captured with `GetImage`. Wayland: the portal's window source where the desktop offers one (xdg-desktop-portal-wlr offers none and says so); substring matching is a hint for the picker | 1A | partial | unit `selector::tests::*`, `x11::tests::a_window_is_captured_with_its_own_pixels`; selftest `screen-window` (400x300 client surface, 117 distinct frames) |
@@ -25,13 +25,13 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--codec` | auto (H.264 ≤1080p, HEVC above), h264, hevc, prores | Same selection and same automatic rule | 0 | done | selftest `pattern-prores`, `pattern-hevc`, `pattern-4k-hevc` (`-r 4k` picks HEVC by itself) |
 | `--bitrate` | Mb/s, else bits/pixel heuristic | Same heuristic (ported); x264enc/x265enc honour it | 0 | done | unit `tests::test_pattern_prepares_without_a_display` (4K ≥ 30 Mb/s); selftest `h264-bitrate`: 8 Mb/s requested → 8.10 Mb/s at profile High |
 | `--system-audio` / `--no-system-audio` | On by default, flags override each other | Same | 0 | done | unit `tests::system_audio_flags_override_each_other`; selftest `gain` (system track) |
-| `--mic DEVICE` / `--no-mic` | Default mic, id or name substring | PipeWire node by id/name | 1B | todo | parses: unit `tests::goal_command_line_parses`; unavailable mic warns and continues |
-| `-w/--cam/--webcam [DEVICE]` | Webcam overlay, default or device | V4L2 (or camera portal in Flatpak) | 1B | todo | parses: unit `tests::goal_command_line_parses` |
+| `--mic DEVICE` / `--no-mic` | Default mic, id or name substring | PipeWire `Audio/Source` node: the session default, an exact node name, a saved/argument display name (exact then substring), or the same USB device on another port. The default mic warns and continues; an explicit missing device fails | 1B | done | selftest `pattern-mic` (default mic, `--mic 'Rec-Test'`, missing device); unit `capture::audio::tests::mic_matching`; script `scripts/audio/integration.sh` |
+| `-w/--cam/--webcam [DEVICE]` | Webcam overlay, default or device | V4L2 (`/dev/video*`), or the xdg-desktop-portal Camera inside Flatpak; id/number/name substring, `default` = first camera | 1B | partial | source: unit `camera::v4l2::tests::device_matching`, `camera::format::tests::*`, `camera::convert::tests::*`; real hardware and the overlay wiring are listed under "Needs a real desktop" (source done, 1G wires it) |
 | `--scene` | screen, screen-cam, cam | Same enum and default rule | 0 | done | unit `tests::scene_option` |
 | `--pip-size/-corner/-shape/-roundness/-border/-border-color/-shadow/-pos/-no-mirror` | Overlay geometry and style | Same parsing, clamping and geometry | 0 | done | unit `tests::overlay_options`, `compose::tests::corners_and_free_positions`, `snapping`, `shape_coverage` |
-| `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values; phase 0 writes stems only (mix is 1C) | 0 (parse), 1C (mix) | partial | parses: unit `settings::tests::record_args_parse_with_the_cli`; writer warns when a mix is requested |
+| `--audio-tracks both/mix/stems` | Mix + stems, mix only, stems only | Same values and track layout; one track when only one source is present | 1G | done | selftest `tracks` (4 tracks: video, mix, system, mic), `audio-tracks` (mix: 2 tracks; stems: video + 2 enabled stems) |
 | `--system-gain`, `--mic-gain` | dB per source, −60 = silence, +24 max, in every track | Same fader maths applied in the writer | 0 | done | selftest `gain` (`--ref=-6 --expect=-12`); unit `mixer::tests::volume_gain`, `fader_glides_and_passes_unity_through` |
-| `--system-audio-offset-ms`, `--mic-offset-ms` | Sync shifts; system default = output latency | Same; latency read from PipeWire in 1B | 0 (shift), 1B (latency) | partial | unit (offsets applied in `push_audio`); selftest `sync` |
+| `--system-audio-offset-ms`, `--mic-offset-ms` | Sync shifts; system default = output latency | Same; the default sink's latency is read once at start from PipeWire and passed to the writer as the system offset | 0 (shift), 1B (latency) | done | unit `capture::audio::pipewire::tests::collector_combines_the_latency_parts`, `node_latency_property_is_a_fraction_or_frames`; integration `devices` prints 5.3 ms for a 256/48000 sink; unit (offsets applied in `push_audio`); selftest `sync` |
 | `--no-cursor`, `--clicks` | Hide cursor / highlight clicks | Portal cursor modes: embedded (drawn by the compositor), hidden, metadata (we composite the bitmap). X11: the cursor is composited from XFixes and clicks are the button bits of `QueryPointer`, drawn as a ring that grows and fades | 1A | partial | unit `cursor::tests::a_ring_is_a_ring_not_a_disc`, `ring_grows_fades_and_expires`, `cursor_is_composited_at_its_hotspot`; `x11::tests::a_click_draws_a_ring_at_the_pointer` (real X server, XTEST click). Wayland: no button events through a portal, so `--clicks` warns and records the cursor only |
 | `-t/--duration` | Exact, counted in output frames; pauses don't count | Identical: grid slots + `reached_limit` | 0 | done | selftest `sync` (300 frames for `-t 5`), selftest `pause-resume` (300 frames with a 2 s pause) |
 | `--mic-backend` | `sck` or `avcapture` (macOS) | `pipewire` (default) or `pulse`; `sck`/`avcapture` map with a message | 0 | done | unit `record::tests::mic_backend_maps_upstream_values` |
@@ -40,9 +40,9 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `--stream DEST` (repeatable) | RTMP(S)/WHIP, platform shortcuts | Same URLs and presets, built-in clients | 1D | todo | unit `live::tests::services_expand_and_are_recognized`, `shared_preset_fits_every_destination` |
 | `--no-record` | Replay/stream only | Same rule (needs replay or stream) | 1D | todo | unit `tests::bad_arguments_are_rejected` |
 | `--live-resolution/--stream-bitrate/--stream-codec/--keyframe/--vbr/--audio-bitrate` | Live encode controls | Same parsing, presets and clamping | 0 (parse/config), 1D (encode) | partial | unit `settings::tests::live_encode_fits_every_enabled_destination` |
-| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout. Displays and windows come from RandR/EWMH (also under XWayland); a Wayland session without X11 prints that the system picker chooses instead of an empty list. Cameras and microphones report phase 1B | 0 (shape), 1A/1B | partial | selftest `screen-x11` runs `devices` and matches `[1] id`; live tests `a_monitor_and_a_window_are_enumerated` |
+| `devices` command | Lists displays, windows, cameras, mics + output latency | Same layout. Displays and windows come from RandR/EWMH (also under XWayland); a Wayland session without X11 prints that the system picker chooses instead of an empty list. Cameras are V4L2 capture nodes (path + card name), microphones PipeWire sources (node name + description), and the default sink's latency is printed | 0 (shape), 1A/1B | partial | selftest `screen-x11` for displays; integration `devices` matches `Rec-Test-Mic [rec_test_mic]` and `Output latency ... 5.3 ms`; script `scripts/audio/integration.sh` |
 | `probe FILE` command | AVFoundation: playable, tracks, codecs, full sample decode, non-zero exit on error | GStreamer: qtdemux structure + `uridecodebin` decode of every sample | 0 | done | selftest uses it on every case (`.probe` files); `ffmpeg -v error -f null` cross-check |
-| `permissions [--request]` | TCC status and prompts | ScreenCast version, source types, cursor modes, whether a grant is stored, whether PipeWire runs. `--request` runs the portal dialog once and stores the restore token (0600, `$XDG_STATE_HOME/rec-rs/portal-token`). Mic/camera lines report phase 1B | 1A | partial | unit `portal::tests::cursor_modes_fall_back_to_what_the_portal_offers`; selftest `screen-token` (`permissions --request` → granted, token 0600, a corrupted token is recovered) |
+| `permissions [--request]` | TCC status and prompts | ScreenCast version, source types, cursor modes, whether a grant is stored, whether PipeWire runs. `--request` runs the portal dialog once and stores the restore token (0600, `$XDG_STATE_HOME/rec-rs/portal-token`). The microphone line reports PipeWire and the number of inputs; the camera line reports `/dev/video*` or the portal | 1A/1B | partial | unit `portal::tests::cursor_modes_fall_back_to_what_the_portal_offers`; selftest `screen-token`; integration `no-pipewire` (no session: `devices` says unavailable, exit 0); container report shows the mic/camera lines |
 | `stop` / `pause` / `resume` | pidfile + SIGUSR1/SIGUSR2/SIGTERM | pidfile in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`), SIGINT to stop | 0 | done | unit `record::tests::pidfile_lives_in_the_runtime_dir`, `no_recorder_means_a_clear_error`; selftest `pause-resume` runs `pause`/`resume`; `stop` demo in the phase report |
 | `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux); buffer is 1D | 0 (signal), 1D (buffer) | partial | unit `record::tests::save_replay_signal_is_a_real_time_signal` |
 | `stream-key DEST [--delete]` | Keychain | Secret Service (`secret-service` crate), `REC_STREAM_KEY` meanwhile | 1D | todo | the command fails with phase 1D and names the env override |
@@ -61,7 +61,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Overlay changes live while recording, baked in, no extra encode | Yes | Yes: the compositor runs before the encoder, and the mask/border/shadow texture is cached per size and style so moving it only changes a transform | 1C | done | unit `gpu::tests::renders_overlay_with_border_into_the_frame` (moves it between frames), `gpu::decor::tests::the_key_ignores_the_position_but_not_the_style` |
 | Scene: Camera full frame | AVCapture | V4L2 into a cover-fitted, mirrored full frame | 1B (source), 1C (composite) | partial | unit `gpu::tests::the_camera_scene_covers_the_frame`, `mirroring_flips_the_camera`; golden `cam` |
 | Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app/CLI rule is 1E/1G | 1C/1E | partial | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame` |
-| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2, PipeWire audio | 1A/1B | todo | — |
+| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2 or portal camera, PipeWire audio | 1A/1B | done | selftest `pattern-screen`, `pattern-mic`, `pattern-system-audio`; unit camera/audio suites; the recorder-side camera wiring is 1G |
 | Record/Stop button and timer | Yes | App | 1E | todo | — |
 | Pause/Resume button | Yes | App (the session API exists) | 1E | todo | session API: selftest `pause-resume` |
 | Audio mixer: meter with peak hold, fader, mute, dB | Yes, after the fader | Same widgets on the same session API | 1E | todo | levels in the status line; unit `mixer::tests::volume_gain` |
@@ -76,8 +76,8 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Settings window: folder, container | Yes | Same, persisted as JSON | 0 (model), 1E (window) | partial | unit `settings::tests::json_roundtrip_and_defaults_for_missing_fields`, `prores_forces_mov` |
 | Resolution, frame rate, codec, bitrate settings | Yes | Same settings → record args | 0 | done | unit `settings::tests::record_args_parse_with_the_cli` |
 | Cursor and click settings | Yes | Portal cursor modes | 1A | todo | — |
-| Audio device and track layout settings | Yes | PipeWire devices | 1B (devices), 1E (UI) | todo | unit `audio_levels_do_not_restart_capture` |
-| Camera device + overlay settings | Yes | V4L2 + same overlay model | 1B/1E | todo | unit `overlay_settings_round_trip_through_the_cli` |
+| Audio device and track layout settings | Yes | PipeWire devices; `microphones()` (with the default first) feeds the mixer list | 1B (devices), 1E (UI) | partial | unit `audio_levels_do_not_restart_capture`, `capture::audio::tests::mic_matching`; integration `devices` |
+| Camera device + overlay settings | Yes | V4L2 device selection + the same overlay model | 1B (device), 1C (overlay), 1E (UI) | partial | unit `overlay_settings_round_trip_through_the_cli`, `camera::v4l2::tests::device_matching`; real hardware under "Needs a real desktop" |
 | Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model | 1D | todo | unit `settings::tests::live_encode_fits_every_enabled_destination` |
 | Settings persist in Application Support | `~/Library/Application Support/rec-rs/settings.json` | `$XDG_CONFIG_HOME/rec-rs/settings.json` | 0 | done | unit `settings::tests::settings_live_in_the_xdg_config_dir` |
 | Dock icon, app menu (Settings ⌘,, Hide ⌘H, Quit ⌘Q, Window menu) | Yes | Native window menu + `.desktop` actions | 1E/1F | todo | — |
@@ -95,34 +95,35 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
 | Video track: H.264 High, HEVC Main (`hvc1`), ProRes 422 | VideoToolbox | GStreamer: x264enc (H.264 High), x265enc (HEVC Main), `avenc_prores_ks` (ProRes 422); VA-API on a GPU host | 0 (software), 1C (hardware) | done | selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`, `h264-bitrate`; `ffprobe` reports h264/High and hevc/Main |
-| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240, chroma averaged over each 2x2 block); the encoder declares the tags | 1C (conversion), 1G (caps) | partial | unit `gpu::tests::the_output_is_bt709_limited_range` (white 235, black 16, red 63/102/240); `gpu::yuv::tests::known_bars`, cross-checked against ffmpeg's swscale |
+| BT.709 tagging | Yes | The compositor writes BT.709 limited range NV12/I420 (Y 16..235, Cb/Cr 16..240); for CPU frames the encoder capsfilter pins primaries/transfer/matrix BT.709 and limited range | 1C (conversion), 1G (caps) | done | unit `gpu::tests::the_output_is_bt709_limited_range`, `gpu::yuv::tests::known_bars`; selftest `pattern-1080-h264`, `pattern-hevc`, `pattern-4k-hevc`, `pattern-prores`: ffprobe reports `bt709/bt709/bt709` and `color_range=tv` for all three codecs |
 | Keyframe every 2 s | Yes | `key-int-max`/`gop-size` = 2 fps | 0 | done | writer sets it per encoder; crash test decodes |
 | Constant frame rate on an exact 1/fps grid | Yes, measured 16.667 ms | Yes: slot grid, PTS checked | 0 | done | `ffprobe` PTS 0.000/0.016667/0.033333/0.050000 (phase report) |
-| Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | Planned: AAC-LC 48 k stereo 256 kb/s | 1C | todo | — |
-| System stem: AAC 48 kHz stereo 256 kb/s | Yes (track 3) | AAC-LC 48 k stereo 256 kb/s, written | 0 | done | selftest tracks count (2: video + system); `ffprobe` audio aac 48000 stereo |
-| Mic stem: AAC 48 kHz mono 192 kb/s | Yes (track 4) | Planned with the mic track (mono) | 1B/1C | todo | — |
-| Track grouping: alternate group with the mix as default | Yes | Muxer track grouping (`mp4mux` input groups) | 1C | todo | — |
+| Mix track: AAC-LC 48 kHz stereo 256 kb/s, default track | Yes (track 2) | AAC-LC 48 kHz stereo 256 kb/s from the mix bus, the enabled track of the audio alternate group | 1G | done | selftest `tracks`: ffprobe `aac, 48000 Hz, 2 ch, 255999 b/s` at index 1, probe `enabled alt-group 1` |
+| System stem: AAC 48 kHz stereo 256 kb/s | Yes (track 3) | AAC-LC 48 kHz stereo 256 kb/s, its own encoder | 0 (track), 1G (faders/mix) | done | selftest `tracks`: index 2, disabled alternative in group 1, system beep at −12 dB with `--system-gain=-12` |
+| Mic stem: AAC 48 kHz mono 192 kb/s | Yes (track 4) | AAC-LC 48 kHz mono 192 kb/s (the device's own sample per frame) | 1B (capture), 1G (track) | done | selftest `tracks`: index 3, `1 ch`, `192000 b/s`, disabled alternative; the synthetic 1.5 kHz beep is the proof it carries the mic and not the system source |
+| Track grouping: alternate group with the mix as default | Yes | The finalise writes `tkhd` alternate_group and enabled flags into the moov (qtmux cannot) | 1G | done | unit `mp4::tests::finalize_builds_a_regular_movie_and_keeps_the_media_bytes`; selftest `tracks`: probe reports `alt-group 1`, mix `enabled`, both stems `disabled`; `audio-tracks stems` has no group and all tracks enabled |
 | Single clock, audio never stretched | Yes | Same: CLOCK_MONOTONIC everywhere, resampling only for device rates | 0 | done | selftest `sync` (offsets 0.0 ms) |
-| Flash/beep sync 0.0 ms in the file, including across pauses | Yes | 0.0 ms on every beep but the first, +9.9 ms on the first (see note) | 0 | partial | selftest `sync`, `pause-resume`, `audio-gaps` |
+| Flash/beep sync 0.0 ms in the file, including across pauses | Yes | 0.0 ms on every beep, the first included (the AAC priming is skipped by an edit list) | 1G | done | selftest `sync` (`--max-ms 1`), `pause-resume`, `audio-gaps`: mean +0.0 ms, range [+0.0, +0.0] |
 | Levels: fader and mute before everything, ≤20 ms ramp, 0 dB untouched | Yes | Same ramp and ordering in the writer | 0 | done | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
-| System audio latency shift (output device latency) | CoreAudio | PipeWire sink latency | 1B | todo | offset plumbing exists (`set_audio_offsets`) |
-| Webcam lag adaptation (emission waits for the slowest source) | Yes | Constant 50 ms lag in phase 0; adapts when the camera lands | 0 (lag), 1B (camera) | partial | writer `lag()`; frames on the grid (selftest) |
-| Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments | `mp4mux`/`qtmux` `fragment-duration=2000`; SIGKILL leaves a playable file | 0 | done | crash test: SIGKILL at 4.5 s → 4.0 s file that `ffmpeg -f null` decodes |
+| System audio latency shift (output device latency) | CoreAudio | PipeWire default sink's `Latency`/`ProcessLatency`, else `node.latency`, read once at start | 1B | done | unit `collector_combines_the_latency_parts`, `node_latency_property_is_a_fraction_or_frames`; integration `devices` prints 5.3 ms; writer applies the offset |
+| Webcam lag adaptation (emission waits for the slowest source) | Yes | Arrival-latency peak per source, decaying 50 ms/s, sets the emission lag (0.05–0.3 s) | 1G (adaptation), 1B (camera) | done | unit `media::writer::tests::camera_latency_widens_the_lag_and_decays`; selftest `camera-lag` (synthetic camera 80 ms late: 120/120 frames, no drift); needs a real desktop for a real 70–120 ms camera |
+| Crash-safe: fragments every 2 s, regular movie on stop | AVAssetWriter fragments while recording, then a regular moov | `fragment-duration=2000` while recording; `media::mp4::finalize` appends a regular moov that indexes the samples where they lie and flips the fragments to `free` (no media bytes move) | 1G | done | selftest `crash` (SIGKILL at 4.5 s: 238 frames, fragmented, decodes), `finalize-crash` (kill between the append and the flip: all 120 frames; mid-flip: playable), `defrag` (same sample count and identical ffmpeg framemd5 as the kept fragmented copy; final file has no `moof`/`mvex`) |
 | Edge to edge: frame has the source's aspect, no bars, never cropped | Yes | Same `fill`/`same_aspect` maths | 0 | done | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` |
 | Window transparent corners filled with the window's edge colour | CoreImage clamp | `compose::corner_inset` + a clamp in the upload shader, compositing the window over the clamped edge | 0 (geometry), 1C (GPU) | partial | unit `compose::tests::fill_is_edge_to_edge_for_the_same_aspect` (`corner_inset`), `gpu::tests::the_corner_fill_replaces_transparent_window_corners` |
-| Camera settles 2 s before the file starts | Yes | Same 2 s gate | 1B | todo | — |
+| Camera settles 2 s before the file starts | Yes | `wait_for_camera` holds the first screen frame until the camera's `settle_remaining()` has elapsed (gives up after 3 s more) | 1B (settle API), 1G (gate) | done | unit `media::writer::tests::the_camera_gate_holds_the_start_until_the_camera_settles`, `…gives_up_on_a_camera_that_never_delivers`; selftest `camera`: wall 4.2 s for 2 s settle + 2 s file, first frame is the camera's red |
 | Audio quality: 48 kHz capture, windowed-sinc resampler continuous across buffers | Yes | Same resampler maths (ported) | 0 | done | unit `mixer::tests::resamples_seamlessly`, `resampler_removes_content_above_nyquist`, `small_jitter_snaps_to_continuous` |
-| Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter | 0 (maths), 1C (mix track) | partial | unit `mixer::tests::limiting` |
+| Mix limiter keeps the mix under −1 dBFS, no clipping | Yes | Same soft-knee limiter on the mix bus; the stems are not limited (upstream's float path) | 0 (maths), 1G (mix track) | done | unit `mixer::tests::limiting`; selftest `tracks`/`gain` measure the mix and both stems |
 | Pause cuts whole frame slots, audio at the exact sample, no gap, no drift | Yes | Same `Pauses` timeline in the writer | 0 | done | unit `media::pauses::tests::output_slots_stay_contiguous_across_pauses`, `keep_cuts_captures_at_pause_boundaries`; selftest `pause-resume` (300 frames, sync holds) |
 | `--duration` exact in output frames, pauses don't count | Yes | Same | 0 | done | selftest `pause-resume`, `sync` |
 
 **AAC priming note.** AVFoundation writes the MP4 edit list that makes decoders skip an AAC
-encoder's priming samples; GStreamer's `qtmux`/`mp4mux` 1.26 cannot. The writer therefore drops the
-priming frames (`fdkaacenc` 2048 samples, `avenc_aac` 1024) and re-stamps the rest, which removes
-the 42.7 ms offset every beep otherwise has. The first kept frame lacks decoder history, so the very
-first ~10 ms of audio in a file fades in: measured 0.0 ms on beeps 2..N and +9.9 ms on beep 1.
-Phase 1C can improve this once the writer owns the audio path (an `elst` writer or a GStreamer
-version that does it).
+encoder's priming samples; GStreamer's `qtmux`/`mp4mux` 1.26 cannot. The finalise in
+`src/media/mp4.rs` writes it instead: each audio track gets an `edts`/`elst` whose `media_time` is
+the encoder's priming (fdkaacenc 2048 samples, avenc_aac 1024, scaled to the track's timescale), and
+`REC_AAC_PRIMING` overrides it. Readers that honour edit lists (ffmpeg, QuickTime) start at the
+first real sample, so the first beep in a file is at 0.0 ms too. `rec-rs probe` reports the edit
+list per track; GStreamer's own decode shows the unskipped priming, which is why the probe's decode
+line starts at 0.043 s for an audio track.
 
 ## Streaming
 
@@ -152,17 +153,18 @@ version that does it).
 | One-time screen permission | TCC grant | ScreenCast restore token in `$XDG_STATE_HOME/rec-rs/portal-token`, replayed through `SelectSources` | 1A | done | selftest `screen-token`; unit `token::tests::*` |
 | Scenes | Three fixed scenes, switchable live, cut only | Same three scenes, composited on the GPU | 1C/1E | partial | scene model: unit `tests::scene_option`; rendering: `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; goldens `screen`, `screen-cam-*`, `cam` |
 | Multiple displays/sources at once | No | No (a portal session may hand over several streams; the first is used) | — | n-a | matches upstream |
-| System audio | Yes | PipeWire sink monitor | 1B | todo | — |
-| Microphone | Yes | PipeWire capture | 1B | todo | — |
-| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | Same, wgpu | 1C | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow` |
-| Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
+| System audio | Yes | PipeWire default sink monitor | 1B | done | selftest `pattern-system-audio` (48 kHz and 44.1 kHz: 5 beeps at −6 dBFS, spacing 1.000 s); integration `system-48k`/`system-44k` |
+| Microphone | Yes | PipeWire `Audio/Source` capture at the device's own rate | 1B | done | selftest `pattern-mic`; integration `mic-default`, `mic-by-name`, `mic-unplug` |
+| Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | V4L2/portal source (1B) + wgpu compositor (1C); the recorder wires them (1G) | 1B/1C/1G | partial | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; camera source units; goldens `screen-cam-*`; real camera under "Needs a real desktop" |
+| Separate audio tracks | Up to 4 | Mix + 2 stems | 1G | done | selftest `tracks` (4 tracks with real AAC 256/256/192 kb/s), `audio-tracks` |
 | Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | partial | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
 | Hardware H.264/HEVC | VideoToolbox | VA-API on a GPU host; the container has no GPU, so it records with x264enc/x265enc (the writer skips VA without /dev/dri and trial-encodes it otherwise) | 1C | todo | dev/ELEMENTS.md |
-| ProRes | 422 | `avenc_prores_ks` 422 | 0 | done | selftest `pattern-prores` |
+| ProRes | 422 | `avenc_prores_ks`, profile pinned to 422 `standard` | 0 (element), 1G (profile) | done | selftest `pattern-prores`: ffprobe `prores/Standard`, BT.709, `.mov` only |
 | 10-bit / HDR | No | No | — | n-a | matches upstream |
 | Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
-| Crash-safe files | Fragments every 2 s | Fragments every 2 s | 0 | done | crash test decodes |
+| Crash-safe files | Fragments every 2 s | Fragments every 2 s, finalised in place | 1G | done | selftest `crash`, `finalize-crash`, `defrag` |
+| Bounded memory when the encoder cannot keep up | AVAssetWriterInput is asked `isReadyForMoreMediaData`; a busy encoder drops the frame | appsrc and every queue are bounded (2 video frames, 8 audio buffers); a full appsrc means the grid slot is dropped and counted, never buffered | 1G | done | unit `media::writer::tests::a_silent_or_far_future_source_cannot_grow_memory` (30 s at 1080p60 with a silent and a 1000 s-ahead source: RSS growth < 300 MB), `a_broken_audio_clock_cannot_stretch_the_file`, `mixer::tests::a_far_future_chunk_cannot_grow_the_mix_buffer`; selftest `pattern-4k-long` (20 s 4K60 noise: peak RSS 1.1 GB, 14.8 fps, 904 frames dropped on this CPU-only host) |
 | Pause / resume, sample-accurate, app and CLI | Yes | Yes (CLI done; app 1E) | 0 | done | selftest `pause-resume` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
@@ -187,7 +189,7 @@ version that does it).
 | HEVC to YouTube tested only against a local server | Yes | Same testing honestly reported | 1D | todo |
 | 8-bit SDR only | Yes | Same | — | n-a |
 | Webcam overlay burned into the video | Yes | Same: the compositor runs before the encoder | 1C | partial | the compositor is done and pixel-tested; the writer calls it (1G) |
-| Output latency read once at start | Yes | Same | 1B | todo |
+| Output latency read once at start | Yes | Same (PipeWire sink params at start; a device switch needs a restart, like upstream) | 1B | done | unit `collector_combines_the_latency_parts`; integration `devices` |
 | Mix track resamples a non-48 kHz mic linearly per buffer upstream | Yes | Linux: the mix uses the same windowed-sinc resampler as everything else (better) | 1C | todo |
 | Re-confirmation prompt for screen recording | macOS-only | n-a: the portal's restore token avoids it | — | n-a |
 
@@ -195,19 +197,20 @@ version that does it).
 
 Done (proved by tests or self-test cases): the CLI surface, settings and the settings-to-arguments
 path, pause timeline and pause/resume end to end, the frame-rate grid, faders/gain ramps and the
-resampler and limiter maths, overlay geometry/masks/shadows, the test-pattern source, the H.264 and
-ProRes writer with an AAC system track and crash-safe fragments, `probe`, the platform preset maths,
-the pidfile/signal control, and the sync/level/self-test scripts.
+resampler and limiter maths, overlay geometry/masks/shadows, the test-pattern source, the writer's
+track layout (video, mix, system stem, mic stem, alternate group with the mix enabled), the AAC
+priming edit list, BT.709 tags on every codec, the fragment-to-regular-movie finalise with both of
+its crash windows, the camera gate and lag adaptation, the native-size scaler, bounded memory when
+the encoder falls behind, `probe` (tracks, alternate group, enabled flags, edit lists, full
+decode), the platform preset maths, the pidfile/signal control, and the sync/level/self-test
+scripts.
 
-Partial (a named part is missing, listed per row): mix and mic tracks, BT.709 colour tagging,
-webcam lag adaptation, GPU compositing, system-audio latency, hardware encoding.
+Partial (a named part is missing, listed per row): hardware encoding (VA-API is selected and
+trial-encoded when `/dev/dri` exists; the container has no GPU, so x264/x265 are what the self-tests
+prove), and what can only be checked on a real desktop (a real V4L2 camera and its 70–120 ms
+latency, see the rows above).
 
-Known items owned by phase 1C (not fixed here): the first ~10 ms of audio in a file fades in
-because the AAC priming frames are dropped instead of trimmed with an MP4 edit list (+9.9 ms on the
-first beep, 0.0 ms after), and the self-test's sync threshold is 20 ms rather than upstream's 1 ms
-for that reason.
-
-Todo (phase 1): all capture, the GPU compositor, the app, replay/streaming, packaging.
+Todo (phase 1): the app, replay/streaming, packaging.
 
 ## Screen capture (phase 1A)
 
@@ -282,3 +285,70 @@ in order, on **GNOME Wayland** and **KDE Plasma Wayland** (and once on an X11 se
 - **Obscured windows on X11 without a compositor.** `GetImage` of a window that another window covers
   returns the server's undefined content for that area (black under Xvfb). With a compositor the
   window is redirected and correct.
+
+## Audio and camera sources (phase 1B)
+
+System audio and the microphone are PipeWire capture streams (`src/capture/audio/`); the camera is
+V4L2 (`src/capture/camera/v4l2.rs`), falling back to xdg-desktop-portal's Camera when `/dev/video*`
+is not reachable (`portal.rs`). All three stamp on `CLOCK_MONOTONIC` and deliver the contract's
+`AudioChunk`/`VideoFrame`; the mixer and compositor stay on the other side.
+
+| Feature | Upstream behaviour | Linux | Status | Evidence |
+|---|---|---|---|---|
+| System audio = what the speakers play | ScreenCaptureKit audio | `stream.capture.sink=true` on the default sink (WirePlumber's `default.audio.sink`), captured at the sink's own rate | done | selftest `pattern-system-audio` (5 beeps, −5.9 dBFS, 1.000 s apart); integration `system-48k`; `system-44k` captures 44100 Hz and resamples to the file's 48 kHz |
+| Microphone selection | AVCapture devices, unique id/name | PipeWire `Audio/Source`: default, exact `node.name`, the same USB device on another port, saved/argument display name (exact, substring), case-insensitive | done | unit `capture::audio::tests::mic_matching`; selftest `pattern-mic`; integration `mic-by-name` |
+| Missing microphone | Warn and use default | `pick_mic` returns the default plus upstream's warning; the CLI's explicit `--mic` fails with `is not connected`, the default mic warns and records | done | integration `mic-missing`; unit `mic_matching` (warning text) |
+| Native rate and channels | 48 kHz AVCapture | The stream asks for the node's `audio.rate`/`audio.channels`; the mixer resamples other rates with its windowed-sinc resampler | done | integration `system-44k` (log: `system format 44100 Hz`, recorded 1 kHz, spacing 1.000 s); `mixer::tests::resamples_seamlessly` |
+| Chunk timestamps | Host clock from CoreMedia | `pw_buffer.time` (graph cycle, ns) / 1e9, guarded against other clocks; live worst `|pts − arrival|` 1.0–3.0 ms over 281 chunks | done | unit `buffer_times_become_monotonic_seconds`, `timestamps_from_another_clock_fall_back_to_now`; ignored `live_chunk_timestamps_are_on_the_host_clock`; integration `clock` |
+| Device disappears mid-recording | Capture error | The registry's `global_remove` of the linked node stops the loop; `stop()` returns `the mic device was disconnected`; the session keeps recording video and finalizes | done | integration `mic-unplug` (121 frames, warning in the log) |
+| Capture latency | CoreAudio | Measured end to end: first captured tone **+26.6…+33.4 ms** after `pw-play` was spawned (its start-up included) | measured | ignored `system_audio_capture_latency`; integration `latency` |
+| Output latency | CoreAudio device latency | Default sink `Latency` + `ProcessLatency` params, else `node.latency`; printed by `devices` and used as the system-audio shift | done | unit `collector_combines_the_latency_parts`, `node_latency_property_is_a_fraction_or_frames`; integration `devices` (256/48000 → 5.3 ms) |
+| Camera enumeration | AVCapture discovery | `/dev/video*` nodes with `VIDEO_CAPTURE`+`STREAMING` (the metadata node is skipped), path as id, driver card as name, numeric order | done (unit); real device listed below | unit `camera::v4l2::tests::device_matching`, `enumerate_devices_never_panics_without_a_camera` |
+| Camera format negotiation | AVCapture 720p preset | Largest frame ≤1920×1080 that reaches 30 fps, even dimensions, 16:9 at equal size, YUYV → NV12 → MJPEG; driver adjustments read back; stepwise ranges sampled, never enumerated exhaustively | done (unit); real device listed below | unit `camera::format::tests::*`; unit `fps_of`, frame interval tests |
+| Camera pixels | AVCapture `PIX_BGRA` | YUYV/NV12/I420/BGRx → BGRA with BT.601/709 limited range; MJPEG through `zune-jpeg`; every frame `is_well_formed()` | done | unit `camera::convert::tests::*` (synthetic YUYV/NV12/I420, a 16×16 JPEG fixture, truncated JPEG is an error) |
+| Camera timestamps | Host clock | V4L2 `timeval`; epoch-valued (wall clock) timestamps converted by age; timestamps >5 s from the host clock replaced by arrival; non-monotonic output repaired | done | unit `monotonic_driver_timestamps_pass_through`, `wall_clock_driver_timestamps_are_converted`, `unknown_and_non_monotonic_timestamps_are_repaired` |
+| Camera size/aspect and settle API | Session preset + 2 s settle | `CameraSource::native_size()`/`aspect()` known from negotiation; `CAMERA_SETTLE_SECS = 2.0`, `settle_remaining()`; 1C/1G consume | done (API); wiring 1G | unit `camera::tests::size_and_aspect_are_known_before_the_first_frame`, `describe_names_the_camera_and_its_format` |
+| Camera portal (Flatpak) | n/a | `ashpd` Camera → access request → PipeWire remote → node; BGRx/BGRA/RGBA/YUY2/NV12/I420 → BGRA; 1280×720 until the stream negotiates | needs real desktop | compiles and is exercised only for the no-portal path here; checklist below |
+| Dead camera | Capture error | Five empty 500 ms stream timeouts report `camera … stopped delivering frames`; `stop()` returns it; the thread never blocks the session | done (unit logic); real device below | code path in `v4l2::run_capture`; covers 1G's writer error handling |
+| `permissions` audio/camera lines | TCC | Mic: PipeWire + number of inputs. Camera: V4L2 nodes or the portal. A missing PipeWire session is reported, never a hang | done | integration `no-pipewire`; container report: `microphone : unavailable (PipeWire is not available …)`, `camera : unavailable (no /dev/video* capture device)` |
+
+### Needs a real desktop (camera and hardware audio)
+
+The dev container has no webcam (and no `v4l2loopback` module it could load), no sound card and no
+Flatpak portal host. These are the exact checks to run on a real machine:
+
+1. **UVC camera.** Plug a webcam. `rec-rs devices` must list `/dev/videoN` with the card name, not
+   the metadata node (`v4l2-ctl --list-devices` shows which is which). `rec-rs record --test-pattern
+   --cam -t 5 -o /tmp/cam.mov` (once 1G wires the camera) must show a live overlay;
+   `rec-rs probe /tmp/cam.mov` decodes every frame. `--webcam <name substring>` and
+   `--webcam /dev/videoN` must select the same device.
+2. **Camera settle.** Start a recording immediately after plugging the camera: the first two seconds
+   are not dark (auto-exposure converges), and the writer's camera gate starts the file once
+   `settle_remaining()` is 0.
+3. **Format choice.** `v4l2-ctl -d /dev/videoN --list-formats-ext`; the start log's camera line must
+   name 1080p30 MJPEG when YUYV only reaches 5 fps, and YUYV/NV12 when it reaches 30 fps. An
+   unplugged camera mid-recording must finalize the file and log the capture error.
+4. **Camera portal.** Build the Flatpak without `/dev/video*` access, run
+   `flatpak run io.github.sultanaltair96.Rec devices`: the portal camera is listed; the first
+   recording shows the desktop's camera dialog; denying it gives a clear error and no hang; granting
+   it records BGRA frames.
+5. **Real sink latency.** With a real output device, `rec-rs devices` must print a non-zero latency
+   (compare `pactl list sinks`); record a screen flash plus a `pw-play` beep and measure it with
+   `scripts/synccheck.py` (≤20 ms with the automatic offset; a Bluetooth sink is the interesting
+   case).
+6. **Bluetooth microphone.** `--mic <headset>` must select it, and `--mic-offset-ms N` must move the
+   mic track against the video flash the way upstream's mic offset does.
+
+### Known gaps (phase 1B)
+
+- **Default sink changes mid-recording are not followed.** System audio is linked to the sink that
+  was the default when the source opened (a target-pinned PipeWire stream is not moved by
+  WirePlumber), so switching outputs needs a new session. Upstream reads the output latency once at
+  start too; the app (1E) or the writer's restart path (1G) can reopen the source later.
+- **The camera is not wired into `record` yet.** `Session::start_sources` is 1G's: it will call
+  `camera::open_source`, feed the compositor and pass `settle_remaining()` to the writer's camera
+  gate. Until then `record --webcam` still says phase 1B.
+- **The camera portal path is untested at run time.** It compiles and its matching logic is unit
+  tested, but this host has no Flatpak portal camera; the manual checklist above is the proof.
+- **MJPEG decoding is on the CPU** (zune-jpeg). Fine for a 720p/1080p webcam on one core; a 4K MJPEG
+  camera would want the GPU path, which is not claimed.
