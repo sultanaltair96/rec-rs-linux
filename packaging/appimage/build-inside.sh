@@ -26,6 +26,7 @@ apt-get install -y -qq --no-install-recommends \
     libpipewire-0.3-dev libx11-dev libxcb1-dev libdbus-1-dev libv4l-dev \
     libssl-dev libwayland-dev libxkbcommon-dev libsecret-1-dev libglib2.0-dev \
     libudev-dev zlib1g-dev \
+    libxcursor1 libxrandr2 libxi6 libxinerama1 libxxf86vm1 libxkbcommon-x11-0 \
     gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
     >/dev/null
@@ -122,23 +123,32 @@ echo "== linuxdeploy"
 # The host must provide libGL/libEGL/Vulkan drivers, libdbus and libpipewire,
 # so those are excluded from the bundle; the closure pass below catches what
 # linuxdeploy leaves out.
+#
+# libxcb, libwayland and the GPU plumbing (libdrm, libgbm) stay on the host: the
+# host's Vulkan/GL driver is linked against *its* copies, and shadowing them
+# with the build container's older ones stops every ICD from loading (Fedora
+# 43's lavapipe wants xcb_dri3_import_syncobj_checked and
+# wl_display_dispatch_queue_timeout, which Ubuntu 24.04's libxcb/libwayland do
+# not have). The Xlib family above them (libX11, libXext, libXrender,
+# libXcursor, ...) is bundled: it is ABI-stable, does not talk to the driver
+# directly, and gst-libav links it, so without it a host without an X stack
+# would lose AAC, ProRes and the HEVC decoder.
 set --
 for f in "$PLUGINS"/*.so; do
     set -- "$@" --library "$f"
 done
 
-# Libraries the app loads with dlopen, so they are not DT_NEEDED of anything
-# and linuxdeploy cannot discover them: winit's X11 backend (x11-dl) opens the
-# Xlib set by soname, xkbcommon-dl opens libxkbcommon, and the Wayland client
-# stack is opened by smithay-client-toolkit. Without them the GUI exits with
-# "Failed to load one of xlib's shared libraries".
-for name in libX11.so.6 libX11-xcb.so.1 libXcursor.so.1 libXrandr.so.2 \
-            libXi.so.6 libXinerama.so.1 libXxf86vm.so.1 libXfixes.so.3 \
-            libxkbcommon.so.0 libxkbcommon-x11.so.0 \
-            libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1; do
+# winit's X11 backend (x11-dl) and xkbcommon-dl open these by soname with
+# dlopen, and nothing links them, so linuxdeploy cannot find them. They are
+# bundled here because they are ABI-stable and do not talk to the GPU driver;
+# libxcb and libwayland underneath them stay on the host (see above).
+for name in libXcursor.so.1 libXrandr.so.2 libXi.so.6 libXinerama.so.1 \
+            libXxf86vm.so.1 libXfixes.so.3 libXext.so.6 libXrender.so.1 \
+            libX11-xcb.so.1 libxkbcommon.so.0 libxkbcommon-x11.so.0; do
     lib=$(ls /usr/lib/x86_64-linux-gnu/"$name" 2>/dev/null | head -1)
     [ -n "$lib" ] && set -- "$@" --library "$lib"
 done
+
 
 "$TOOLS/linuxdeploy" --appdir "$APPDIR" \
     --executable "$APPDIR/usr/bin/rec-rs" \
@@ -149,6 +159,10 @@ done
     --exclude-library 'libGL*' \
     --exclude-library 'libEGL*' \
     --exclude-library 'libdbus-1*' \
+    --exclude-library 'libxcb*' \
+    --exclude-library 'libwayland*' \
+    --exclude-library 'libdrm*' \
+    --exclude-library 'libgbm*' \
     "$@"
 
 # linuxdeploy drops the plugins into usr/lib; GStreamer loads them from
@@ -175,7 +189,7 @@ echo "== dependency closure"
 # from the host's /usr/lib/*/dri, which is the part that must match the GPU.
 # The Vulkan *loader* is bundled (ffmpeg's libavcodec links it); the ICDs and
 # drivers behind it still come from the host. Same for libva above.
-HOST_PROVIDED='^(linux-vdso|ld-linux|libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|libnss_|libpipewire|libspa-|libGL|libGLX|libOpenGL|libEGL|libdbus-1)'
+HOST_PROVIDED='^(linux-vdso|ld-linux|libc\.so|libm\.so|libpthread|libdl\.so|librt\.so|libresolv|libnss_|libpipewire|libspa-|libGL|libGLX|libOpenGL|libEGL|libdbus-1|libxcb|libwayland|libdrm|libgbm)'
 for pass in 1 2 3 4 5; do
     added=0
     for f in "$APPDIR/usr/bin/rec-rs" "$APPDIR"/usr/lib/*.so* \

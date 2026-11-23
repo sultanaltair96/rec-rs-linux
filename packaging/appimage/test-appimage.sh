@@ -50,7 +50,7 @@ for image in $IMAGES; do
             setup='dnf -y -q install util-linux pipewire-libs xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers libglvnd-egl libglvnd-glx >/dev/null 2>&1'
             ;;
         debian:*)
-            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd xvfb xauth libgl1-mesa-dri mesa-vulkan-drivers libglx-mesa0 libegl1 >/dev/null'
+            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd xvfb xauth libgl1-mesa-dri mesa-vulkan-drivers libglx-mesa0 libegl1 libxcb-render0 libxcb-shm0 libxcb-dri3-0 libxcb-randr0 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 >/dev/null'
             ;;
         *)
             setup='true'

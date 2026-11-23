@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 3.5 MB bundle (runtime shared) | 98 MB AppImage (GStreamer inside) |
+| Size | 9.6 MB bundle (runtime shared) | 106 MB AppImage (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -172,9 +172,11 @@ on the host side of the Videos mount, `probe` inside the sandbox, the default
 output folder, HEVC, ProRes, the no-subcommand entry point, the settings path
 (writable, private to the app, visible in `~/.var/app`), the exported desktop actions
 (rewritten to `flatpak run ... gui --start-recording` / `--settings`), and the installed
-desktop/metainfo/icon files. Result: **12/12 pass**, encoder names printed by the
-recorder (`x264enc`, `x265enc`, `avenc_prores_ks`) and `probe` reporting
-`video h264 1920x1080 @ 60.000 fps` / HEVC.
+desktop/metainfo/icon files, and the GUI: `flatpak run` with no subcommand
+opens the window (Xvfb + the runtime's Mesa, still up after 8 s). Result:
+**12/12 pass**, encoder names printed by the recorder (`x264enc`, `x265enc`,
+`avenc_prores_ks`) and `probe` reporting `video h264 1920x1080 @ 60.000 fps` /
+HEVC.
 
 Bundle size: **3.5 MB** (`rec.flatpak`) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
@@ -196,12 +198,12 @@ part of the bundle.
 * `packaging/update-sources.sh` must be run and the result committed whenever
   `Cargo.lock` changes (every later phase adds crates).
 * The metainfo's screenshots still point at upstream's macOS captures; replace
-  them with Linux screenshots (and remote URLs) once phase 1E renders the
-  window. The `TODO(packaging)` comment in the file says so.
-* The app entry point currently prints *"the graphical app is not implemented
-  yet (phase 1E)"* and exits 1. The package is complete for the CLI and becomes
-  a windowed app when 1E lands; nothing in the packaging needs to change for
-  that.
+  them with Linux screenshots (and remote URLs) now that the window runs. The
+  `TODO(packaging)` comment in the file says so.
+* The app entry point works: `flatpak run io.github.sultanaltair96.Rec` opens
+  the window, and the container test proves it stays up for 8 s under Xvfb with
+  the runtime's Mesa (llvmpipe). The tray appears when the desktop offers a
+  StatusNotifierWatcher, and the app logs and continues when it does not.
 
 ## AppImage
 
@@ -249,6 +251,8 @@ host's `/usr/lib/*/dri`, simply registers no elements; the writer then picks
 | libdbus-1 | must match the running session bus |
 | **libpipewire-0.3 / libspa-0.2** | the client ABI has to match the *daemon* it talks to; a bundled client against the host's PipeWire is the classic AppImage failure. Every desktop ships it. If it is missing, the recorder fails to start; screen/audio capture would not work without a PipeWire daemon anyway |
 | the Vulkan ICDs and the GL drivers | `libvulkan.so.1` (the loader) is bundled because ffmpeg's libavcodec links it; the ICD JSON files and the drivers behind it are the host's |
+| **libxcb, libwayland, libdrm, libgbm** | the host's Vulkan/GL driver is linked against *its* libxcb and libwayland; shadowing them with the build container's older copies stops every ICD from loading (Fedora 43's lavapipe needs `xcb_dri3_import_syncobj_checked` and `wl_display_dispatch_queue_timeout`, which Ubuntu 24.04's libraries do not export). libavcodec links libxcb too, so a host without it loses gst-libav (AAC, ProRes, the HEVC decoder) — every desktop with an X11 or Wayland session has it |
+| the Xlib family (`libX11`, `libXext`, `libXrender`, `libXcursor`, `libXrandr`, `libXi`, `libXinerama`, `libXxf86vm`, `libXfixes`) and `libxkbcommon(-x11)` | **bundled**: they are ABI-stable, do not talk to the GPU driver, and winit/xkbcommon-dl `dlopen` them by soname, so a host without an X stack would have no window |
 
 `AppRun` narrows `GST_PLUGIN_SYSTEM_PATH_1_0` to the bundled plugins only, so a
 host GStreamer can never be mixed into the bundled core, and points
@@ -266,8 +270,8 @@ gh-releases-zsync|sultanaltair96|rec-rs-linux|latest|Rec-*x86_64.AppImage.zsync
 (`--appimage-updateinformation` prints it back) and writes
 `Rec-<version>-x86_64.AppImage.zsync` next to the AppImage. Both are attached to
 each GitHub Release, so AppImageUpdate and any zsync-aware launcher can update
-in place. The app's own "Check for Updates" menu item belongs to phase 1E; the
-feed it will read exists from the first release.
+in place, and the app's own "Check for Updates…" reads the same release feed
+(hidden inside the Flatpak, where Flatpak owns the update).
 
 ### Build and test
 
@@ -287,25 +291,50 @@ library, see the table above). It records H.264, HEVC and ProRes with the test
 pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
-Result on both distributions: **7/7 checks pass**, `x264enc`, `x265enc` and
-`avenc_prores_ks` chosen, `probe` reporting `video h264 1920x1080 @ 60.000 fps`
-and HEVC, 28 bundled plugins, and the only host libraries resolved are
-`libpipewire-0.3.so.0` and glibc (`libc`, `libm`, `ld-linux`).
+Result: **Debian 13 8/8 pass** and **Fedora 43 7/7 pass + 1 skip**. The
+encoders are `x264enc`, `x265enc` and `avenc_prores_ks`, `probe` reports
+`video h264 1920x1080 @ 60.000 fps` and HEVC, 28 plugins are bundled, and the
+GUI opens under Xvfb on Debian 13 (window still up after 8 s). On Fedora 43's
+container the same check **skips**: the host's software Vulkan (lavapipe over
+Xvfb) refuses to enumerate a device (`vkEnumeratePhysicalDevices` returns
+`VK_ERROR_INCOMPATIBLE_DRIVER`) and its GL adapter cannot present to the X
+window, so there is no adapter for wgpu to use. The Flatpak, which carries the
+runtime's Mesa, opens its window in the same container — the difference is the
+host's rendering stack, not the package. A real Fedora desktop with a GPU
+driver is check 8 in the list below.
 
-Sizes: AppImage **93.6 MiB** (98,126,328 bytes), `.zsync` 328 KiB. Most of it
+Sizes: AppImage **101.3 MiB** (106,211,832 bytes), `.zsync` 178 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
-libplacebo, libaom, ...). That is the price of AAC and ProRes in a single file;
-the Flatpak gets the same codecs from the runtime for 3.5 MB.
+libplacebo, libaom, ...) plus egui/wgpu and the embedded Inter fonts. That is
+the price of AAC, ProRes and the app in a single file; the Flatpak gets the
+codecs from the runtime and is 9.6 MB.
 
 AppImages normally mount themselves with FUSE; containers have no FUSE, so both
 scripts use the runtime's own `APPIMAGE_EXTRACT_AND_RUN=1`, which extracts the
 same image and runs the same `AppRun`.
 
+## What the app needs at run time, and where it comes from
+
+The app (phase 1E) is a winit + wgpu window with a tray icon, global hotkeys and
+a folder picker; the recorder itself needs GStreamer and PipeWire. Each row says
+which package provides it:
+
+| Need | Flatpak | AppImage |
+|---|---|---|
+| Vulkan/GL for wgpu | the runtime's Mesa (`org.freedesktop.Platform.GL.default`, installed with the runtime) plus `--device=dri` | the host's Mesa/GL/Vulkan drivers; the `libvulkan.so.1` loader is bundled, the ICDs are the host's |
+| Window: Wayland/X11 client stack | the runtime's libwayland, libxkbcommon, libX11 | the Xlib family and `libxkbcommon(-x11)` are bundled; `libxcb`/`libwayland` are the host's (see the table above) |
+| Tray (StatusNotifierItem through ksni, D-Bus session) | `--talk-name=org.kde.StatusNotifierWatcher` | host session bus; without a watcher the app warns and keeps the window |
+| Global hotkeys (XDG GlobalShortcuts portal) | the portal is reachable in the sandbox by default; a missing portal falls back to X11 grabs and otherwise says "unavailable" | host portal over D-Bus, same fallback |
+| Secret Service (stream keys, phase 1D) | `--talk-name=org.freedesktop.secrets` | host Secret Service |
+| Folder picker (rfd) | FileChooser portal | host FileChooser portal |
+| Inter (Regular/Medium/SemiBold) | `include_bytes!` in the binary (`assets/fonts/`), nothing to install | the same bytes, in the same binary |
+| GStreamer + encoders | the runtime + `codecs-extra` + the built x265 | 28 bundled plugins (see above) |
+
 ## Desktop integration
 
 * **Desktop entry** `io.github.sultanaltair96.Rec.desktop`: `Exec=rec-rs gui`,
-  `StartupWMClass=rec-rs` (winit's default app id is the binary name; phase 1E
-  must keep that or update this line and the AppImage's `rec-rs.desktop`),
+  `StartupWMClass=rec-rs` (winit's app id is the binary name; if the app ever
+  changes it, update this line and the AppImage's `rec-rs.desktop`),
   categories `AudioVideo;Recorder;`, and the two upstream Dock-menu equivalents
   as actions:
   `Start Recording` → `rec-rs gui --start-recording`, `Settings` →
@@ -373,9 +402,11 @@ Everything below needs a display, a portal host, audio hardware or a camera,
 which the build host (WSL, no display, no GPU passthrough, no webcam) cannot
 provide. The exact checks:
 
-1. **Flatpak GUI** — `flatpak install --user rec.flatpak && flatpak run
-   io.github.sultanaltair96.Rec` opens the app window (phase 1E); before 1E it
-   prints the phase message, which is what the container test checks.
+1. **The GUI on real hardware** — `flatpak install --user rec.flatpak && flatpak
+   run io.github.sultanaltair96.Rec` and `./Rec-*.AppImage` open the window, the
+   tray icon appears and the preview shows frames. The containers verify the
+   window opening under Xvfb (Flatpak 12/12, AppImage on Debian 13); a real GPU
+   driver, a real tray host and a live preview are what remains.
 2. **Flatpak screen capture** — inside the Flatpak, `flatpak run
    --command=rec-rs io.github.sultanaltair96.Rec permissions --request` shows
    the desktop's own ScreenCast picker once, then `record -t 5` produces a
