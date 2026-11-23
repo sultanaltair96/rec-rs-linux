@@ -79,9 +79,9 @@ muxers and the decoders `probe` uses), built on Ubuntu 22.04 so it starts on eve
 distribution:
 
 ```sh
-packaging/appimage/build-appimage.sh          # in a container; writes $REC_PKG_OUT/Rec-0.1.0-x86_64.AppImage
-"$REC_PKG_OUT/Rec-0.1.0-x86_64.AppImage" record --test-pattern -t 3 -o /tmp/x.mp4
-"$REC_PKG_OUT/Rec-0.1.0-x86_64.AppImage" probe /tmp/x.mp4
+packaging/appimage/build-appimage.sh          # in a container; writes $REC_PKG_OUT/Rec-<version>-x86_64.AppImage
+"$REC_PKG_OUT/Rec-<version>-x86_64.AppImage" record --test-pattern -t 3 -o /tmp/x.mp4
+"$REC_PKG_OUT/Rec-<version>-x86_64.AppImage" probe /tmp/x.mp4
 ```
 
 Both need Docker on the build host and nothing else: every build and every check runs in a
