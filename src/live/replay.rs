@@ -193,6 +193,14 @@ pub fn write_mp4(
     // frame (the tap can be a little ahead) is cut, as upstream does.
     let last_v = video_packets.iter().map(|p| p.pts).fold(t0, f64::max) - t0;
     let pcm = decode_audio(audio_packets, formats, t0, last_v + 0.05)?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "rec: debug: replay: {:.2} s of video, {} audio packets, {:.2} s of PCM",
+            last_v,
+            audio_packets.len(),
+            pcm.len() as f64 / audio::RATE as f64
+        );
+    }
     mux_mp4(&abs, video_packets, t0, &pcm, formats)
         .with_context(|| format!("writing the replay to {}", abs.display()))?;
     Ok(abs)
@@ -216,31 +224,50 @@ fn decode_audio(
         dec.push(p.pts, &p.data)?;
     }
     let decoded = dec.decode_all()?;
-    if std::env::var_os("REC_DEBUG").is_some() {
-        eprintln!(
-            "rec: debug: replay audio: {} packets, decoder {} (offset {} samples)",
-            packets.len(),
-            dec.decoder,
-            dec.offset
-        );
-    }
     // Never longer than the picture: the last PCM the muxer gets ends with it.
     let limit = (max_secs.max(0.0) * rate).round() as usize;
     let mut out: Vec<[f32; 2]> = Vec::with_capacity(limit.min(1 << 20));
+    // Place every decoded sample at the clip time it belongs to (`t0` is the
+    // first video frame). `dec.offset` is the decoder's own warm-up (see
+    // `audio::decoder_offset`), so a buffer labelled `pts` holds the audio of
+    // `pts + (i - offset)/rate` at its sample `i`.
+    //
+    // A hole becomes silence: the writer's audio tap can start after the first
+    // video frame (it did by 50 ms in a real recording), and the audio stream
+    // can have a gap; neither may shift the rest of the track earlier.
     for buf in decoded {
-        // Sample-accurate cut: the clip's audio starts at t0, and the packets
-        // before it are only the decoder's warm-up (which is why they are in
-        // the ring at all).
-        let skip = (((t0 - buf.pts) * rate).round().max(0.0) as i64 + dec.offset).max(0) as usize;
-        for sample in buf.samples.iter().skip(skip) {
-            if out.len() >= limit {
+        let base = (buf.pts - t0) * rate - dec.offset as f64;
+        for (i, sample) in buf.samples.iter().enumerate() {
+            let at = (base + i as f64).round();
+            if at < 0.0 {
+                continue;
+            }
+            let at = at as usize;
+            if at >= limit {
                 break;
             }
-            out.push(*sample);
+            if at > out.len() {
+                out.resize(at, [0.0, 0.0]);
+            }
+            if at == out.len() {
+                out.push(*sample);
+            }
+            // `at < out.len()`: the decoder's tail overlapping the previous
+            // buffer; the earlier copy is the one to keep.
         }
         if out.len() >= limit {
             break;
         }
+    }
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "rec: debug: replay audio: {} packets, decoder {} (offset {} samples), {:.3} s at {} Hz",
+            packets.len(),
+            dec.decoder,
+            dec.offset,
+            out.len() as f64 / rate,
+            audio::RATE
+        );
     }
     Ok(out)
 }

@@ -1024,7 +1024,10 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                 let dt = frame.pts - lt;
                 if dt > 1.5 * step && dt < MAX_FILL {
                     let mut ft = lt + step;
-                    while ft < frame.pts - 0.5 * step {
+                    // Never stamp a fill frame on the arriving frame's own time
+                    // (a jittery fps estimate must not create a duplicate
+                    // timestamp: a stream would then carry two frames at once).
+                    while ft < frame.pts - 1e-3 {
                         e.video.encode(lf, ft);
                         ft += step;
                     }
@@ -1047,8 +1050,8 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                 }
             }
         }
-        if let Some(last) = prev {
-            last_video = Some(last);
+        if let Some(last) = &prev {
+            last_video = Some(last.clone());
         }
 
         for chunk in &chunks {

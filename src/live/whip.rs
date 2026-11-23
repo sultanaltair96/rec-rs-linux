@@ -545,6 +545,13 @@ const SEND_MARGIN: Duration = Duration::from_millis(40);
 /// keyframe.
 const OPUS_FRAME: f64 = 0.02;
 
+/// How close the first audio packet has to be to the keyframe. Packets are
+/// OPUS_FRAME apart, so a keyframe lands inside this window most of the time;
+/// when it does not, the next keyframe (one GOP later) is tried. This is what
+/// keeps the A/V offset steady: the server places each track from its first
+/// packet, and a start one frame apart was measured as a −36 ms recording.
+const ALIGN_WINDOW: f64 = OPUS_FRAME * 0.35;
+
 #[derive(Clone, Copy)]
 struct Anchor {
     /// Capture time sent at `at`.
@@ -592,13 +599,13 @@ fn start_anchor(q: &mut VecDeque<Media>, now: Instant) -> Option<Anchor> {
     // one-frame nudge in the direction that measured best (a later packet
     // showed up as audio up to 12 ms early in the server's recording).
     let before = candidates()
-        .filter(|&p| p <= tk + 1e-9 && p > tk - OPUS_FRAME)
+        .filter(|&p| p <= tk + 1e-9 && p > tk - ALIGN_WINDOW)
         .fold(f64::MIN, f64::max);
     let best = if before != f64::MIN {
         Some(before)
     } else {
         candidates()
-            .filter(|&p| p > tk && p < tk + OPUS_FRAME)
+            .filter(|&p| p > tk && p < tk + ALIGN_WINDOW)
             .min_by(|a, b| (a - tk).abs().total_cmp(&(b - tk).abs()))
     };
     let newest_audio = candidates().fold(f64::MIN, f64::max);
@@ -620,14 +627,14 @@ fn start_anchor(q: &mut VecDeque<Media>, now: Instant) -> Option<Anchor> {
         if std::env::var_os("REC_DEBUG").is_some() {
             eprintln!(
                 "whip: keyframe {tk:.4} has no audio within {} ms (newest audio {newest_audio:.4}): waiting for the next one",
-                OPUS_FRAME * 1000.0
+                ALIGN_WINDOW * 1000.0
             );
         }
         let from = newest_audio - OPUS_FRAME;
         q.retain(|m| m.pts() >= from);
         return None;
     }
-    let first = best.filter(|&p| (p - tk).abs() < OPUS_FRAME);
+    let first = best.filter(|&p| (p - tk).abs() < ALIGN_WINDOW);
     let cut = first.unwrap_or(tk);
     if std::env::var_os("REC_DEBUG").is_some() {
         eprintln!(
@@ -880,11 +887,11 @@ mod tests {
         }
     }
 
-    /// Audio that starts after the first keyframe (the encoder came up late, or
-    /// the session connected mid-buffer) must not start the stream on that
-    /// keyframe: the tracks would stay a frame or two apart for the whole
-    /// recording (measured: a −36 ms recording). The next keyframe, with audio
-    /// around it, starts it.
+    /// Audio that starts after the first keyframe (the encoder came up late, the
+    /// writer's tap began 50 ms after the first frame, or the session connected
+    /// mid-buffer) must not start the stream on that keyframe: the tracks would
+    /// stay a frame or two apart for the whole recording (measured: −36 ms).
+    /// The next keyframe, with audio right next to it, starts it.
     #[test]
     fn waits_for_audio_next_to_the_keyframe() {
         let t = Instant::now();
@@ -907,19 +914,31 @@ mod tests {
             "the old GOP was dropped: {:?}",
             q.iter().map(Media::pts).collect::<Vec<_>>()
         );
-        // The next keyframe (12.0) has audio around it.
+        // The next keyframe (12.0) has an audio packet 4 ms before it.
         q.push_back(video(12.0));
         for i in 0..6 {
-            q.push_back(audio(11.99 + i as f64 * 0.02));
+            q.push_back(audio(11.996 + i as f64 * 0.02));
         }
         let a = start_anchor(&mut q, t).expect("the second keyframe starts it");
-        assert!((a.t0 - 11.99).abs() < 1e-9, "t0 {}", a.t0);
+        assert!((a.t0 - 11.996).abs() < 1e-9, "t0 {}", a.t0);
         // The first video packet is the keyframe, and the audio before the cut
         // is dropped.
         assert!(
             matches!(q.front(), Some(Media::Video { key: true, pts, .. }) if (pts - 12.0).abs() < 1e-9)
         );
-        assert!(q.iter().all(|m| m.pts() >= 11.99 - 1e-9));
+        assert!(q.iter().all(|m| m.pts() >= 11.996 - 1e-9));
+
+        // A keyframe 10 ms away from every audio packet is skipped too: the
+        // window is deliberately tighter than half an Opus frame.
+        let mut q: VecDeque<Media> = VecDeque::new();
+        q.push_back(video(20.0));
+        for i in 0..6 {
+            q.push_back(audio(20.01 + i as f64 * 0.02));
+        }
+        assert!(
+            start_anchor(&mut q, t).is_none(),
+            "10 ms is outside the alignment window"
+        );
     }
 
     fn audio(pts: f64) -> Media {
