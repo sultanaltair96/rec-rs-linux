@@ -470,9 +470,18 @@ fn the_settings_window_round_trips_to_settings_json() {
     low.click();
     h.run();
     assert!(h.state().settings.preview_low_power);
+    // G3: hiding Rec's own window while recording is a setting, on by default.
+    assert!(h.state().settings.hide_window_when_recording);
+    h.get_by_label("Hide Rec's window while recording").click();
+    h.run();
+    assert!(!h.state().settings.hide_window_when_recording);
     // The settings file was written by the click, and reads back the same.
     let text = std::fs::read_to_string(&path).expect("settings.json written");
     assert!(text.contains("\"preview_low_power\": true"), "{text}");
+    assert!(
+        text.contains("\"hide_window_when_recording\": false"),
+        "{text}"
+    );
     assert!(text.contains("\"resolution\": \"1440p\""));
     let back = Settings::from_json(&text).expect("valid json");
     assert_eq!(back, h.state().settings);

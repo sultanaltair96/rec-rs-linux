@@ -41,6 +41,52 @@ pub fn reveal_args(file: &Path) -> Vec<String> {
     ]
 }
 
+/// A desktop notification (the freedesktop notification service on the session
+/// bus), fire-and-forget: a session without one keeps the message in the tray
+/// area instead. Used when the app hides its own window for a recording.
+pub fn notify(summary: &str, body: &str) {
+    let (summary, body) = (summary.to_string(), body.to_string());
+    std::thread::Builder::new()
+        .name("rec-notify".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(rt) = rt else { return };
+            rt.block_on(async move {
+                let Ok(conn) = zbus::Connection::session().await else {
+                    return;
+                };
+                let Ok(proxy) = zbus::Proxy::new(
+                    &conn,
+                    "org.freedesktop.Notifications",
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                )
+                .await
+                else {
+                    return;
+                };
+                let _: Result<u32, _> = proxy
+                    .call(
+                        "Notify",
+                        &(
+                            "rec-rs",
+                            0u32,
+                            "",
+                            summary,
+                            body,
+                            Vec::<String>::new(),
+                            std::collections::HashMap::<String, zbus::zvariant::Value>::new(),
+                            5000i32,
+                        ),
+                    )
+                    .await;
+            });
+        })
+        .ok();
+}
+
 /// Open a URL in the user's browser.
 pub fn open_url(url: &str) {
     spawn_detached("xdg-open", &[url]);

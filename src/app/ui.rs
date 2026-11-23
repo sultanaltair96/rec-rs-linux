@@ -1472,6 +1472,12 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
             "Low power (half resolution, 15 fps)",
         );
         ui.end_row();
+        ui.label("Window");
+        ui.checkbox(
+            &mut s.hide_window_when_recording,
+            "Hide Rec's window while recording",
+        );
+        ui.end_row();
     });
 
     section(ui, "AUDIO");
