@@ -156,21 +156,25 @@ fn record(a: RecordArgs) -> Result<()> {
     Ok(())
 }
 
+/// One display line of `rec-rs devices`, in upstream's format
+/// (`reference/rec-rs/src/main.rs:606-660`): index, id, pixels, points.
+///
+/// Deliberately no extra markers: a script parses these lines, and upstream
+/// prints nothing after the points. A Linux-only fact worth saying (the display
+/// is the picker's choice on Wayland) goes on its own indented line below.
+fn display_line(d: &media_types::DisplayInfo) -> String {
+    format!(
+        "  [{}] id {}  {}x{} pixels ({}x{} points)",
+        d.index, d.id, d.pixels.0, d.pixels.1, d.points.0, d.points.1
+    )
+}
+
 fn devices() -> Result<()> {
     println!("Displays:");
     match capture::screen::displays() {
         Ok(ds) => {
             for d in &ds {
-                println!(
-                    "  [{}] id {}  {}x{} pixels ({}x{} points){}",
-                    d.index,
-                    d.id,
-                    d.pixels.0,
-                    d.pixels.1,
-                    d.points.0,
-                    d.points.1,
-                    if d.primary { "  primary" } else { "" }
-                );
+                println!("{}", display_line(d));
             }
         }
         Err(e) => println!("  unavailable: {e}"),
@@ -205,15 +209,13 @@ fn devices() -> Result<()> {
         }
         Err(e) => println!("  unavailable: {e}"),
     }
-    match capture::audio::output_latency() {
-        Some(l) => println!(
+    // Upstream prints this line only when the output device reports a
+    // latency; a session with no sink prints nothing here at all.
+    if let Some(l) = capture::audio::output_latency() {
+        println!(
             "Output latency (system audio is shifted by this): {:.1} ms",
             l * 1000.0
-        ),
-        None => println!(
-            "Output latency: unavailable (no PipeWire sink reported a latency; \
-             set --system-audio-offset-ms to shift system audio yourself)"
-        ),
+        );
     }
     Ok(())
 }
@@ -442,6 +444,35 @@ mod tests {
         assert_eq!(opts.size, (3840, 2160));
         assert_eq!(opts.codec, media::Codec::Hevc);
         assert!(opts.bitrate >= 30_000_000, "{}", opts.bitrate);
+    }
+
+    #[test]
+    fn devices_lines_match_upstreams_format() {
+        // Upstream prints exactly this (no primary marker, no extra columns).
+        let d = media_types::DisplayInfo {
+            index: 1,
+            id: "HDMI-1".into(),
+            name: "HDMI-1".into(),
+            pixels: (2560, 1440),
+            points: (1280, 720),
+            primary: true,
+        };
+        assert_eq!(
+            display_line(&d),
+            "  [1] id HDMI-1  2560x1440 pixels (1280x720 points)"
+        );
+        assert!(!display_line(&d).contains("primary"));
+        // A second display numbers itself, and a non-primary one looks the same:
+        // the marker used to distinguish them and must not come back.
+        let second = media_types::DisplayInfo {
+            index: 2,
+            primary: false,
+            ..d
+        };
+        assert_eq!(
+            display_line(&second),
+            "  [2] id HDMI-1  2560x1440 pixels (1280x720 points)"
+        );
     }
 
     #[test]

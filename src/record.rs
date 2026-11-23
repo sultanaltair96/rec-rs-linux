@@ -61,6 +61,12 @@ impl Shared {
     }
 }
 
+/// The warning shown when a started screen source delivers nothing for 3 s.
+/// Upstream points at the Screen Recording grant; on Linux the actionable
+/// equivalent is the portal's screen-sharing request.
+const NO_FRAMES_WARNING: &str = "rec: warning: no screen frames after 3s (was the \
+screen-sharing request approved? see `rec-rs permissions`)";
+
 /// Set by SIGINT/SIGTERM/SIGHUP.
 static STOP: AtomicBool = AtomicBool::new(false);
 /// Pause/resume requests (SIGUSR1/SIGUSR2 from `rec-rs pause`/`resume`).
@@ -790,7 +796,7 @@ pub fn run(o: Options) -> Result<Stats> {
         }
         if !warned_no_frames && elapsed > 3.0 && !sess.has_frames() {
             warned_no_frames = true;
-            eprintln!("rec: warning: no screen frames after 3s");
+            eprintln!("{NO_FRAMES_WARNING}");
         }
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();
@@ -884,6 +890,21 @@ pub fn stop_running() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_no_frames_warning_points_at_the_permission() {
+        // Upstream's "(is Screen Recording permission granted?)"; Linux's
+        // actionable equivalent is the portal request and `rec-rs permissions`.
+        assert!(
+            NO_FRAMES_WARNING.contains("permissions"),
+            "{NO_FRAMES_WARNING}"
+        );
+        assert!(
+            NO_FRAMES_WARNING.contains("screen-sharing request"),
+            "{NO_FRAMES_WARNING}"
+        );
+        assert!(NO_FRAMES_WARNING.starts_with("rec: warning: no screen frames after 3s"));
+    }
 
     #[test]
     fn mic_backend_maps_upstream_values() {

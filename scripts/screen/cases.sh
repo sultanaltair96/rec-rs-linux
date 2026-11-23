@@ -47,17 +47,49 @@ region)
 token)
     # `permissions --request` runs the dialog once and stores the grant; a
     # corrupt token is ignored (with a message) instead of failing a recording.
+    chooser_runs() { wc -l <"${SCREEN_CHOOSER_LOG:?the harness exports this}" | tr -d ' '; }
     "$B" permissions --request >"$OUT/screen-token.request" 2>&1
     grep -q granted "$OUT/screen-token.request"
     token="$XDG_STATE_HOME/rec-rs/portal-token"
     test -s "$token"
     test "$(stat -c %a "$token")" = 600
+    first=$(chooser_runs)
+    test "$first" -ge 1
+    # Upstream forgets the earlier screen-recording decision before asking
+    # (tcc.rs:183-230), so the system asks again. Here the restore token is
+    # what makes the portal skip its picker: --request must drop it, and the
+    # chooser log proves the picker really ran a second time.
+    "$B" permissions --request >"$OUT/screen-token.request2" 2>"$OUT/screen-token.request2.err"
+    grep -q granted "$OUT/screen-token.request2"
+    grep -qi 'forgetting' "$OUT/screen-token.request2.err"
+    second=$(chooser_runs)
+    test "$second" -gt "$first"
+    test -s "$token"
+    # A corrupt token is recovered from instead of failing a recording.
     echo garbage >"$token"
     REC_PORTAL_TIMEOUT=30 "$B" record -q -t 1 --no-mic --no-system-audio \
         -o "$OUT/screen-token.mp4" 2>"$OUT/screen-token.log"
     grep -qi 'grant' "$OUT/screen-token.log"
     "$B" permissions >"$OUT/screen-token.permissions" 2>&1
     grep -q granted "$OUT/screen-token.permissions"
+    ;;
+exclude-x11)
+    # The only animating window on the screen is excluded, so the recording must
+    # come out as one still frame (its content was painted out) and the log must
+    # say what happened.
+    export REC_SCREEN_BACKEND=x11
+    id=$("$B" devices | awk '/GStreamer/ { print $1; exit }')
+    test -n "$id"
+    REC_EXCLUDE_WINDOWS="$id" "$B" record -q -t 2 --no-mic --no-system-audio \
+        -o "$OUT/screen-exclude.mp4" 2>"$OUT/screen-exclude.log"
+    grep -q "leaving 1 of rec's own windows out of the capture" "$OUT/screen-exclude.log"
+    ;;
+exclude-portal)
+    # A portal stream cannot exclude anything; the capture must say so.
+    REC_EXCLUDE_WINDOWS=2147480000 "$B" record -q -t 1 --no-mic --no-system-audio \
+        -o "$OUT/screen-exclude-portal.mp4" 2>"$OUT/screen-exclude-portal.log"
+    grep -q "a screen-cast portal cannot leave rec's own windows out" \
+        "$OUT/screen-exclude-portal.log"
     ;;
 x11)
     # The direct X11 path: monitor enumeration through RandR, then a capture of

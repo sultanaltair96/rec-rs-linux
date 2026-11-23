@@ -66,6 +66,45 @@ pub struct CameraRequest {
     pub device: Option<String>,
 }
 
+/// A running watch on the `/dev/video*` set (phase 1E's camera hotplug).
+///
+/// Dropping it stops the watch. In a Flatpak sandbox there are no device nodes
+/// to watch: the portal has no camera-added signal, so the app refreshes that
+/// list on demand (or when a recording starts) instead.
+pub struct DeviceWatch {
+    inner: v4l2::Watch,
+}
+
+impl DeviceWatch {
+    /// Stop watching and join the watcher thread.
+    pub fn stop(self) {
+        self.inner.stop();
+    }
+}
+
+impl std::fmt::Debug for DeviceWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("camera::DeviceWatch")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Call `cb` when a `/dev/video*` capture node appears or disappears (a webcam
+/// plugged in or unplugged). The watch is an inotify watch on `/dev`; events
+/// are coalesced over 250 ms, so a UVC camera's picture and metadata nodes
+/// produce one callback. The callback runs on the watcher thread and must not
+/// block (reload the camera list, wake the UI).
+///
+/// The watch lives until the returned [`DeviceWatch`] is dropped, and requires
+/// inotify (Linux, always available in the dev container). Pair it with
+/// [`crate::capture::audio::watch_devices`]; 1E starts both and refreshes its
+/// source lists.
+pub fn watch_devices(cb: impl Fn() + Send + 'static) -> Result<DeviceWatch> {
+    Ok(DeviceWatch {
+        inner: v4l2::watch_dir(std::path::Path::new("/dev"), cb)?,
+    })
+}
+
 /// The cameras `--webcam` and the app list.
 pub fn cameras() -> Result<Vec<CameraInfo>> {
     let mut out: Vec<CameraInfo> = v4l2::devices()
