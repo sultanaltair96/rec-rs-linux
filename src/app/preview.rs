@@ -528,5 +528,37 @@ mod tests {
                 t.elapsed().as_secs_f64() * 1000.0 / n as f64
             );
         }
+        // The texture path (G10): the compositor's own texture drawn in the
+        // preview rect. No readback, no upload — one bind group and one draw.
+        // 704x396 is the preview rect the audit measured.
+        for (w, h) in [(1920u32, 1080u32), (3840, 2160)] {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("composited frame"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let (cpu, gpu) = super::super::preview_gpu::texture_path_cost(
+                &device,
+                &_queue,
+                &mut painter,
+                &texture,
+                wgpu::TextureFormat::Bgra8Unorm,
+                (704, 396),
+                n,
+            );
+            println!(
+                "{w}x{h} texture -> {cpu:.3} ms/frame of CPU, {gpu:.3} ms/frame of GPU throughput"
+            );
+        }
     }
 }

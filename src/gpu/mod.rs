@@ -114,6 +114,7 @@
 
 mod decor;
 mod device;
+pub mod dmabuf;
 mod readback;
 mod uniforms;
 #[cfg(test)]
@@ -186,6 +187,49 @@ impl OutputFormat {
         self.pixel_format().label()
     }
 }
+
+/// A device the caller already owns, so the compositor draws on egui's device
+/// instead of one of its own.
+///
+/// The point is the preview: on a shared device the composited frame can be
+/// drawn straight from [`Renderer::preview_frame`], with no readback and no
+/// upload. Everything else is unchanged, and a renderer built with
+/// [`Renderer::with_device`] behaves exactly like one that owns its device.
+#[derive(Clone)]
+pub struct SharedGpu {
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
+    /// What the adapter calls itself, for the status line (a device cannot be
+    /// asked).
+    pub info: wgpu::AdapterInfo,
+}
+
+/// One composited frame as a GPU texture, for the app's preview.
+///
+/// `texture` is the renderer's own output texture: it is reused every frame, so
+/// a preview must draw it before the next frame is composited (one queue, in
+/// submission order, guarantees the reads see whole frames). Cloning the handle
+/// keeps the texture alive; nothing is copied.
+#[derive(Clone)]
+pub struct PreviewFrame {
+    pub texture: wgpu::Texture,
+    /// The frame's size in pixels (the output size).
+    pub width: u32,
+    pub height: u32,
+    /// When the frame belongs on the recording's grid, seconds on
+    /// [`crate::media_types::now`]'s clock.
+    pub pts: f64,
+    /// Bumped when the texture is replaced (a new output size or format), so a
+    /// consumer can cache a bind group for it without comparing handles.
+    pub generation: u64,
+}
+
+/// Where a [`Renderer`] hands its composited texture to the app's preview.
+///
+/// Called from the writer's emission loop at the preview rate (30 fps), must not
+/// block. Only wired when the renderer shares the app's device: a texture from
+/// another device cannot be drawn in egui's pass.
+pub type PreviewSink = Arc<dyn Fn(PreviewFrame) + Send + Sync>;
 
 /// How a [`Renderer`] is built.
 #[derive(Clone, Debug)]
@@ -354,6 +398,9 @@ pub struct Renderer {
     in_flight: VecDeque<InFlight>,
     next_slot: usize,
     frames: u64,
+    /// Bumped whenever the composited texture is rebuilt, so a preview can cache
+    /// its bind group (see [`PreviewFrame`]).
+    preview_generation: u64,
 }
 
 impl Renderer {
@@ -412,6 +459,7 @@ impl Renderer {
             in_flight: VecDeque::new(),
             next_slot: 0,
             frames: 0,
+            preview_generation: 0,
             gpu,
         })
     }
@@ -501,6 +549,14 @@ impl Renderer {
         self.gpu.is_software()
     }
 
+    /// True when the renderer draws on the device it was handed
+    /// ([`Renderer::with_device`]), so its [`PreviewFrame`]s can be drawn in
+    /// the caller's own render passes. False when it made its own device: a
+    /// texture from another device cannot be used there.
+    pub fn shares_app_device(&self) -> bool {
+        self.gpu.is_shared()
+    }
+
     /// The last composited frame as a texture, for the live preview: BGRA8,
     /// [`size`](Self::size) big, valid until the next render. Draw it 1:1 (it is
     /// already gamma encoded, so a non-sRGB view is right).
@@ -510,6 +566,23 @@ impl Renderer {
 
     pub fn texture_format(&self) -> wgpu::TextureFormat {
         FMT_OUT
+    }
+
+    /// The last composited frame as a [`PreviewFrame`] (a cloned handle, no
+    /// copy), stamped with `pts`.
+    ///
+    /// `None` before the first frame. The texture is the output size,
+    /// `texture_format()`, and is reused: draw it before the next frame is
+    /// composited.
+    pub fn preview_frame(&self, pts: f64) -> Option<PreviewFrame> {
+        let frame = self.tex.frame.as_ref()?;
+        Some(PreviewFrame {
+            texture: frame.texture.clone(),
+            width: frame.width,
+            height: frame.height,
+            pts,
+            generation: self.preview_generation,
+        })
     }
 
     /// Frames submitted and not yet read back: 0 when the pipeline is empty.
@@ -1282,6 +1355,11 @@ impl Renderer {
 
     /// Build (or reuse) the output-sized textures.
     fn ensure_outputs(&mut self, device: &wgpu::Device) {
+        let before = self
+            .tex
+            .frame
+            .as_ref()
+            .map(|t| (t.width, t.height, t.format));
         let (w, h) = (self.width, self.height);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         Tex::ensure(
@@ -1342,6 +1420,17 @@ impl Renderer {
                 }
             }
             OutputFormat::Bgra => {}
+        }
+        if self
+            .tex
+            .frame
+            .as_ref()
+            .map(|t| (t.width, t.height, t.format))
+            != before
+        {
+            // A different composited texture: a preview's cached bind group is
+            // stale (see `PreviewFrame::generation`).
+            self.preview_generation += 1;
         }
     }
 

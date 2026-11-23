@@ -208,6 +208,13 @@ pub struct Options {
     /// The app offers every emitted (composited) frame here, at most 30 times
     /// a second (phase 1E's preview). Non-blocking.
     pub preview: Option<FrameSink>,
+    /// The app's own wgpu device, when it has one: the compositor draws on it
+    /// so the preview can read the composited texture instead of a readback
+    /// (G10). Falls back to a device of its own when this is `None` or fails.
+    pub gpu: Option<gpu::SharedGpu>,
+    /// Where the composited texture goes, when the compositor shares the app's
+    /// device. Ignored otherwise (the texture would belong to another device).
+    pub preview_gpu: Option<gpu::PreviewSink>,
     /// Stream destinations (URL, key) to start with the session.
     pub streams: Vec<(String, String)>,
 }
@@ -524,10 +531,36 @@ impl Session {
                     && o.screen.as_ref().is_some_and(|s| s.window.is_some()),
                 pipeline_depth: 1,
             };
-            match gpu::Renderer::with_options(&opts) {
+            // On the app's own device when it handed one over, so the preview
+            // can draw the composited texture with no readback; a device of its
+            // own otherwise (the CLI), and the same device if the shared one
+            // cannot take the compositor.
+            let shared = o.gpu.as_ref().map(|g| {
+                gpu::Renderer::with_device(g.device.clone(), g.queue.clone(), g.info.clone(), &opts)
+            });
+            let built = match shared {
+                Some(Ok(r)) => Some(Ok(r)),
+                Some(Err(e)) => {
+                    if std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!(
+                            "rec: debug: the app's GPU device cannot composite ({e:#}); using one of its own"
+                        );
+                    }
+                    Some(gpu::Renderer::with_options(&opts))
+                }
+                None => Some(gpu::Renderer::with_options(&opts)),
+            };
+            match built.expect("always built") {
                 Ok(r) => {
                     if !o.quiet {
                         eprintln!("rec: compositor {}", r.describe_adapter());
+                    }
+                    // Only a renderer on the app's device may publish textures.
+                    if o.gpu.is_some()
+                        && let Some(sink) = o.preview_gpu.clone()
+                        && r.shares_app_device()
+                    {
+                        writer.set_preview_gpu(sink);
                     }
                     writer.set_renderer(Some(r));
                 }

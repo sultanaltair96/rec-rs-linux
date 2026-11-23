@@ -310,8 +310,15 @@ fn preview(ui: &mut Ui, st: &mut State) {
         // (black corners), and the frame already has the source's shape.
         let r = CornerRadius::ZERO;
         let live = st.recording.is_some() || st.preview.is_some();
-        match &st.preview_frame {
-            Some(frame) if live => {
+        match (&st.preview_tex, &st.preview_frame) {
+            // The compositor's own texture: no readback, no upload (G10).
+            (Some(tex), _) if live => {
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    super::preview_gpu::PreviewCallback::texture(tex.clone()),
+                ));
+            }
+            (None, Some(frame)) if live => {
                 // Converted and scaled on the GPU (G10).
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                     rect,

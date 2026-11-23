@@ -247,13 +247,13 @@ line starts at 0.043 s for an audio track.
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Done: built-in RTMP/RTMPS and WHIP, one encode for every destination, enhanced-RTMP HEVC with H.264 fallback, reconnect with backoff | 1D | done | selftest `stream-rtmp`, `stream-whip`, `live-e2e`; script `scripts/live/streams.sh --hevc` (`stream-hevc`) |
 | Bounded memory when the encoder cannot keep up | AVAssetWriterInput is asked `isReadyForMoreMediaData`; a busy encoder drops the frame | appsrc and every queue are bounded (2 video frames, 8 audio buffers); a full appsrc means the grid slot is dropped and counted, never buffered | 1G | done | unit `media::writer::tests::a_silent_or_far_future_source_cannot_grow_memory` (30 s at 1080p60 with a silent and a 1000 s-ahead source: RSS growth < 300 MB), `a_broken_audio_clock_cannot_stretch_the_file`, `mixer::tests::a_far_future_chunk_cannot_grow_the_mix_buffer`; selftest `pattern-4k-long` (20 s 4K60 noise: peak RSS 1.1 GB, 14.8 fps, 904 frames dropped on this CPU-only host) |
 | Screen scaling: GPU Lanczos | Metal MPS, which antialiases a downscale | wgpu Lanczos (a = 3), separable, per plane in the encoded domain, **stretched by the reduction factor** so a downscale antialiases, edge clamp, never upscaling | 1C | done | unit `gpu::tests::lanczos_matches_a_cpu_reference` (≤2/255 against an independent CPU implementation), `downscaling_a_one_pixel_pattern_leaves_only_its_mean` (a 1-px 5K pattern leaves 0.7/255 ripple inside the frame, against 121.7 for an unstretched kernel; ffmpeg's own swscale/zimg reach 22.6/29.7 at the replicated edge against our 22.7), `the_scaler_matches_ffmpeg_lanczos` (PSNR 50.3 dB 4K→1080p, 51.4 dB 5K→1080p against swscale's Lanczos; 58.1/57.0 dB against zimg), `a_small_screen_is_not_upscaled`; golden `screen-4k-to-1080`; measured 77 ms/frame 4K→1080p and 116 ms 5K→1080p on lavapipe (`tests/golden/README.md`) |
-| Live preview | Yes | The composited frame uploaded as planes and converted/scaled in a shader (G10); 1C's `Renderer::texture()` could remove the last copy in phase 2 | 1E | done | unit `app::preview::tests::*`, `app::preview_gpu::tests::*`; `preview_cost` 0.8–1.2 ms (1080p NV12) / 1.6–2.2 ms (4K NV12) vs 6.6/8.15 before; selftest `gui` (`preview frame 1920x1080`) |
+| Live preview | Yes, the composited frame never leaves the GPU | The session composites on the window's own device, so the preview draws the composited texture with no readback and no upload (`Renderer::preview_frame` → `fs_texture`); a CPU-frame path (planes uploaded, converted and scaled in a shader) stays as the fallback for a compositor on its own device | 1E (with 1C) | done | unit `app::preview::tests::*`, `app::preview_gpu::tests::the_texture_path_draws_the_composited_frame`, `app::ui_tests::the_compositor_publishes_its_texture_on_a_shared_device` (a session with no CPU frame sink still draws the overlay); `preview_cost`: 0.004–0.010 ms of CPU per preview frame on the texture path vs 0.74 (1080p NV12) / 1.57 (4K NV12) on the upload path, plus the same one-quad draw either way (1.5 ms of lavapipe throughput); selftest `gui` (`preview frame 1920x1080 … the compositor's texture`) |
 | Level meters with peak hold, after the fader | Yes | Same | 1E | done | unit `app::tests::meters_decay_and_hold_peaks`, `app::ui_tests::a_muted_channel_greys_its_meter` |
 | Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | partial | unit `hotkey::tests::*`; needs a real desktop (`docs/DESKTOP_CHECKLIST.md`) |
 | Menu bar control | StatusItem | StatusNotifierItem | 1E | partial | unit `app::tray::tests::*`; needs a real desktop (`docs/DESKTOP_CHECKLIST.md`) |
 | Headless CLI | Yes | Yes | 0 | done | this phase is CLI-first; selftest runs headless |
 | Small footprint | ~22 MB app | Flatpak bundle 11.4 MB (GStreamer/PipeWire/Mesa shared from the runtime); AppImage 109 MB (it bundles GStreamer, its ffmpeg stack, egui/wgpu and str0m/rustls) | 1F | done | `packaging/flatpak/build-flatpak.sh` and `packaging/appimage/build-appimage.sh` print the sizes |
-| Encoder input: IOSurface straight to VideoToolbox | Zero copy | Not built: frames reach the encoder from CPU memory (`Arc<[u8]>` planes). dmabuf import is phase 2 work | 1C/2 | todo | — |
+| Encoder input: IOSurface straight to VideoToolbox | Zero copy | Not built: frames reach the encoder from CPU memory (`Arc<[u8]>` planes). The GPU side exists (`gpu::dmabuf` imports a DMA-BUF as a texture); what is missing is a texture-carrying frame in the contract and the VA-API `memory:DMABuf` sink, both of which need the parent's decision | 1C/2 | todo | policy + import: unit `gpu::dmabuf::tests::*` (`the_software_adapter_cannot_import` on llvmpipe); `docs/DESKTOP_CHECKLIST.md` § 3.6 |
 
 ## Packaging, installation and updates (phase 1F)
 
@@ -342,9 +342,13 @@ under a compositor, screen lock and a revoked grant are in
 
 ### Known gaps, with the reason
 
-- **dmabuf/zero copy.** Frames are copied to the CPU (`BGRx`/`BGRA`, or X11's `GetImage`). A
-  compositor that offers only dmabuf is an error that names phase 1C; the GPU importer is 1C's work,
-  and it is also what removes the per-frame copy.
+- **dmabuf/zero copy.** Frames are copied to the CPU (`BGRx`/`BGRA`, or X11's `GetImage`). The
+  importer and the policy exist (`gpu::dmabuf`: the adapter probe, the format/modifier mapping and
+  `wgpu-hal`'s `texture_from_dmabuf_fd` wrapper, all unit-tested), but nothing calls it: a frame that
+  carries a `wgpu::Texture` needs a `media_types` change the parent has not approved, and every
+  device in CI is Mesa's software adapter, which reports `import false` (no DRM device). The screen
+  source keeps negotiating shared memory and its error message now says which half is missing;
+  `docs/DESKTOP_CHECKLIST.md` § 3.6 is the GPU-desktop check for when the contract carries it.
 - **Click highlighting on Wayland.** No portal reports mouse buttons (`spa_meta_cursor` carries a
   position and a bitmap, never a button state). `--clicks` warns and records the cursor only. X11
   highlights clicks.

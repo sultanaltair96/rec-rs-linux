@@ -470,6 +470,8 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
         mic_offset_ms: a.mic_offset_ms,
         write: !a.no_record,
         preview: None,
+        gpu: None,
+        preview_gpu: None,
         live,
         streams: a
             .stream

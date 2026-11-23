@@ -456,8 +456,8 @@ fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
         set_error(
             &data.error,
             format!(
-                "the screen-cast stream negotiates {:?}, which this build cannot consume; \
-                 a compositor that only offers dmabuf needs the GPU importer (phase 1C)",
+                "the screen-cast stream negotiates {:?}, which this build cannot consume; rec \
+                 needs a packed XRGB/BGRX buffer from the compositor",
                 data.format.format()
             ),
         );
@@ -488,9 +488,10 @@ fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
     let Some(bytes) = d.data() else {
         set_error(
             &data.error,
-            "the screen-cast stream sent a buffer without CPU memory (dmabuf); \
-             the GPU importer is phase 1C"
-                .to_string(),
+            format!(
+                "the screen-cast stream sent a buffer without CPU memory (a DMA-BUF), and {}",
+                crate::gpu::dmabuf::refusal(crate::gpu::dmabuf::probe_support())
+            ),
         );
         return;
     };

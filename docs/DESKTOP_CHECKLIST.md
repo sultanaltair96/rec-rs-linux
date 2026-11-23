@@ -327,6 +327,37 @@ REC_DEBUG=1 rec-rs gui 2>"$EV/app-x11.log"
 - Expect: the transparent corners are filled with the window's edge colour, not black or garbage.
 - Evidence: a frame at a corner, enlarged.
 
+### 3.6 DMA-BUF screen frames (the zero-copy import, needs a GPU)
+
+The importer is written and its policy is unit-tested (`cargo test gpu::dmabuf`), but this host's
+software Vulkan device has no DRM device, so `gpu::dmabuf::support()` is `false` here and the screen
+source keeps negotiating shared memory. On a GPU desktop the two facts to establish are (a) whether
+the device can import at all, and (b) that a DMA-BUF frame is bit-identical to the shared-memory one.
+
+- Do, first, on a Wayland desktop with a GPU:
+  ```sh
+  cargo test --release gpu::dmabuf::tests::the_software_adapter_cannot_import -- --nocapture
+  ```
+- Expect: `dmabuf support on <your GPU> (DiscreteGpu or IntegratedGpu): import true`. If it prints
+  `false`, that GPU/driver lacks `VK_EXT_external_memory_dma_buf` or
+  `VK_EXT_image_drm_format_modifier` (`vulkaninfo | grep -E "external_memory_dma_buf|drm_format_modifier"`),
+  and shared memory stays the right answer.
+- Do, then, the end-to-end check **once the frame contract can carry a texture** (a `PixelFormat` /
+  `VideoFrame` variant, which is the parent's call, not this round's): record a window with a
+  test-pattern still on screen for 3 s, `--window`:
+  ```sh
+  REC_DEBUG=1 rec-rs record --window <id> -t 3 -o "$EV/3.6-dmabuf.mov" 2>&1 | tee "$EV/3.6.log"
+  ```
+- Expect: `rec: debug: screen stream format …` names a DMA-BUF buffer, the recording's first frame is
+  pixel-identical to the same window captured with `REC_SCREEN_SHM=1` (shared memory forced), and the
+  process copies no frame-sized buffer per frame (`/proc/<pid>/stat` utime, or `perf top`): a 4K
+  screen share at 30 fps saves about 1 GB/s of memcpy.
+- If it falls back: the log says which half failed — "this device cannot import DMA-BUFs" (the
+  adapter, above) or "the compositor's frame contract has no texture frame yet" (the missing contract
+  change).
+- Evidence: the two logs, one frame from each path compared with `ffmpeg -i a -i b -lavfi psnr`, and
+  the CPU time of both runs.
+
 ---
 
 ## Part 4 — Flatpak (≈8 min, inside the GNOME or KDE session)

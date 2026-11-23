@@ -29,6 +29,12 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
 @group(0) @binding(2) var plane2: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 
+// The composited texture's own bind group: binding 0 is the texture, binding 1
+// its sampler (a pipeline layout takes one group; the two preview paths are two
+// entry points and two layouts, not two shaders).
+@group(0) @binding(0) var frame_tex: texture_2d<f32>;
+@group(0) @binding(1) var frame_samp: sampler;
+
 fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
     let yy = (y * 255.0 - 16.0) * (255.0 / 219.0) / 255.0;
     let uu = u - 128.0 / 255.0;
@@ -37,6 +43,18 @@ fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
     let g = yy - 0.1873 * uu - 0.4681 * vv;
     let b = yy + 1.8556 * uu;
     return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The compositor's own output (G10): already gamma-encoded BGRA at the output
+// size, drawn 1:1 — no conversion, no upload. Its texture is a `Bgra8Unorm`
+// texture, so sampling already gives RGB in the right order (unlike the upload
+// path, whose bytes are copied verbatim into an `Rgba8Unorm` texture and need
+// the swap). The sampler is linear, so drawing into a smaller preview rect is
+// the only scaling there is.
+@fragment
+fn fs_texture(in: VOut) -> @location(0) vec4<f32> {
+    let c = textureSample(frame_tex, frame_samp, in.uv);
+    return vec4<f32>(c.rgb, 1.0);
 }
 
 // Packed BGRA: bytes are B,G,R,A, so swap red and blue.

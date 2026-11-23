@@ -325,6 +325,10 @@ pub struct Writer {
     live: Option<Arc<live::Live>>,
     /// Where every emitted frame is offered (the app's preview; phase 1E).
     preview: Option<FrameSink>,
+    /// Where the composited *texture* goes for the preview, when the renderer
+    /// shares the app's device (no readback, no upload; G10). Only set then: a
+    /// texture from another device cannot be drawn in egui's pass.
+    preview_gpu: Option<crate::gpu::PreviewSink>,
     /// Last preview time on the real grid (upstream throttles it to 30 fps).
     last_preview: f64,
     /// GPU compositor, when phase 1C's renderer is available.
@@ -418,6 +422,7 @@ impl Writer {
             live_t0: None,
             live: None,
             preview: None,
+            preview_gpu: None,
             last_preview: 0.0,
             renderer: None,
             composed_last: None,
@@ -541,6 +546,17 @@ impl Writer {
     /// included.
     pub fn set_preview(&mut self, sink: FrameSink) {
         self.preview = Some(sink);
+    }
+
+    /// Offer the composited frame as a GPU texture to `sink`, at the same
+    /// 30 fps as [`set_preview`](Self::set_preview).
+    ///
+    /// Only for a renderer that shares the caller's device: the app draws the
+    /// texture in its own render pass. The CPU `preview` sink stays wired as
+    /// the fallback, so a preview keeps working if the compositor is dropped
+    /// (a slow software device falls back to the CPU path).
+    pub fn set_preview_gpu(&mut self, sink: crate::gpu::PreviewSink) {
+        self.preview_gpu = Some(sink);
     }
 
     /// Make phase 1C's compositor available. Called by the session when a
@@ -1166,8 +1182,10 @@ impl Writer {
             if !write {
                 self.stats.paused_slots += 1;
             }
-            // The preview and the live encode get every frame, paused or not.
-            let want_preview = self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
+            // The preview (as a texture, a CPU frame, or both) and the live
+            // encode get every frame, paused or not.
+            let want_preview = (self.preview.is_some() || self.preview_gpu.is_some())
+                && slot_t - self.last_preview >= 1.0 / 30.0;
             let want_live = self.live.as_ref().is_some_and(|l| l.active());
             if !write && !want_preview && !want_live {
                 continue;
@@ -1199,9 +1217,19 @@ impl Writer {
                 stamped.pts = slot_t;
                 l.push_video(&stamped);
             }
-            if want_preview && let Some(p) = self.preview.clone() {
+            if want_preview {
                 self.last_preview = slot_t;
-                p(frame.as_ref().clone());
+                // The texture first, then the CPU frame whose sink wakes the
+                // window: by the time the UI runs, both are there and the
+                // preview can prefer the texture.
+                if let (Some(sink), Some(r)) = (&self.preview_gpu, &self.renderer)
+                    && let Some(tex) = r.preview_frame(slot_t)
+                {
+                    sink(tex);
+                }
+                if let Some(p) = self.preview.clone() {
+                    p(frame.as_ref().clone());
+                }
             }
         }
         self.top_up_audio(self.out_slot as f64 / self.spec.fps as f64);
