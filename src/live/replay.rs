@@ -235,8 +235,14 @@ fn decode_audio(
     // A hole becomes silence: the writer's audio tap can start after the first
     // video frame (it did by 50 ms in a real recording), and the audio stream
     // can have a gap; neither may shift the rest of the track earlier.
+    let offset = dec.offset;
+    let mut padded_lead = 0usize;
+    let mut first_kept: Option<f64> = None;
     for buf in decoded {
-        let base = (buf.pts - t0) * rate - dec.offset as f64;
+        let base = (buf.pts - t0) * rate - offset as f64;
+        if first_kept.is_none() && base + buf.samples.len() as f64 > 0.0 {
+            first_kept = Some(buf.pts);
+        }
         for (i, sample) in buf.samples.iter().enumerate() {
             let at = (base + i as f64).round();
             if at < 0.0 {
@@ -247,6 +253,9 @@ fn decode_audio(
                 break;
             }
             if at > out.len() {
+                if out.is_empty() {
+                    padded_lead = at;
+                }
                 out.resize(at, [0.0, 0.0]);
             }
             if at == out.len() {
@@ -261,12 +270,14 @@ fn decode_audio(
     }
     if std::env::var_os("REC_DEBUG").is_some() {
         eprintln!(
-            "rec: debug: replay audio: {} packets, decoder {} (offset {} samples), {:.3} s at {} Hz",
+            "rec: debug: replay audio: {} packets, decoder {} (offset {} samples), {:.3} s at {} Hz, first packet {:+.1} ms from t0, {} samples of lead silence",
             packets.len(),
             dec.decoder,
-            dec.offset,
+            offset,
             out.len() as f64 / rate,
-            audio::RATE
+            audio::RATE,
+            first_kept.map_or(f64::NAN, |p| (p - t0) * 1000.0),
+            padded_lead
         );
     }
     Ok(out)

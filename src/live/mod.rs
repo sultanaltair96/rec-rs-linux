@@ -214,6 +214,14 @@ struct Stats {
     dropped: AtomicU64,
 }
 
+/// Audio kept from before the first composited frame. The encode needs it: the
+/// replay writer decodes the clip's first packets as the decoder's warm-up, and
+/// its clip is only in sync when there is a little history (`AUDIO_LEAD` in
+/// replay.rs). The streams drop it themselves (RTMP skips packets before its
+/// `t0`, WHIP cuts at the first audio packet next to the keyframe), so a server
+/// never receives a sample older than its track's start.
+const AUDIO_PREROLL_SECS: f64 = 0.2;
+
 /// A short gap (a capture session being swapped) is filled; a longer one
 /// restarts the timeline. Same rule and value as upstream.
 const MAX_FILL: f64 = 3.0;
@@ -885,6 +893,7 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     let mut retry_after = Instant::now();
     let mut audio_sources = [false, false];
     let mut rate = FrameRate::default();
+    let mut first_video_pts: Option<f64> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1037,6 +1046,9 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         // anywhere — inside a batch or between batches — is bridged.
         let mut prev = last_video.clone();
         for frame in &frames {
+            if first_video_pts.is_none() {
+                first_video_pts = Some(frame.pts);
+            }
             if let Some((lt, lf)) = &prev {
                 let dt = frame.pts - lt;
                 if dt > 1.5 * step && dt < MAX_FILL {
@@ -1071,6 +1083,26 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
             last_video = Some(last.clone());
         }
 
+        // Audio before the first composited frame is pre-roll: a server times
+        // its audio track from the first sample it accepts, and a sample older
+        // than the picture's start is discarded as "received too late"
+        // (MediaMTX logs exactly that, and the recording then starts with a
+        // hole). The picture defines the timeline, so the tap does not send it.
+        let chunks: Vec<AudioChunk> = match first_video_pts {
+            Some(start) => chunks
+                .into_iter()
+                .filter(|c| c.pts >= start - AUDIO_PREROLL_SECS)
+                .collect(),
+            None => {
+                if !chunks.is_empty() && std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!(
+                        "rec: debug: live: dropping {} audio chunk(s) before the first frame",
+                        chunks.len()
+                    );
+                }
+                vec![]
+            }
+        };
         for chunk in &chunks {
             // A short hole between buffers is silence, so later audio does not
             // shift; a long one restarts the timeline.

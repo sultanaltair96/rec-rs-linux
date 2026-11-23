@@ -1010,7 +1010,7 @@ fi
 # The replay buffer: 20 s with --replay 15, saved with `rec-rs save-replay`,
 # checked for length, keyframe start, playability, sync and the memory report.
 if wanted replay; then
-    if scripts/live/replay.sh >"$OUT/replay.log" 2>&1 && [ -s "$OUT/replay.log" ]; then
+    if REC_LIVE_DIR="$OUT/replay" scripts/live/replay.sh >"$OUT/replay.log" 2>&1 && [ -s "$OUT/replay.log" ]; then
         echo "PASS  replay  ($(grep -m1 '^PASS  replay-length' "$OUT/replay.log" | sed 's/^PASS  replay-length  (//; s/)$//'))"
         pass=$((pass+1))
     else
@@ -1025,7 +1025,7 @@ fi
 # downloaded (offline): that is a SKIP, not a failure.
 if wanted stream-rtmp; then
     status=0
-    scripts/live/streams.sh --rtmp >"$OUT/stream-rtmp.log" 2>&1 || status=$?
+    REC_LIVE_DIR="$OUT/stream-rtmp" scripts/live/streams.sh --rtmp >"$OUT/stream-rtmp.log" 2>&1 || status=$?
     if [ "$status" -eq 0 ] && [ -s "$OUT/stream-rtmp.log" ]; then
         echo "PASS  stream-rtmp  ($(grep -m1 '^PASS  rtmp-a' "$OUT/stream-rtmp.log" | sed 's/^PASS  rtmp-a  (//; s/)$//'); $(grep -c '^PASS  rtmp\|^PASS  rtmps' "$OUT/stream-rtmp.log") recordings checked)"
         pass=$((pass+1))
@@ -1040,7 +1040,7 @@ fi
 # server and measured with the sync check.
 if wanted stream-whip; then
     status=0
-    scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
+    REC_LIVE_DIR="$OUT/stream-whip" scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
     if [ "$status" -eq 0 ] && [ -s "$OUT/stream-whip.log" ]; then
         # Five sessions in a row, every mean within ±15 ms.
         offs=$(grep -h '^PASS  whip-run' "$OUT/stream-whip.log" \
@@ -1060,7 +1060,7 @@ fi
 # file. This is the case that proves the writer's live tap.
 if wanted live-e2e; then
     status=0
-    scripts/live/e2e.sh >"$OUT/live-e2e.log" 2>&1 || status=$?
+    REC_LIVE_DIR="$OUT/live-e2e" scripts/live/e2e.sh >"$OUT/live-e2e.log" 2>&1 || status=$?
     if [ "$status" -eq 0 ] && [ -s "$OUT/live-e2e.log" ]; then
         echo "PASS  live-e2e  ($(grep -c '^PASS' "$OUT/live-e2e.log") checks: file $(grep -m1 '^PASS  record-file' "$OUT/live-e2e.log" | sed 's/^PASS  record-file  (//; s/)$//'); $(grep -m1 '^PASS  record-sync' "$OUT/live-e2e.log" | sed 's/^PASS  record-sync  (//; s/)$//'); two save-replay clips; --no-record writes no file)"
         pass=$((pass+1))

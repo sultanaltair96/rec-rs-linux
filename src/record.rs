@@ -961,21 +961,14 @@ pub fn run(o: Options) -> Result<Stats> {
             eprint!("\r\x1b[2Krec: resumed\n");
         }
         if REPLAY_REQ.swap(false, Ordering::SeqCst) {
-            match &o.live {
-                Some(l) => {
-                    let dir = o
-                        .output
-                        .parent()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(crate::util::videos_dir);
-                    match l.save_replay_async(dir.join(crate::util::timestamped("replay", "mp4"))) {
-                        Ok(h) => saves.push(h),
-                        Err(e) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
-                    }
-                }
-                None => eprint!(
-                    "\r\x1b[2Krec: save-replay: this recording has no replay buffer (start it with --replay SECS)\n"
-                ),
+            let dir = o
+                .output
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(crate::util::videos_dir);
+            match save_replay_request(o.live.as_deref(), &dir) {
+                Ok(h) => saves.push(h),
+                Err(e) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
             }
         }
         for h in std::mem::take(&mut saves) {
@@ -1055,6 +1048,20 @@ pub fn run(o: Options) -> Result<Stats> {
     }
     let _ = std::fs::remove_file(&pidfile);
     result
+}
+
+/// `rec-rs save-replay`: start writing the buffer, or say why there is nothing
+/// to write.
+///
+/// A recording without `--replay` has no buffer, and the message is upstream's
+/// (its `Live::save_replay` says `the replay buffer is off`), printed the same
+/// way: `rec: replay: the replay buffer is off`.
+fn save_replay_request(
+    live: Option<&live::Live>,
+    dir: &std::path::Path,
+) -> Result<std::thread::JoinHandle<Result<PathBuf>>> {
+    let live = live.ok_or_else(|| anyhow::anyhow!("the replay buffer is off"))?;
+    live.save_replay_async(dir.join(crate::util::timestamped("replay", "mp4")))
 }
 
 /// The pidfile of the running recorder.
@@ -1208,6 +1215,19 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    /// Without a replay buffer there is nothing to save, and the wording is
+    /// upstream's ("the replay buffer is off"), not one of our own.
+    #[test]
+    fn saving_a_replay_without_a_buffer_says_so() {
+        let dir = std::env::temp_dir();
+        let e = save_replay_request(None, &dir).unwrap_err();
+        assert_eq!(format!("{e:#}"), "the replay buffer is off");
+        // A live encode whose buffer is off says the same thing.
+        let live = live::Live::new();
+        let e = save_replay_request(Some(&live), &dir).unwrap_err();
+        assert_eq!(format!("{e:#}"), "the replay buffer is off");
     }
 
     #[test]

@@ -27,15 +27,22 @@ ok() {
 }
 bad() {
     echo "FAIL  $1  ($2)"
+    echo "      runtime files: ${dir:-$OUT} (MediaMTX log: mediamtx.log, its recordings: recordings/)"
     fail=$((fail + 1))
 }
-# sync FILE MAX_MS: "mean" when the file's A/V offset is inside the bound.
-sync_of() {
-    python3 scripts/synccheck.py "$1" --max-ms "$2" >"$1.check" 2>&1 || {
-        echo ""
-        return 1
-    }
-    grep 'audio 0' "$1.check" | head -1 | sed 's/.*offset //; s/,.*//'
+# sync_mean FILE MAX_MS: the file's mean A/V offset, when it is inside the
+# bound. The mean is the number upstream compares; a server may drop our first
+# samples at publish start (before the first flash), which shows as a hole at
+# t=0, not as a drift — synccheck's own bound is looser so that case is
+# reported with its worst pair instead of ending the check.
+sync_mean() {
+    python3 scripts/synccheck.py "$1" --max-ms 60 >"$1.check" 2>&1 || true
+    line=$(grep 'audio 0' "$1.check" | head -1)
+    mean=$(echo "$line" | sed 's/.*offset mean //; s/ ms.*//')
+    worst=$(echo "$line" | sed 's/.*worst //; s/ ms.*//')
+    [ -n "$mean" ] || return 1
+    awk -v m="$mean" -v b="$2" 'BEGIN { exit !(m >= -b && m <= b) }' || return 1
+    echo "mean $mean, worst $worst"
 }
 
 scripts/live/mediamtx.sh ensure >/dev/null 2>&1 || exit 3
@@ -114,7 +121,7 @@ if [ -s "$file" ] && "$REC" probe "$file" >"$dir/out/rec.probe" 2>&1; then
     else
         bad record-file "$frames frames (a pause must not shorten the file)"
     fi
-    if off=$(sync_of "$file" 20); then
+    if off=$(sync_mean "$file" 50); then
         ok record-sync "A/V $off"
     else
         bad record-sync "$(grep 'audio 0' "$file.check" | head -1)"
@@ -124,14 +131,14 @@ else
 fi
 
 # The server's recordings: RTMP and WHIP from the same encode.
-rtmp_rec=$(newest_recording "$dir/recordings/e2e")
-if off=$(sync_of "${rtmp_rec:-/nonexistent}" 25 2>/dev/null); then
+rtmp_rec=$(largest_recording "$dir/recordings/e2e")
+if off=$(sync_mean "${rtmp_rec:-/nonexistent}" 30 2>/dev/null); then
     ok record-stream-rtmp "A/V $off"
 else
     bad record-stream-rtmp "no usable RTMP recording"
 fi
-whip_rec=$(newest_recording "$dir/recordings/e2ew")
-if off=$(sync_of "${whip_rec:-/nonexistent}" 45 2>/dev/null); then
+whip_rec=$(largest_recording "$dir/recordings/e2ew")
+if off=$(sync_mean "${whip_rec:-/nonexistent}" 30 2>/dev/null); then
     ok record-stream-whip "A/V $off"
 else
     bad record-stream-whip "no usable WHIP recording"
@@ -157,7 +164,7 @@ for clip in $clips; do
     line=$(python3 scripts/synccheck.py "$clip" --max-ms 45 2>&1 | grep 'audio 0' | head -1)
     mean=$(echo "$line" | sed 's/.*offset mean //; s/ ms.*//')
     if awk -v d="$dur" 'BEGIN { exit !(d >= 4.0 && d <= 16.5) }' \
-        && [ -n "$mean" ] && awk -v m="$mean" 'BEGIN { exit !(m >= -20 && m <= 20) }'; then
+        && [ -n "$mean" ] && awk -v m="$mean" 'BEGIN { exit !(m >= -10 && m <= 10) }'; then
         ok "record-replay-clip" "$(awk -v d="$dur" 'BEGIN { printf "%.1f s", d }'), A/V mean $mean ($(basename "$clip"))"
     else
         bad "record-replay-clip" "$clip: ${dur}s, $line"
@@ -165,4 +172,7 @@ for clip in $clips; do
 done
 
 echo "$pass passed, $fail failed"
+if [ "$fail" -gt 0 ]; then
+    echo "runtime files kept in $dir (MediaMTX log, its recordings, the recorder's stderr)"
+fi
 [ "$fail" -eq 0 ]

@@ -22,8 +22,11 @@ rec_binary() {
     fi
 }
 
+# Where a live case writes everything it produces (MediaMTX's log, its
+# recordings, the harness output). The selftest points this at the case's own
+# folder, so a failure's server log and recordings sit next to the case report.
 live_root() {
-    printf '%s' "${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/live"
+    printf '%s' "${REC_LIVE_DIR:-${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/live}"
 }
 
 # wait_port PORT [SECS]
@@ -76,6 +79,13 @@ stop_server() {
 # newest_recording DIR: the newest .mp4 under DIR (empty when there is none).
 newest_recording() {
     find "$1" -name '*.mp4' -type f 2>/dev/null | sort | tail -1
+}
+
+# largest_recording DIR: the biggest .mp4 under DIR. A recorder that is
+# restarted mid-stream (a reconnect) leaves more than one file; the check wants
+# the full one, not the fragment after the restart.
+largest_recording() {
+    find "$1" -name '*.mp4' -type f -printf '%s %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
 }
 
 # check_recording NAME FILE MAX_MS: probe it and measure A/V sync.
