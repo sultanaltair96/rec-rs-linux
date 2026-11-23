@@ -862,6 +862,18 @@ impl FrameRate {
         let median = v[v.len() / 2];
         (1.0 / median).round().clamp(1.0, 240.0) as u32
     }
+
+    /// Whether a new encoder should be built for `want`: only for a real change
+    /// (more than 10%) once there is a full second of evidence. Rebuilding for
+    /// jitter restarts the encoders mid-stream — a new keyframe, a cleared
+    /// replay buffer, and the audio encoder's buffered tail lost.
+    fn worth_rebuilding(&self, want: u32) -> bool {
+        if self.intervals.len() < 31 {
+            return false;
+        }
+        let current = self.fps();
+        (current as f64 - want as f64).abs() / want.max(1) as f64 > 0.1
+    }
 }
 
 /// The encode thread: drain the tap, keep the encoders right, fill short gaps.
@@ -938,7 +950,12 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         let rebuild_video = match &enc {
             None => true,
             Some(e) => {
-                e.hevc != hevc || e.fps != fps || e.generation != generation || e.size != size
+                e.hevc != hevc
+                    || e.generation != generation
+                    || e.size != size
+                    // Only a real frame-rate change, not jitter: a rebuild
+                    // restarts the encoders mid-stream.
+                    || (e.fps != fps && rate.worth_rebuilding(fps))
             }
         };
         if rebuild_video && first.is_some() && Instant::now() >= retry_after {
