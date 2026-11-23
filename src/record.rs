@@ -937,8 +937,8 @@ pub fn run(o: Options) -> Result<Stats> {
             mic_desc,
             sess.camera_name().unwrap_or("off"),
         );
-        if o.write && !o.quiet {
-            eprintln!("rec: encoder {}", sess.encoder);
+        if o.write && std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!("rec: debug: encoder {}", sess.encoder);
         }
         eprintln!("rec: press Ctrl-C to stop");
     }

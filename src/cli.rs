@@ -141,22 +141,21 @@ pub struct RecordArgs {
     #[arg(long, value_name = "SECS")]
     pub replay: Option<f64>,
     /// Stream to an RTMP(S) URL or a WHIP endpoint (http(s)://.../whip).
-    /// youtube, twitch and kick are shortcuts. Repeat it to stream to several
-    /// at once. The key comes from $REC_STREAM_KEY.
+    /// youtube, twitch and kick are shortcuts. Repeat it to stream to
+    /// several at once. The key comes from $REC_STREAM_KEY or the Secret
+    /// Service (`rec-rs stream-key URL`).
     #[arg(long, value_name = "URL")]
     pub stream: Vec<String>,
     /// Do not write a recording file (replay buffer / streaming only).
     #[arg(long)]
     pub no_record: bool,
-    /// Live encode bounding size: the frame keeps its shape and is never
-    /// above the capture.
+    /// Live encode (replay and streams) size.
     #[arg(long, default_value = "1080p")]
     pub live_resolution: String,
-    /// Live video bitrate in kb/s. Default: the platform's recommendation for
-    /// the size and frame rate (YouTube 2160p60 45 Mb/s H.264 or 35 HEVC
-    /// (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and
-    /// 1080p; Kick at most 8 Mb/s and 1080p; others like YouTube). With
-    /// several destinations, the lowest bitrate and size among them.
+    /// Live video bitrate in kb/s. Default: the platform's recommendation
+    /// for the size and frame rate (YouTube 4K60 45 Mb/s H.264 or 35 HEVC,
+    /// Twitch at most 6 Mb/s, Kick at most 8), else YouTube's. With several
+    /// destinations, the lowest of them.
     #[arg(long)]
     pub stream_bitrate: Option<u32>,
     /// Live video codec: auto (HEVC when every destination is YouTube), h264
@@ -164,7 +163,7 @@ pub struct RecordArgs {
     /// that refuse it).
     #[arg(long, default_value = "auto", value_parser = ["auto", "h264", "hevc"])]
     pub stream_codec: String,
-    /// Live keyframe interval in seconds (0.5–4).
+    /// Live keyframe interval in seconds.
     #[arg(long, default_value_t = 2.0)]
     pub keyframe: f64,
     /// Variable bitrate for the live encode (default: constant).
@@ -339,6 +338,21 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
     if scene.uses_cam() && webcam.is_none() {
         webcam = Some(None);
     }
+    let output = a.output.clone().unwrap_or_else(default_output);
+    // Validate every flag before resolving the screen (upstream's order): on a
+    // headless or portal-less host a bad argument must still be the error the
+    // user sees, not a capture failure.
+    if a.no_record && a.replay.is_none() && a.stream.is_empty() {
+        bail!("--no-record needs --replay or --stream");
+    }
+    if let Some(secs) = a.replay
+        && !(15.0..=300.0).contains(&secs)
+    {
+        bail!("--replay must be 15-300 seconds");
+    }
+    if a.codec == Some(Codec::Prores) && output.extension().is_some_and(|e| e == "mp4") {
+        bail!("ProRes needs a .mov output");
+    }
     let (request, native) = if a.test_pattern {
         (None, (3840, 2160))
     } else {
@@ -369,12 +383,8 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
         .map(|m| (m * 1e6) as u64)
         .unwrap_or_else(|| ((w * h) as f64 * a.fps as f64 * bpp) as u64)
         .clamp(1_000_000, 400_000_000);
-    let output = a.output.clone().unwrap_or_else(default_output);
     if codec.needs_mov() && output.extension().is_some_and(|e| e == "mp4") {
         bail!("ProRes needs a .mov output");
-    }
-    if a.no_record && a.replay.is_none() && a.stream.is_empty() {
-        bail!("--no-record needs --replay or --stream");
     }
     let mut live = None;
     if a.replay.is_some() || !a.stream.is_empty() {
@@ -411,9 +421,6 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
             );
         }
         if let Some(secs) = a.replay {
-            if !(15.0..=300.0).contains(&secs) {
-                bail!("--replay must be 15-300 seconds");
-            }
             conf.set_replay(Some(secs));
         }
         live = Some(std::sync::Arc::new(conf));
@@ -498,5 +505,22 @@ mod tests {
 
         // `--no-mic` still conflicts with any `--mic`, value or not.
         assert!(crate::parse_record_args(&["--test-pattern", "--no-mic", "--mic"]).is_err());
+    }
+
+    /// G16: bad arguments are reported before the screen is resolved, so a
+    /// headless box says what is wrong instead of "the portal is not
+    /// reachable" (upstream validates every flag first too).
+    #[test]
+    fn argument_errors_come_before_the_capture_target() {
+        let a = crate::parse_record_args(&["--no-record"]).unwrap();
+        let err = prepare(a).unwrap_err().to_string();
+        assert!(
+            err.contains("--no-record needs --replay or --stream"),
+            "{err}"
+        );
+
+        let a = crate::parse_record_args(&["--codec", "prores", "-o", "x.mp4"]).unwrap();
+        let err = prepare(a).unwrap_err().to_string();
+        assert!(err.contains("ProRes needs a .mov output"), "{err}");
     }
 }
