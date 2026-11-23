@@ -230,13 +230,96 @@ impl std::fmt::Debug for Options {
     }
 }
 
+/// How many cameras this process opened (tests prove a hand-over opens none).
+#[cfg(test)]
+pub(crate) static CAMERA_OPENS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of cameras opened so far (tests only).
+#[cfg(test)]
+pub(crate) fn camera_opens() -> usize {
+    CAMERA_OPENS.load(Ordering::SeqCst)
+}
+
+/// A running camera, handed from one session to the next (phase 1E).
+///
+/// The device stays open across a preview → recording → preview hand-over, so
+/// a recording starts with the exposure already settled (upstream's
+/// `take_camera`/`start_with_camera`) and the camera LED never restarts.
+/// Frames go to whatever session last adopted it; between sessions they go
+/// nowhere, so a finished writer never sees them.
+pub struct Camera {
+    source: Box<dyn VideoSource>,
+    /// The session the frames go to, or None while being handed over.
+    target: Arc<Mutex<Option<FrameSink>>>,
+    desc: String,
+}
+
+impl Camera {
+    /// Start `source` with a forwarding sink, so the next session can adopt it
+    /// without stopping the device.
+    fn start(source: Box<dyn VideoSource>, sink: FrameSink) -> Result<Camera> {
+        let target: Arc<Mutex<Option<FrameSink>>> = Arc::new(Mutex::new(Some(sink)));
+        let forward = target.clone();
+        let forwarder: FrameSink = Arc::new(move |frame| {
+            let to = forward.lock().ok().and_then(|t| t.clone());
+            if let Some(to) = to {
+                to(frame);
+            }
+        });
+        let desc = source.describe();
+        let mut cam = Camera {
+            source,
+            target,
+            desc,
+        };
+        cam.source.start(forwarder)?;
+        Ok(cam)
+    }
+
+    /// Point the running camera's frames at `sink` (a new session adopting it).
+    fn adopt(&self, sink: FrameSink) {
+        if let Ok(mut t) = self.target.lock() {
+            *t = Some(sink);
+        }
+    }
+
+    /// Frames go nowhere until another session adopts the camera.
+    fn detach(&self) {
+        if let Ok(mut t) = self.target.lock() {
+            *t = None;
+        }
+    }
+
+    /// The device name, for the app and the start line.
+    pub fn describe(&self) -> &str {
+        &self.desc
+    }
+
+    /// Stop the camera; the device's LED goes off.
+    pub fn stop(&mut self) {
+        if let Err(e) = self.source.stop() {
+            eprintln!("rec: warning: stopping the camera: {e}");
+        }
+        self.detach();
+    }
+}
+
+impl Drop for Camera {
+    fn drop(&mut self) {
+        // An idle spare camera must not keep the device (and its LED) on.
+        let _ = self.source.stop();
+        self.detach();
+    }
+}
+
 /// A running capture session.
 pub struct Session {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     pacer: Option<std::thread::JoinHandle<()>>,
     video: Option<Box<dyn VideoSource>>,
-    camera: Option<Box<dyn VideoSource>>,
+    camera: Option<Camera>,
     /// What the camera reported (its device name), for the start log and the app.
     camera_desc: String,
     audio: Vec<Box<dyn crate::media_types::AudioSource>>,
@@ -252,6 +335,14 @@ pub struct Session {
 impl Session {
     /// Start capturing and writing. `o.write` false = preview-only.
     pub fn start(o: &Options) -> Result<Session> {
+        Self::start_with_camera(o, None)
+    }
+
+    /// `start`, taking over a running camera (from [`take_camera`](Session::take_camera)):
+    /// the device stays open, so a recording starts with its exposure already
+    /// settled instead of waiting the 2 s cold-camera gate. A camera the
+    /// options no longer want is stopped.
+    pub fn start_with_camera(o: &Options, cam: Option<Camera>) -> Result<Session> {
         let (w, h) = o.size;
         let spec = VideoSpec {
             width: w,
@@ -375,7 +466,7 @@ impl Session {
             description: String::new(),
             encoder,
         };
-        match sess.start_sources(o) {
+        match sess.start_sources(o, cam) {
             Ok(()) => {}
             Err(e) => {
                 sess.stop_sources();
@@ -411,7 +502,7 @@ impl Session {
         Ok(sess)
     }
 
-    fn start_sources(&mut self, o: &Options) -> Result<()> {
+    fn start_sources(&mut self, o: &Options, handed: Option<Camera>) -> Result<()> {
         let vsink: FrameSink = {
             let shared = self.shared.clone();
             Arc::new(move |f| shared.with(|w| w.push_video(f)))
@@ -428,26 +519,45 @@ impl Session {
         // exposure has settled (upstream's 2 s gate), so the first frames are
         // not dark, and its frames feed the scene from the first slot.
         if let Some(sel) = &o.webcam {
-            let req = CameraRequest {
-                device: sel.clone(),
-            };
-            // The camera source knows how much of upstream's settle time is
-            // left (a device that was already running keeps its exposure).
-            let (mut cam, settle): (Box<dyn VideoSource>, f64) = match testsrc::camera_from_env() {
-                Some(c) => (c, camera_capture::CAMERA_SETTLE_SECS),
+            // A camera handed over from the preview is already running (and
+            // already warm): adopt it instead of opening the device again.
+            let (cam, settle) = match handed {
+                Some(cam) => {
+                    cam.adopt(camsink.clone());
+                    (cam, 0.0)
+                }
                 None => {
-                    let src = camera_capture::open_source(&req)?;
-                    let settle = src.settle_remaining();
-                    (Box::new(src), settle)
+                    let req = CameraRequest {
+                        device: sel.clone(),
+                    };
+                    // The camera source knows how much of upstream's settle
+                    // time is left (a device that was already running keeps
+                    // its exposure).
+                    let (src, settle): (Box<dyn VideoSource>, f64) =
+                        match testsrc::camera_from_env() {
+                            Some(c) => (c, camera_capture::CAMERA_SETTLE_SECS),
+                            None => {
+                                let src = camera_capture::open_source(&req)?;
+                                let settle = src.settle_remaining();
+                                (Box::new(src), settle)
+                            }
+                        };
+                    #[cfg(test)]
+                    CAMERA_OPENS.fetch_add(1, Ordering::SeqCst);
+                    (Camera::start(src, camsink.clone())?, settle)
                 }
             };
-            self.camera_desc = cam.describe();
-            cam.start(camsink)?;
-            // A preview just shows the dark frames; only a file waits.
+            self.camera_desc = cam.describe().to_string();
+            // A preview just shows the dark frames; only a file waits, and a
+            // warm camera has nothing left to settle.
             if o.write && o.scene.uses_cam() {
                 self.shared.with(|w| w.wait_for_camera(settle));
             }
             self.camera = Some(cam);
+        } else if let Some(mut cam) = handed {
+            // The scene no longer wants the camera: close it rather than leak
+            // the device (its LED would stay on).
+            cam.stop();
         }
         match o.test_pattern {
             Some(noise) => {
@@ -536,10 +646,8 @@ impl Session {
         {
             eprintln!("rec: warning: stopping capture: {e}");
         }
-        if let Some(mut c) = self.camera.take()
-            && let Err(e) = c.stop()
-        {
-            eprintln!("rec: warning: stopping the camera: {e}");
+        if let Some(mut c) = self.camera.take() {
+            c.stop();
         }
         for mut a in self.audio.drain(..) {
             if let Err(e) = a.stop() {
@@ -605,6 +713,17 @@ impl Session {
     #[allow(dead_code)]
     pub fn set_volumes(&self, volumes: [Volume; 2]) {
         self.shared.with(|w| w.set_volumes(volumes));
+    }
+
+    /// Take the camera out of this session, still running, for the next one
+    /// ([`start_with_camera`](Session::start_with_camera)): the preview hands it
+    /// to the recording and the recording hands it back. Its frames go nowhere
+    /// until then.
+    pub fn take_camera(&mut self) -> Option<Camera> {
+        let cam = self.camera.take()?;
+        cam.detach();
+        self.camera_desc.clear();
+        Some(cam)
     }
 
     /// The camera in use, for the status line and the app (phase 1E).

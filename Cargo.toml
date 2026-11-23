@@ -38,8 +38,10 @@ egui = "0.36.2"
 egui-wgpu = { version = "0.36.2", features = ["winit", "wayland", "x11"] }
 egui-winit = "0.36.2"
 winit = "0.30"
-# Tray (StatusNotifierItem) and global hotkeys (XDG GlobalShortcuts portal).
+# Tray (StatusNotifierItem), global hotkeys (XDG GlobalShortcuts portal) and
+# the screen lock (logind's LockedHint / the screen saver's ActiveChanged).
 ksni = { version = "0.3", features = ["blocking"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 rfd = "0.18"
 gstreamer-video = "0.24"
