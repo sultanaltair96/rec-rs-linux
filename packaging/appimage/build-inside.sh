@@ -53,6 +53,9 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/m
 
 install -Dm755 /root/target/release/rec-rs "$APPDIR/usr/bin/rec-rs"
 ln -sf rec-rs "$APPDIR/usr/bin/rec"
+# gst-inspect is a 50 KB diagnostic that answers "is vah264enc here?" on a real
+# GPU host; the AppImage has no other way to enumerate elements.
+install -Dm755 "$(command -v gst-inspect-1.0)" "$APPDIR/usr/bin/gst-inspect-1.0"
 install -Dm644 packaging/desktop/io.github.sultanaltair96.Rec.metainfo.xml \
     "$APPDIR/usr/share/metainfo/io.github.sultanaltair96.Rec.metainfo.xml"
 # The AppImage desktop file is named after the binary, and its icon too, so
@@ -107,6 +110,15 @@ for el in $ELEMENTS; do
     file=$(gst-inspect-1.0 "$el" 2>/dev/null | sed -n 's/^  Filename *//p' | head -1)
     [ -n "$file" ] && [ -f "$file" ] && cp -n "$file" "$PLUGINS/" || true
 done
+# The VA-API plugin registers its encoders only when a VA display opens, so on
+# this GPU-less build host `gst-inspect-1.0 vah264enc` finds nothing and the
+# element-driven collection above would miss the whole plugin. Copy it by file:
+# on a host with /dev/dri the plugin then registers vah264enc/vah265enc, which
+# the writer prefers over x264enc/x265enc.
+for f in /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstva.so; do
+    [ -f "$f" ] && cp -n "$f" "$PLUGINS/" || true
+done
+
 # Core plugins that are not named after an element but are needed:
 # coreelements (queue/tee/filesink/capsfilter are there), playback, typefind.
 for f in /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstcoreelements.so \

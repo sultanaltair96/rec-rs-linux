@@ -14,6 +14,9 @@ OUT=/out/test
 pass=0
 fail=0
 skip=0
+# The writer prints which encoder it chose ("rec: debug: encoder x264enc") only
+# with REC_DEBUG, so every record run below runs with it on.
+export REC_DEBUG=1
 
 ok() { echo "PASS  $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL  $1"; fail=$((fail + 1)); }
@@ -41,7 +44,7 @@ echo "== record: h264 through the CLI, output in ~/Videos"
 mkdir -p "$HOME/Videos"
 if flatpak run "$APP" record --test-pattern --no-mic --no-system-audio -t 3 \
         -o "$HOME/Videos/x.mp4" >"$OUT/h264.log" 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' "$OUT/h264.log" | head -1
+    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/h264.log" | head -1
     ok "record h264"
 else
     cat "$OUT/h264.log"
@@ -83,7 +86,7 @@ fi
 echo "== record: hevc (x265enc built by this manifest)"
 if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
         -t 2 --codec hevc -o "$HOME/Videos/hevc.mp4" >"$OUT/hevc.log" 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' "$OUT/hevc.log" | head -1
+    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/hevc.log" | head -1
     ok "record hevc"
     if flatpak run --command=rec-rs "$APP" probe "$HOME/Videos/hevc.mp4" >"$OUT/hevc.probe" 2>&1; then
         ok "probe hevc"
@@ -99,8 +102,8 @@ fi
 echo "== record: prores (the runtime's avenc_prores_ks)"
 if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
         -t 2 --codec prores -o "$HOME/Videos/prores.mov" >"$OUT/prores.log" 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' "$OUT/prores.log" | head -1
-    ok "record prores ($(grep -o 'rec: encoder [a-z0-9_]*' "$OUT/prores.log" | head -1 | sed 's/rec: encoder //'))"
+    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/prores.log" | head -1
+    ok "record prores ($(grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/prores.log" | head -1 | sed 's/.*encoder //'))"
 else
     cat "$OUT/prores.log"
     bad "record prores"

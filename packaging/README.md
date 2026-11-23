@@ -254,10 +254,27 @@ resolve their library dependencies:
   `uridecodebin`, `decodebin`, `parsebin`, `multiqueue`, `fakesink`, `filesink`,
   `filesrc`, `videotestsrc`, `tee`, `valve`.
 
-The bundle ends up with **28 plugins** (their list is printed by
-`test-appimage.sh`). A VA-API plugin without a GPU, or without a driver in the
-host's `/usr/lib/*/dri`, simply registers no elements; the writer then picks
-`x264enc`/`x265enc` as on the Flatpak.
+The bundle ends up with **29 plugins** (their list is printed by
+`test-appimage.sh`) plus the VA-API plugin, which is handled specially: the `va`
+plugin registers `vah264enc`/`vah265enc` only when a VA display opens, so on the
+GPU-less build host `gst-inspect` finds no such element and an element-driven
+collection would silently leave the whole plugin out (that is exactly what
+happened before: the AppImage shipped libva but no `libgstva.so`, so it always
+fell back to x264/x265). `build-inside.sh` therefore copies
+`libgstva.so` **by file**, and linuxdeploy pulls in what it links
+(`libgstcodecparsers-1.0`, libva). The bundle also carries `gst-inspect-1.0`
+(50 KB), the only way to answer "is `vah264enc` here?" on a real GPU host.
+
+**libva: loader bundled, driver from the host.** `libavcodec` links `libva.so.2`
+directly, so dropping it would cost AAC, ProRes and the HEVC decoder on a host
+without libva; the *driver* (`radeonsi_drv_video.so`, `iHD_drv_video.so`, …) is
+the host's, next to its Mesa stack. libva's compiled-in search path is the build
+container's (Debian layout), so `AppRun` sets `LIBVA_DRIVERS_PATH` (unless the
+user already did) to the host layouts: `/usr/lib64/dri` (Fedora, openSUSE),
+`/usr/lib/x86_64-linux-gnu/dri` (Debian, Ubuntu) and `/usr/lib/dri` (Arch).
+`LIBVA_DRIVER_NAME` is left alone so the host can force a driver. A missing
+driver does not break anything: the plugin registers no elements and the writer
+picks `x264enc`/`x265enc`, exactly as on the Flatpak without a GPU.
 
 ### What deliberately comes from the host
 
@@ -265,7 +282,7 @@ host's `/usr/lib/*/dri`, simply registers no elements; the writer then picks
 |---|---|
 | glibc, libm, libpthread, libdl | A bundled glibc does not work; linuxdeploy's excludelist keeps them out |
 | libGL, libEGL, libvulkan, Mesa/GPU drivers | must match the user's GPU and driver |
-| the VA-API driver (iHD/radeonsi/...) | it must match the GPU; `libva` itself *is* bundled, because `libavcodec` links it directly and a host without it would lose AAC, ProRes and the HEVC decoder |
+| the VA-API driver (iHD/radeonsi/..., in the host's `dri` dir) | it must match the GPU and the kernel; `libva` itself *is* bundled (a thin loader `libavcodec` links directly), and `AppRun` points it at the host's driver directories with `LIBVA_DRIVERS_PATH` |
 | libdbus-1 | must match the running session bus |
 | **libpipewire-0.3 / libspa-0.2** | the client ABI has to match the *daemon* it talks to; a bundled client against the host's PipeWire is the classic AppImage failure. Every desktop ships it. If it is missing, the recorder fails to start; screen/audio capture would not work without a PipeWire daemon anyway |
 | the Vulkan ICDs and the GL drivers | `libvulkan.so.1` (the loader) is bundled because ffmpeg's libavcodec links it; the ICD JSON files and the drivers behind it are the host's |
@@ -309,11 +326,11 @@ library, see the table above). It records H.264, HEVC and ProRes with the test
 pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
-Result: **Debian 13 14/14 pass** and **Fedora 43 13/13 pass + 1 skip**. The
-encoders are `x264enc`, `x265enc` and `avenc_prores_ks` (`avenc_prores_aw` and
-`avenc_prores` are bundled too, but Ubuntu's libav picks the `_ks` variant
-first), `probe` reports
-`video h264 1920x1080 @ 60.000 fps` and HEVC, 28 plugins are bundled, and the
+Result: **Debian 13 15/15 pass + 1 skip** and **Fedora 43 14/14 pass + 2
+skips**. The encoders are `x264enc`, `x265enc` and `avenc_prores_aw`
+(`avenc_prores_ks` and `avenc_prores` are bundled too), `probe` reports
+`video h264 1920x1080 @ 60.000 fps` and HEVC, 29 plugins are bundled (the VA
+plugin included), and the
 GUI opens under Xvfb on Debian 13 (window still up after 8 s). The **live path**
 runs for real: RTMP + WHIP from one encode with a 15 s replay buffer, a
 `save-replay` clip from a second AppImage process (the AppImage has no PID
@@ -323,6 +340,11 @@ AppImage process plays. `fdkaacenc`/`fdkaacdec` are absent
 from the bundle (Ubuntu has no fdk-aac); `avenc_aac`, `avdec_aac` and `voaacenc`
 are present, so the live path's fallback is what runs.
 
+The two skips are the checks that need hardware this container does not have:
+the GUI on Fedora (below) and `vah264enc` (no `/dev/dri/renderD128`). The VA
+plugin's presence is asserted everywhere; the element itself is asserted
+whenever a render node exists, which is what the GPU hosts run.
+
 On Fedora 43's container the GUI check **skips**: the host's software Vulkan
 (lavapipe over Xvfb) refuses to enumerate a device
 (`vkEnumeratePhysicalDevices` returns `VK_ERROR_INCOMPATIBLE_DRIVER`) and its GL
@@ -331,7 +353,7 @@ Mesa, opens its window in the same container — the difference is the host's
 rendering stack, not the package. A real Fedora desktop with a GPU driver is
 check 8 in the list below.
 
-Sizes: AppImage **104.4 MiB** (109,394,424 bytes), `.zsync` 183 KiB. Most of it
+Sizes: AppImage **104.7 MiB** (109,828,600 bytes), `.zsync` 184 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
 fonts. That is the price of AAC, ProRes, the app and streaming in a single file;
@@ -460,5 +482,9 @@ provide. The exact checks:
    about).
 9. **AppImage update** — upload a newer AppImage + `.zsync` to a GitHub Release
    and run `AppImageUpdate Rec-*.AppImage` (or wait for the app's 1E menu item).
-10. **AppImage VA-API** — the bundled plugin plus the host's libva/driver should
-    give `vah264enc` on a GPU; `REC_DEBUG=1` says which encoder ran.
+10. **AppImage VA-API** — on a GPU host (`/dev/dri/renderD128`), `test-appimage.sh`
+    asserts the bundled `va` plugin registers `vah264enc`
+    (`gst-inspect-1.0 vah264enc` from the unpacked bundle), and
+    `REC_DEBUG=1 ./Rec-*.AppImage record --test-pattern -t 5 --codec h264`
+    should report `rec: encoder vah264enc` (the writer decides that; see the
+    phase 1G notes about I420 vs NV12 probing).

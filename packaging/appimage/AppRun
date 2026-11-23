@@ -25,5 +25,16 @@ export GST_PLUGIN_SYSTEM_PATH_1_0="$APPDIR/usr/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER_1_0="$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
 export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-appimage/gst-registry-$(uname -m).bin"
 
+# VA-API: the *driver* (radeonsi_drv_video.so, iHD_drv_video.so, nvidia_drv_video.so)
+# is the host's, next to its Mesa/GPU drivers; the loader (libva) is bundled
+# because gst-libav links it directly. libva's compiled-in driver path is the
+# build container's (Debian layout), so point it at the host's layout unless the
+# user already did: lib64 is Fedora/openSUSE, x86_64-linux-gnu Debian/Ubuntu,
+# lib Arch.
+if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
+    LIBVA_DRIVERS_PATH="/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
+    export LIBVA_DRIVERS_PATH
+fi
+
 # The app (no subcommand) opens its window; every subcommand runs headless.
 exec "$APPDIR/usr/bin/rec-rs" "$@"
