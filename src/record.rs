@@ -243,6 +243,100 @@ pub struct Session {
     pub encoder: String,
 }
 
+/// Open the capture sources a session will use: the screen or the test
+/// pattern, and the system audio and microphone that are actually available.
+///
+/// Called before the writer is built so the file's track set follows these
+/// sources: a source that failed to open gets no track (and warns, because
+/// audio never blocks a session), while a source that opened but never
+/// delivers keeps its track.
+struct OpenedSources {
+    video: Box<dyn VideoSource>,
+    audio: Vec<Box<dyn crate::media_types::AudioSource>>,
+    description: String,
+}
+
+fn open_sources(
+    o: &Options,
+    mic: Option<Box<dyn crate::media_types::AudioSource>>,
+) -> Result<OpenedSources> {
+    let mut audio: Vec<Box<dyn crate::media_types::AudioSource>> = vec![];
+    let video: Box<dyn VideoSource>;
+    let description;
+    match o.test_pattern {
+        Some(noise) => {
+            // REC_SYNTH_NATIVE=WxH makes the pattern larger than the output,
+            // to exercise the scaler (a native-size display into a smaller
+            // recording).
+            let (pw, ph) = std::env::var("REC_SYNTH_NATIVE")
+                .ok()
+                .and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                })
+                .unwrap_or((o.size.0, o.size.1));
+            let synth = Synth::new(Pattern {
+                width: pw,
+                height: ph,
+                fps: o.fps,
+                format: media_types::PixelFormat::Bgra,
+                noise,
+            });
+            description = synth.describe();
+            // Test hook (scripts/audio/integration.sh): take system audio from
+            // PipeWire instead of the pattern's own beeps.
+            let pattern_audio = match std::env::var("REC_PATTERN_SYSTEM_AUDIO").as_deref() {
+                Err(_) | Ok("") => false,
+                Ok("pipewire") => true,
+                Ok(other) => {
+                    bail!("REC_PATTERN_SYSTEM_AUDIO={other}: only `pipewire` is supported")
+                }
+            };
+            // Both halves of the pattern share one origin, so flash and beep
+            // stay aligned.
+            if o.system_audio {
+                if pattern_audio {
+                    match audio_capture::open_system() {
+                        Ok(src) => audio.push(src),
+                        Err(e) => {
+                            eprintln!("rec: warning: {e}; recording without system audio")
+                        }
+                    }
+                } else {
+                    audio.push(Box::new(synth.audio(true)));
+                }
+            }
+            video = Box::new(synth);
+        }
+        None => {
+            let req = o.screen.clone().unwrap_or_default();
+            let src = screen::open_with(
+                &req,
+                &screen::CaptureOptions {
+                    cursor: o.cursor,
+                    clicks: o.clicks,
+                },
+            )?;
+            description = src.describe();
+            video = src;
+            if o.system_audio {
+                match audio_capture::open_system() {
+                    Ok(src) => audio.push(src),
+                    Err(e) => eprintln!("rec: warning: {e}; recording without system audio"),
+                }
+            }
+        }
+    }
+    if let Some(mic) = mic {
+        audio.push(mic);
+    }
+    Ok(OpenedSources {
+        video,
+        audio,
+        description,
+    })
+}
+
 impl Session {
     /// Start capturing and writing. `o.write` false = preview-only.
     pub fn start(o: &Options) -> Result<Session> {
@@ -280,11 +374,23 @@ impl Session {
                 },
             }
         }
-        let has_mic = mic_source.is_some();
+        // Open the capture sources before the writer: the file's audio tracks
+        // follow the sources that really opened. A default sink that is gone
+        // (1B's G4 fix warns and records) must not leave a silent system track
+        // in the file; a source that opened but stays silent keeps its track.
+        let opened = open_sources(o, mic_source.take())?;
+        let system_ok = opened
+            .audio
+            .iter()
+            .any(|a| a.kind() == media_types::AudioKind::System);
+        let has_mic = opened
+            .audio
+            .iter()
+            .any(|a| a.kind() == media_types::AudioKind::Mic);
         let mut writer = Writer::new(
             path,
             &spec,
-            o.system_audio,
+            system_ok,
             has_mic,
             o.audio_layout,
             o.volumes,
@@ -360,13 +466,13 @@ impl Session {
             shared: shared.clone(),
             stop,
             pacer: None,
-            video: None,
+            video: Some(opened.video),
             camera: None,
             camera_desc: String::new(),
-            audio: mic_source.into_iter().collect(),
+            audio: opened.audio,
             output: o.write.then(|| o.output.clone()),
             started: Instant::now(),
-            description: String::new(),
+            description: opened.description,
             encoder,
         };
         match sess.start_sources(o) {
@@ -442,62 +548,6 @@ impl Session {
                 self.shared.with(|w| w.wait_for_camera(settle));
             }
             self.camera = Some(cam);
-        }
-        match o.test_pattern {
-            Some(noise) => {
-                // REC_SYNTH_NATIVE=WxH makes the pattern larger than the
-                // output, to exercise the scaler (a native-size display into a
-                // smaller recording).
-                let (pw, ph) = std::env::var("REC_SYNTH_NATIVE")
-                    .ok()
-                    .and_then(|v| {
-                        let (w, h) = v.split_once('x')?;
-                        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
-                    })
-                    .unwrap_or((o.size.0, o.size.1));
-                let synth = Synth::new(Pattern {
-                    width: pw,
-                    height: ph,
-                    fps: o.fps,
-                    format: media_types::PixelFormat::Bgra,
-                    noise,
-                });
-                self.description = synth.describe();
-                // Test hook (scripts/audio/integration.sh): take system audio
-                // from PipeWire instead of the pattern's own beeps.
-                let pattern_audio = match std::env::var("REC_PATTERN_SYSTEM_AUDIO").as_deref() {
-                    Err(_) | Ok("") => false,
-                    Ok("pipewire") => true,
-                    Ok(other) => {
-                        bail!("REC_PATTERN_SYSTEM_AUDIO={other}: only `pipewire` is supported")
-                    }
-                };
-                // Both halves of the pattern share one origin, so flash and
-                // beep stay aligned.
-                if o.system_audio {
-                    if pattern_audio {
-                        self.audio.push(audio_capture::open_system()?);
-                    } else {
-                        self.audio.push(Box::new(synth.audio(true)));
-                    }
-                }
-                self.video = Some(Box::new(synth));
-            }
-            None => {
-                let req = o.screen.clone().unwrap_or_default();
-                let src = screen::open_with(
-                    &req,
-                    &screen::CaptureOptions {
-                        cursor: o.cursor,
-                        clicks: o.clicks,
-                    },
-                )?;
-                self.description = src.describe();
-                self.video = Some(src);
-                if o.system_audio {
-                    self.audio.push(audio_capture::open_system()?);
-                }
-            }
         }
         if let Some(v) = &mut self.video {
             v.start(vsink)?;
