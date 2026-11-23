@@ -163,11 +163,14 @@ const QUEUE_MAX: usize = 7;
 /// software encoder (a 4K BGRA frame is 33 MB) must not spend.
 const VIDEO_QUEUE_FRAMES: u64 = 2;
 
-/// Bytes an audio appsrc may hold: 17 buffers of 10 ms stereo f32 (170 ms).
-const AUDIO_QUEUE_BYTES: u64 = 64 * 1024;
+/// Bytes an audio appsrc may hold: about 0.7 s of 10 ms stereo f32 buffers.
+/// Large enough that a busy muxer rides out a stall without dropping a chunk
+/// in the middle of a beep (a dropped buffer ends the previous one abruptly,
+/// which is a quiet click), still a hard memory bound per track.
+const AUDIO_QUEUE_BYTES: u64 = 256 * 1024;
 
 /// Buffers an audio appsrc/queue may hold.
-const AUDIO_QUEUE_BUFFERS: u32 = 8;
+const AUDIO_QUEUE_BUFFERS: u32 = 32;
 
 /// How far behind its time a slot may fall while the encoder is busy before it
 /// is dropped instead of retried (upstream's `MAX_BACKLOG_SECS`).
@@ -175,6 +178,11 @@ pub const MAX_BACKLOG_SECS: f64 = 0.5;
 
 /// Audio timestamp jitter tolerated before a track is padded or trimmed.
 pub const SNAP_SECS: f64 = 0.0015;
+
+/// Fade-in applied to real audio that follows filler silence, so the join is
+/// not a step (a click) whatever phase the signal resumes at. Short enough to
+/// leave a beep's onset and peak intact (the parent's ±5 ms / ±1 dB).
+const FILLER_FADE_SECS: f64 = 0.002;
 
 /// The longest audio gap the writer fills with silence. A longer jump is a
 /// source's clock bug or a device that connected late: the track resyncs
@@ -227,6 +235,11 @@ struct AudioTrack {
     channels: u8,
     /// Output-timeline position (seconds) where this track continues.
     next: Option<f64>,
+    /// The last thing written to this track was filler silence (a source that
+    /// had not delivered yet, or a gap). Real audio that would overlap it is
+    /// dropped whole rather than spliced mid-chunk, and the next real write
+    /// after it is faded in, so a late burst never clicks.
+    after_filler: bool,
 }
 
 /// One audio source's stream state: resampling to 48 kHz and its fader.
@@ -298,6 +311,16 @@ pub struct Writer {
     mixer: Option<Mixer>,
     /// The mix bus for the live encode (real time, keeps running while paused).
     live_mixer: Option<Mixer>,
+    /// Host time of the first frame handed to the live encode. Its timeline
+    /// starts there; audio from before it is pre-roll the RTMP/WHIP servers
+    /// discard as "received too late" (a real race: 3 packets, one run in two
+    /// under load), so the tap does not send it.
+    live_t0: Option<f64>,
+    /// Wall-clock time each source last delivered a chunk. Filler silence is
+    /// only for a source that is *gone* (nothing for STARVE_SECS), never for
+    /// one that is alive but behind in media time (a backlog burst): filling
+    /// in the middle of a burst pushed the track late and spliced it.
+    source_seen: [f64; 2],
     /// The shared live encode (replay buffer, streams; phase 1D).
     live: Option<Arc<live::Live>>,
     /// Where every emitted frame is offered (the app's preview; phase 1E).
@@ -391,6 +414,8 @@ impl Writer {
             }),
             mixer: None,
             live_mixer: None,
+            source_seen: [0.0; 2],
+            live_t0: None,
             live: None,
             preview: None,
             last_preview: 0.0,
@@ -684,6 +709,12 @@ impl Writer {
         if let Some(sink) = self.sink.as_ref() {
             let _ = sink.pipeline.set_state(gst::State::Playing);
         }
+        let started = crate::media_types::now();
+        for i in 0..2 {
+            if self.audio_wanted[i] {
+                self.source_seen[i] = started;
+            }
+        }
         if self.audio_wanted.iter().any(|w| *w) {
             if self
                 .sink
@@ -711,6 +742,7 @@ impl Writer {
         if !self.audio_wanted[i] || chunk.frames() == 0 {
             return;
         }
+        self.source_seen[i] = crate::media_types::now();
         let Some(t0) = self.t0 else {
             // Keep it until the clock starts; the part after t0 is used.
             self.preroll.push_back((kind, chunk.clone()));
@@ -802,10 +834,13 @@ impl Writer {
             AudioKind::System => Target::System,
             AudioKind::Mic => Target::Mic,
         };
-        self.write_track(target, out_s, &part);
-        match kind {
-            AudioKind::System => self.stats.audio_sys_buffers += 1,
-            AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+        if self.write_track(target, out_s, &part) {
+            match kind {
+                AudioKind::System => self.stats.audio_sys_buffers += 1,
+                AudioKind::Mic => self.stats.audio_mic_buffers += 1,
+            }
+        } else {
+            self.stats.audio_drops += 1;
         }
     }
 
@@ -822,8 +857,11 @@ impl Writer {
             overruns = m.overruns;
         }
         for (t, frames) in chunks {
-            self.write_track(Target::Mix, t, &frames);
-            self.stats.audio_mix_buffers += 1;
+            if self.write_track(Target::Mix, t, &frames) {
+                self.stats.audio_mix_buffers += 1;
+            } else {
+                self.stats.audio_drops += 1;
+            }
         }
         if self.mixer.is_some() {
             self.stats.audio_clipped_samples = clipped;
@@ -874,13 +912,28 @@ impl Writer {
         let out_time = limit.map_or(out_time, |l| out_time.min(l));
         let mut filled = 0u64;
         let mut failed = false;
+        let wall = crate::media_types::now();
         for track in &mut sink.tracks {
-            let start = track.next.unwrap_or(0.0);
-            let never = track.next.is_none();
-            if out_time <= start + SNAP_SECS {
+            let source_alive = match track.target {
+                Target::System => wall - self.source_seen[0] < STARVE_SECS,
+                Target::Mic => wall - self.source_seen[1] < STARVE_SECS,
+                Target::Mix => {
+                    (0..2).any(|i| self.audio_wanted[i] && wall - self.source_seen[i] < STARVE_SECS)
+                }
+            };
+            if source_alive {
+                // The source is delivering, just behind in media time (a
+                // backlog burst). Its own samples must fill this range; filler
+                // here would push the track late and splice the burst.
                 continue;
             }
-            if !never && out_time - start < STARVE_SECS {
+            let start = track.next.unwrap_or(0.0);
+            // Only a track that is genuinely overdue gets filler: a source
+            // that is merely late (under load, a burst of past-pts chunks) must
+            // get its own samples into the file first, or the filler would
+            // push the whole track late (measured: 11-60 ms under load) and
+            // splicing at the filler edge clicked.
+            if out_time - start < STARVE_SECS {
                 continue;
             }
             let mut at = start;
@@ -898,6 +951,7 @@ impl Writer {
                 filled += 1;
             }
             track.next = Some(at);
+            track.after_filler = true;
         }
         self.stats.audio_gaps_filled += filled;
         if filled > 0 {
@@ -910,16 +964,18 @@ impl Writer {
 
     /// Write 48 kHz stereo frames to the track that holds `target`, keeping it
     /// on the output timeline (a gap becomes silence, an overlap is trimmed).
-    fn write_track(&mut self, target: Target, pts: f64, frames: &[[f32; 2]]) {
+    /// Returns true when a buffer was written; the caller counts a track that
+    /// never received one (qtmux only writes a trak once it has a sample).
+    fn write_track(&mut self, target: Target, pts: f64, frames: &[[f32; 2]]) -> bool {
         if frames.is_empty() {
-            return;
+            return false;
         }
         let limit_secs = self.limit.map(|l| l as f64 / self.spec.fps as f64);
         let Some(sink) = self.sink.as_mut() else {
-            return;
+            return false;
         };
         let Some(track) = sink.tracks.iter_mut().find(|t| t.target == target) else {
-            return;
+            return false;
         };
         let rate = mixer::RATE;
         // The track continues from the last buffer written: fill a gap (late
@@ -937,8 +993,7 @@ impl Writer {
             // cannot stretch a 2 s recording.
             self.stats.audio_resyncs += 1;
             if gap > MAX_RESYNC_SECS {
-                self.stats.audio_drops += 1;
-                return;
+                return false;
             }
             start = pts;
             track.next = Some(pts);
@@ -947,7 +1002,15 @@ impl Writer {
         } else if gap < -SNAP_SECS {
             skip = (-gap * rate).round() as usize;
             if skip >= frames.len() {
-                return;
+                return false;
+            }
+            if track.after_filler {
+                // The range this chunk covers was already written as filler
+                // (the source was overdue and burst afterwards). Dropping the
+                // whole chunk keeps an intact signal from the next one instead
+                // of splicing this one mid-beep, which clicked and measured
+                // 2-4 dB hot.
+                return false;
             }
         }
         let body = &frames[skip..];
@@ -955,12 +1018,12 @@ impl Writer {
         // ends where the video grid does.
         let body = if let Some(limit) = limit_secs {
             if start >= limit {
-                return;
+                return false;
             }
             pad = pad.min(((limit - start) * rate).floor().max(0.0) as usize);
             let body_start = start + pad as f64 / rate;
             if body_start >= limit {
-                return;
+                return false;
             }
             let room = ((limit - body_start) * rate).floor().max(0.0) as usize;
             &body[..body.len().min(room)]
@@ -968,7 +1031,7 @@ impl Writer {
             body
         };
         if body.is_empty() && pad == 0 {
-            return;
+            return false;
         }
         let body_start = start + pad as f64 / rate;
         let mut ok = true;
@@ -976,15 +1039,35 @@ impl Writer {
             ok &= push_track_samples(track, start, &vec![[0.0, 0.0]; pad], 2);
             self.stats.audio_gaps_filled += 1;
         }
+        // Fade in when the signal resumes after filler, so silence-to-audio at
+        // an arbitrary phase is not a step.
+        let after_filler = track.after_filler || pad > 0;
+        let faded;
+        let body = if after_filler && !body.is_empty() {
+            let fade = ((FILLER_FADE_SECS * rate) as usize).min(body.len()).max(1);
+            let mut f = body.to_vec();
+            for (i, s) in f.iter_mut().enumerate().take(fade) {
+                let g = i as f32 / fade as f32;
+                s[0] *= g;
+                s[1] *= g;
+            }
+            faded = f;
+            &faded[..]
+        } else {
+            body
+        };
         if !body.is_empty() {
             ok &= push_track_samples(track, body_start, body, track.channels as usize);
         }
         if ok {
             track.next = Some(body_start + body.len() as f64 / rate);
+            if !body.is_empty() {
+                track.after_filler = false;
+            }
         } else {
-            self.stats.audio_drops += 1;
             self.check_bus();
         }
+        ok
     }
 
     /// Latest capture time the next slot to be emitted may show.
@@ -1109,6 +1192,9 @@ impl Writer {
             if want_live && let Some(l) = self.live.clone() {
                 // The live encode places frames on the real grid, so a paused
                 // recording does not stall it.
+                if self.live_t0.is_none() {
+                    self.live_t0 = Some(slot_t);
+                }
                 let mut stamped = frame.as_ref().clone();
                 stamped.pts = slot_t;
                 l.push_video(&stamped);
@@ -1315,8 +1401,10 @@ impl Writer {
             // Preview-only session.
             return Ok(self.stats.clone());
         };
-        // A track that never got audio would make an empty track; give it a
-        // moment of silence so the layout is intact.
+        // A track that never got audio would make an empty track: qtmux only
+        // writes a trak once it has a sample, so a short clip with a slow
+        // source lost it silently. Give every requested track a moment of
+        // silence and say so; the layout is then intact whatever the device did.
         for t in &mut sink.tracks {
             let written = match t.target {
                 Target::Mix => self.stats.audio_mix_buffers,
@@ -1324,6 +1412,14 @@ impl Writer {
                 Target::Mic => self.stats.audio_mic_buffers,
             };
             if written == 0 {
+                let what = match t.target {
+                    Target::Mix => "mix",
+                    Target::System => "system audio",
+                    Target::Mic => "microphone",
+                };
+                eprintln!(
+                    "rec: warning: no {what} arrived; writing a silent {what} track so the layout is intact"
+                );
                 let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480], t.channels as usize);
             }
         }
@@ -1535,12 +1631,23 @@ pub fn video_encoder_candidates(codec: Codec) -> &'static [&'static str] {
             "avenc_libx265",
             "avenc_hevc",
         ],
-        Codec::Prores => &["avenc_prores_ks"],
+        // ffmpeg has two ProRes encoders: the "Apple" one (prores_aw, also
+        // registered as avenc_prores) is several times faster than Kostya's
+        // (prores_ks) and is what a CPU can record in real time; ks stays as
+        // the fallback for a build without it.
+        Codec::Prores => &["avenc_prores_aw", "avenc_prores", "avenc_prores_ks"],
     }
 }
 
 /// AAC encoder elements to try, most capable first.
-pub const AUDIO_ENCODER_CANDIDATES: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc", "faac"];
+///
+/// `avenc_aac` is preferred over `fdkaacenc`: measured on a 40 ms 1 kHz beep
+/// train, fdkaacenc reproduces the first beep exactly but encodes the later
+/// ones 1.2-1.5 dB hot (a pure tone through it standalone is exact, so this is
+/// its behaviour on the gated stream a recording produces), and a recorder
+/// with faders must not change levels. ffmpeg's encoder is level-accurate and
+/// its 1024-sample priming is what the edit list skips.
+pub const AUDIO_ENCODER_CANDIDATES: &[&str] = &["avenc_aac", "fdkaacenc", "voaacenc", "faac"];
 
 /// Samples an AAC encoder holds back before it emits its first frame (its
 /// priming, the MDCT look-ahead). The file keeps those frames and the finalise
@@ -1686,9 +1793,22 @@ fn make_encoder(
             "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
                 el.set_property_from_str("rate-control", "cbr");
             }
-            // ffmpeg's ProRes encoder defaults to 422 HQ; upstream writes
-            // plain 422 ("standard"), and editors expect that.
-            "avenc_prores_ks" => set(&el, "profile", "standard"),
+            // ffmpeg's ProRes encoders default to 422 HQ; upstream writes
+            // plain 422 ("standard"), and editors expect that. ProRes is
+            // intra-only and a 1080p60 frame needs all the parallelism it can
+            // get: prores_ks goes from 3.5 to 15 fps with slice threads.
+            "avenc_prores_ks" | "avenc_prores_aw" | "avenc_prores" => {
+                set(&el, "profile", "standard");
+                // ffmpeg's ProRes encoders only use slice threading when a
+                // slice count is set; with threads=auto alone the encoder is
+                // 3.5 fps at 1080p60, with slices it is far above real time.
+                if el.find_property("threads").is_some() {
+                    set(&el, "threads", "auto");
+                }
+                if el.find_property("slices").is_some() {
+                    set(&el, "slices", 8);
+                }
+            }
             _ => {}
         }
         if let Some(format) = probe_format
@@ -2018,6 +2138,7 @@ fn open_sink(
                 appsrc: src,
                 channels: *channels as u8,
                 next: None,
+                after_filler: false,
             });
         }
     }
@@ -2103,8 +2224,13 @@ mod tests {
         assert_eq!(video_encoder_candidates(Codec::H264)[0], "vah264enc");
         assert!(video_encoder_candidates(Codec::H264).contains(&"openh264enc"));
         assert!(video_encoder_candidates(Codec::Hevc).contains(&"x265enc"));
-        assert_eq!(video_encoder_candidates(Codec::Prores), ["avenc_prores_ks"]);
-        assert_eq!(AUDIO_ENCODER_CANDIDATES[0], "fdkaacenc");
+        // The fast ffmpeg ProRes encoder first, Kostya's as the fallback.
+        assert_eq!(
+            video_encoder_candidates(Codec::Prores)[0],
+            "avenc_prores_aw"
+        );
+        assert!(video_encoder_candidates(Codec::Prores).contains(&"avenc_prores_ks"));
+        assert_eq!(AUDIO_ENCODER_CANDIDATES[0], "avenc_aac");
     }
 
     #[test]
@@ -2548,6 +2674,77 @@ mod tests {
             after.saturating_sub(before) < 300_000,
             "memory grew {} kB",
             after.saturating_sub(before)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+    /// A real PipeWire microphone starts after its stream reaches Streaming
+    /// and delivers 1024/2048-frame buffers, so its first chunk is late and
+    /// its sizes are not 10 ms. Such a source must still fill its track (the
+    /// 1B `pattern-mic` regression was a finalise bug, but this keeps the
+    /// writer side honest too).
+    #[test]
+    fn a_late_first_chunk_with_irregular_sizes_still_fills_the_track() {
+        let _ = gst::init();
+        let dir = std::env::temp_dir().join(format!("rec-rs-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.mov");
+        let _ = std::fs::remove_file(&path);
+        let spec = VideoSpec {
+            width: 320,
+            height: 180,
+            fps: 30,
+            codec: Codec::H264,
+            bitrate: 1_000_000,
+        };
+        let mut w = Writer::new(
+            Some(&path),
+            &spec,
+            false,
+            true,
+            AudioLayout::Stems,
+            [Volume::UNITY; 2],
+            Scene::Screen,
+            PipSpec::default(),
+        )
+        .unwrap();
+        w.limit_secs(Some(1.0));
+        let t0 = crate::media_types::now();
+        // Video on time; the microphone's first buffer only at 0.3 s, then
+        // 1024- and 2048-frame buffers (21.3 and 42.7 ms).
+        let mut next_audio = t0 + 0.3;
+        let mut sizes = [1024usize, 2048].into_iter().cycle();
+        let mut audio_count = 0;
+        for i in 0..30 {
+            let t = t0 + i as f64 / 30.0;
+            w.push_video(frame_at(t, 320, 180));
+            while next_audio <= t {
+                let n = sizes.next().unwrap();
+                let samples: Vec<f32> = vec![0.05; n * 2];
+                w.push_audio(
+                    AudioKind::Mic,
+                    &AudioChunk::stereo(next_audio, 48_000, samples),
+                );
+                next_audio += n as f64 / 48_000.0;
+                audio_count += 1;
+            }
+            w.emit_until(t);
+        }
+        let stats = w.finish(t0 + 1.0).unwrap();
+        assert!(audio_count > 0);
+        assert!(stats.audio_mic_buffers > 0, "mic buffers were written");
+        assert_eq!(stats.audio_drops, 0, "no mic buffer was dropped");
+        let info = crate::media::mp4::read(&path).expect("the file reads back");
+        let mic = info
+            .tracks
+            .iter()
+            .find(|t| t.handler == crate::media::mp4::Handler::Audio)
+            .expect("a microphone track exists");
+        assert!(mic.samples > 0, "the mic track has samples");
+        assert!(
+            mic.duration as f64 / mic.timescale.max(1) as f64 > 0.5,
+            "the mic track covers most of the second: {} samples",
+            mic.samples
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

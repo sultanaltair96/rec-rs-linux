@@ -102,8 +102,13 @@ impl AudioSource for MicBeep {
         let rate = crate::mixer::RATE;
         self.handle = Some(std::thread::spawn(move || {
             let mut k = 0i64;
+            // A device never sends a timestamp earlier than one it already
+            // sent; a late thread delivers its backlog with these (monotonic,
+            // possibly past) times, which is what a real buffer queue does.
+            let mut last_sent = f64::NEG_INFINITY;
             while !stop.load(Ordering::SeqCst) {
-                let pts = origin + (k * AUDIO_CHUNK as i64) as f64 / rate;
+                let pts = (origin + (k * AUDIO_CHUNK as i64) as f64 / rate).max(last_sent);
+                last_sent = pts;
                 // Deliver each chunk once it has "played", like a device.
                 let ready = pts + AUDIO_CHUNK as f64 / rate;
                 let now = media_types::now();
@@ -249,9 +254,45 @@ impl Drop for TestCamera {
     }
 }
 
+/// A source that opens and runs but never delivers a buffer, like a device
+/// that is connected but dead. `REC_SYNTH_MIC=silent` selects it, so the
+/// writer's "a requested source never delivered" path can be tested.
+pub struct SilentMic {
+    running: bool,
+}
+
+impl AudioSource for SilentMic {
+    fn kind(&self) -> AudioKind {
+        AudioKind::Mic
+    }
+
+    fn describe(&self) -> String {
+        "silent microphone (never delivers)".into()
+    }
+
+    fn start(&mut self, _sink: AudioSink) -> Result<()> {
+        self.running = true;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.running = false;
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        self.running
+    }
+}
+
 /// The synthetic microphone, when `REC_SYNTH_MIC` is set (tests only).
+/// `REC_SYNTH_MIC=silent` gives a device that never delivers.
 pub fn mic_from_env() -> Option<Box<dyn AudioSource>> {
-    std::env::var_os("REC_SYNTH_MIC").map(|_| Box::new(MicBeep::new()) as Box<dyn AudioSource>)
+    let value = std::env::var("REC_SYNTH_MIC").ok()?;
+    if value == "silent" {
+        return Some(Box::new(SilentMic { running: false }));
+    }
+    Some(Box::new(MicBeep::new()))
 }
 
 /// The synthetic camera, when `REC_SYNTH_CAM` is set (tests only).

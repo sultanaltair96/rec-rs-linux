@@ -122,6 +122,14 @@ pub struct TrackInfo {
     pub edits: Vec<Edit>,
     /// Samples in the movie (from the fragment headers or `stsz`).
     pub samples: u64,
+    /// Total bytes of those samples, for the data rate `probe` prints.
+    pub bytes: u64,
+    /// Presentation start in seconds (the first fragment's decode time; 0 for
+    /// a regular movie).
+    pub first_pts: f64,
+    /// The track's nominal frame rate (the most common sample duration), not
+    /// the effective one: a file with dropped slots still reads 60.000 fps.
+    pub nominal_fps: Option<f64>,
 }
 
 /// The movie as `probe` reports it.
@@ -370,11 +378,41 @@ fn parse_elst(b: &[u8]) -> Result<Vec<Edit>> {
     Ok(out)
 }
 
-fn parse_stsz_count(b: &[u8]) -> Result<u64> {
+/// `stsz`: (fixed size or 0, sample count, total bytes).
+fn parse_stsz(b: &[u8]) -> Result<(u32, u32, u64)> {
     if b.len() < 20 || &b[4..8] != b"stsz" {
         bail!("not an stsz box");
     }
-    Ok(be32(b, 16)? as u64)
+    let fixed = be32(b, 12)?;
+    let count = be32(b, 16)?;
+    if fixed > 0 {
+        return Ok((fixed, count, fixed as u64 * count as u64));
+    }
+    let mut bytes = 0u64;
+    for i in 0..count as usize {
+        bytes += be32(b, 20 + i * 4)? as u64;
+    }
+    Ok((0, count, bytes))
+}
+
+/// The most common sample duration in an `stts` table (the nominal frame
+/// interval), or None for an empty table.
+fn parse_stts_mode(b: &[u8]) -> Result<Option<u32>> {
+    if b.len() < 16 || &b[4..8] != b"stts" {
+        bail!("not an stts box");
+    }
+    let n = be32(b, 12)? as usize;
+    let mut best: Option<(u32, u32)> = None;
+    let mut at = 16;
+    for _ in 0..n {
+        let count = be32(b, at)?;
+        let delta = be32(b, at + 4)?;
+        at += 8;
+        if best.is_none_or(|(bc, bd)| count > bc || (count == bc && delta < bd)) {
+            best = Some((count, delta));
+        }
+    }
+    Ok(best.map(|(_, d)| d))
 }
 
 fn parse_moov(moov: &[u8]) -> Result<Init> {
@@ -402,6 +440,8 @@ fn parse_moov(moov: &[u8]) -> Result<Init> {
         let mut timescale = 0u32;
         let mut duration = tkhd_duration;
         let mut samples = 0u64;
+        let mut bytes = 0u64;
+        let mut nominal_fps = None;
         let mut edits = vec![];
         if let Some(mdia_ref) = find(&tk, b"mdia") {
             let mdia = slice(&trak, mdia_ref);
@@ -422,7 +462,14 @@ fn parse_moov(moov: &[u8]) -> Result<Init> {
                     let stbl = slice(minf, stbl_ref);
                     let sk = children(stbl, 8, stbl.len())?;
                     if let Some(sz) = find(&sk, b"stsz") {
-                        samples = parse_stsz_count(slice(stbl, sz))?;
+                        let (_, count, total) = parse_stsz(slice(stbl, sz))?;
+                        samples = count as u64;
+                        bytes = total;
+                    }
+                    if let Some(table) = find(&sk, b"stts") {
+                        nominal_fps = parse_stts_mode(slice(stbl, table))?
+                            .filter(|d| *d > 0)
+                            .map(|d| timescale as f64 / d as f64);
                     }
                 }
             }
@@ -444,6 +491,9 @@ fn parse_moov(moov: &[u8]) -> Result<Init> {
                 alternate_group,
                 edits,
                 samples,
+                bytes,
+                first_pts: 0.0,
+                nominal_fps,
             },
         });
     }
@@ -494,15 +544,41 @@ pub fn read(path: &Path) -> Result<MovieInfo> {
     let fragmented = init.has_mvex;
     let mut tracks: Vec<TrackInfo> = init.tracks.into_iter().map(|t| t.info).collect();
     if fragmented {
-        // The init moov has no sample tables; count what the fragments say so
-        // `probe` reports real numbers either way.
+        // The init moov has no sample tables; take the counts, bytes, duration
+        // and presentation start from the fragment headers so `probe` reports
+        // the real movie (a crash-left file is as long as its samples).
+        let mut per_track: HashMap<u32, Vec<Sample>> = HashMap::new();
+        let mut firsts: HashMap<u32, u64> = HashMap::new();
         for b in boxes.iter().filter(|b| b.kind == MOOF) {
             let buf = read_at(&mut file, b.start, b.size)?;
-            for (tid, samples) in parse_moof(&buf, b.start, &init.trex)? {
-                if let Some(t) = tracks.iter_mut().find(|t| t.track_id == tid) {
-                    t.samples += samples.len() as u64;
-                }
+            for (tid, decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
+                per_track.entry(tid).or_default().extend(samples);
+                firsts
+                    .entry(tid)
+                    .and_modify(|f| *f = (*f).min(decode_time))
+                    .or_insert(decode_time);
             }
+        }
+        for t in tracks.iter_mut() {
+            let Some(samples) = per_track.get(&t.track_id) else {
+                continue;
+            };
+            let samples = sane_durations(samples, t.timescale);
+            t.samples = samples.len() as u64;
+            t.bytes = samples.iter().map(|s| s.size as u64).sum();
+            t.duration = media_duration(&samples);
+            t.first_pts =
+                firsts.get(&t.track_id).copied().unwrap_or(0) as f64 / t.timescale.max(1) as f64;
+            let mut durations: HashMap<u32, u32> = HashMap::new();
+            for s in &samples {
+                *durations.entry(s.duration).or_default() += 1;
+            }
+            let mode = durations
+                .iter()
+                .max_by_key(|(d, n)| (**n, std::cmp::Reverse(**d)))
+                .map(|(d, _)| *d)
+                .filter(|d| *d > 0);
+            t.nominal_fps = mode.map(|d| t.timescale as f64 / d as f64);
         }
     }
     Ok(MovieInfo {
@@ -539,12 +615,12 @@ fn parse_moof(
     buf: &[u8],
     moof_offset: u64,
     trex: &HashMap<u32, Trex>,
-) -> Result<Vec<(u32, Vec<Sample>)>> {
+) -> Result<Vec<(u32, u64, Vec<Sample>)>> {
     if buf.len() < 8 || &buf[4..8] != b"moof" {
         bail!("not a moof box");
     }
     let kids = children(buf, 8, buf.len())?;
-    let mut out: Vec<(u32, Vec<Sample>)> = vec![];
+    let mut out: Vec<(u32, u64, Vec<Sample>)> = vec![];
     // Base offset for a traf without `base_data_offset`: the end of the
     // previous traf's data (ISO 14496-12 §8.8.7).
     let mut running_base = moof_offset;
@@ -580,6 +656,17 @@ fn parse_moof(
         }
         if tflags & 0x20 != 0 {
             default_flags = Some(be32(tfhd, at)?);
+        }
+        // The fragment's decode time (the track's presentation start in a
+        // fragmented movie).
+        let mut decode_time = 0u64;
+        if let Some(dt) = find(&tk, b"tfdt") {
+            let b = slice(traf, dt);
+            decode_time = if b[8] == 1 {
+                be64(b, 12)?
+            } else {
+                be32(b, 12)? as u64
+            };
         }
         let mut samples: Vec<Sample> = vec![];
         let mut data_end = base;
@@ -630,13 +717,13 @@ fn parse_moof(
                 let cts = if rflags & 0x800 != 0 {
                     let v = be32(trun, p)?;
                     p += 4;
-                    if version == 1 {
-                        v as i32
-                    } else {
-                        // Version 0 composition offsets are unsigned; saturate
-                        // instead of wrapping negative.
-                        v.min(i32::MAX as u32) as i32
-                    }
+                    // qtmux writes a *negative* composition offset (the
+                    // compensation for a retimed audio duration) as two's
+                    // complement even in a version-0 trun, whose offsets the
+                    // spec calls unsigned. Reading it as unsigned saturated it
+                    // to i32::MAX and put the 11th audio packet at 44739 s.
+                    let _ = version;
+                    v as i32
                 } else {
                     0
                 };
@@ -652,10 +739,10 @@ fn parse_moof(
             data_end = offset;
         }
         running_base = data_end;
-        if let Some((_, list)) = out.iter_mut().find(|(id, _)| *id == track_id) {
+        if let Some((_, _, list)) = out.iter_mut().find(|(id, _, _)| *id == track_id) {
             list.extend(samples);
         } else {
-            out.push((track_id, samples));
+            out.push((track_id, decode_time, samples));
         }
     }
     Ok(out)
@@ -687,6 +774,50 @@ struct Tables {
     chunks: Vec<Chunk>,
     /// True when an offset does not fit 32 bits (`co64`).
     co64: bool,
+}
+
+/// Repair a fragment's sample durations.
+///
+/// qtmux re-times audio buffers whose duration it considers wrong
+/// (`max-raw-audio-drift`): a real PipeWire mic delivers 1024/2048-frame
+/// buffers, and the truns then contain duration 0 or a negative duration
+/// written as a huge `u32` (the demuxer's fragmented timeline even jumps back
+/// inside a fragment). Copying those into a regular `stts` produced a track
+/// whose 11th packet was at 44739 s, so a finalised mic track decoded 0.2 s of
+/// a 4 s recording. When any duration is implausible, rebuild a uniform
+/// timeline from the most common plausible one.
+fn sane_durations(samples: &[Sample], timescale: u32) -> Vec<Sample> {
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for s in samples
+        .iter()
+        .filter(|s| s.duration > 0 && s.duration <= timescale)
+    {
+        *counts.entry(s.duration).or_default() += 1;
+    }
+    let mode = counts
+        .iter()
+        .max_by_key(|(d, n)| (**n, std::cmp::Reverse(**d)))
+        .map(|(d, _)| *d)
+        .unwrap_or(0);
+    if mode == 0 {
+        return samples.to_vec();
+    }
+    let irregular = samples
+        .iter()
+        .any(|s| s.duration == 0 || s.duration > timescale);
+    if !irregular {
+        return samples.to_vec();
+    }
+    // The composition offsets were compensating the retimed durations; with a
+    // uniform decode timeline they would double-count, so drop them.
+    samples
+        .iter()
+        .map(|s| Sample {
+            duration: mode,
+            cts: 0,
+            ..*s
+        })
+        .collect()
 }
 
 fn build_tables(samples: &[Sample]) -> Tables {
@@ -1097,7 +1228,7 @@ pub fn finalize(
     if defragmented {
         for b in boxes.iter().filter(|b| b.kind == MOOF) {
             let buf = read_at(&mut file, b.start, b.size)?;
-            for (id, samples) in parse_moof(&buf, b.start, &init.trex)? {
+            for (id, _decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
                 per_track.entry(id).or_default().extend(samples);
             }
         }
@@ -1112,10 +1243,11 @@ pub fn finalize(
         let samples = per_track.get(&t.info.track_id);
         let media_duration = match samples {
             Some(samples) => {
+                let samples = sane_durations(samples, t.info.timescale);
                 total_samples += samples.len() as u64;
-                let tables = build_tables(samples);
+                let tables = build_tables(&samples);
                 plan.tables = Some((tables, samples.len() as u32));
-                Some(media_duration(samples))
+                Some(media_duration(&samples))
             }
             // A regular movie keeps its tables; a track with no fragments at
             // all keeps its (empty) init stbl.
@@ -1191,8 +1323,12 @@ pub fn finalize(
         .filter(|b| b.kind == MOOF || b.kind == *b"mfra")
         .copied()
         .collect();
+    // A crash in the middle leaves the first fragments (the first video one
+    // among them) and the init moov, so the file still plays up to there;
+    // flipping from the front could remove every video fragment.
     if crash_at == CrashAt::MidFlip {
-        flips.truncate(flips.len() / 2);
+        let keep = flips.len() / 2;
+        flips.drain(..keep);
     }
     for b in &flips {
         f.seek(SeekFrom::Start(b.start + 4))?;

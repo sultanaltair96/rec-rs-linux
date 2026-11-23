@@ -63,9 +63,9 @@ pub struct RecordArgs {
     /// Do not record system audio.
     #[arg(long)]
     pub no_system_audio: bool,
-    /// Microphone: an optional unique ID or name substring; no value or
-    /// `default` means the system default mic.
-    #[arg(long, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
+    /// Microphone: `default`, a unique ID or a name substring (default: the
+    /// system default mic).
+    #[arg(long, value_name = "DEVICE")]
     pub mic: Option<String>,
     /// Display name of the --mic device, used to find it again when its unique
     /// ID changed.
@@ -148,13 +148,15 @@ pub struct RecordArgs {
     /// Do not write a recording file (replay buffer / streaming only).
     #[arg(long)]
     pub no_record: bool,
-    /// Live encode (replay and streams) size.
+    /// Live encode bounding size: the frame keeps its shape and is never
+    /// above the capture.
     #[arg(long, default_value = "1080p")]
     pub live_resolution: String,
     /// Live video bitrate in kb/s. Default: the platform's recommendation for
-    /// the size and frame rate (YouTube 4K60 45 Mb/s H.264 or 35 HEVC, Twitch
-    /// at most 6 Mb/s, Kick at most 8). With several destinations, the lowest
-    /// of them.
+    /// the size and frame rate (YouTube 2160p60 45 Mb/s H.264 or 35 HEVC
+    /// (2160p30 35/25, 1440p 24/16, 1080p 12/10); Twitch at most 6 Mb/s and
+    /// 1080p; Kick at most 8 Mb/s and 1080p; others like YouTube). With
+    /// several destinations, the lowest bitrate and size among them.
     #[arg(long)]
     pub stream_bitrate: Option<u32>,
     /// Live video codec: auto (HEVC when every destination is YouTube), h264
@@ -162,7 +164,7 @@ pub struct RecordArgs {
     /// that refuse it).
     #[arg(long, default_value = "auto", value_parser = ["auto", "h264", "hevc"])]
     pub stream_codec: String,
-    /// Live keyframe interval in seconds.
+    /// Live keyframe interval in seconds (0.5–4).
     #[arg(long, default_value_t = 2.0)]
     pub keyframe: f64,
     /// Variable bitrate for the live encode (default: constant).
@@ -309,21 +311,16 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
     }
     let mic_backend = MicBackend::parse(&a.mic_backend)?;
     // A missing mic falls back to the default; audio never blocks a session.
-    // `--mic` alone (an empty value) and `--mic default` both mean the system
-    // default mic, which warns instead of failing when it is unavailable. Only
-    // a named device is an explicit request.
-    let mic_explicit = a
-        .mic
-        .as_deref()
-        .is_some_and(|m| !m.is_empty() && m != "default")
-        || a.mic_name.is_some();
+    // `--mic default` means the system default mic, which warns instead of
+    // failing when it is unavailable; a named device is an explicit request.
+    let mic_explicit = a.mic.as_deref().is_some_and(|m| m != "default") || a.mic_name.is_some();
     let mic = if a.no_mic {
         None
     } else {
         Some(
             a.mic
                 .as_deref()
-                .filter(|m| !m.is_empty() && *m != "default")
+                .filter(|m| *m != "default")
                 .map(str::to_string),
         )
     };
@@ -481,18 +478,12 @@ mod tests {
     use super::*;
 
     /// Ported from rec-rs src/main.rs `goal_command_line_parses` (MIT OR
-    /// Apache-2.0): upstream's `--mic` takes an optional device, and `--mic`
-    /// alone means the default microphone.
+    /// Apache-2.0): upstream's `--mic` requires a device, and `default` means
+    /// the system default microphone.
     #[test]
-    fn the_mic_device_is_optional() {
-        let a = crate::parse_record_args(&["--test-pattern", "--mic"]).unwrap();
-        assert_eq!(a.mic.as_deref(), Some(""));
-        let o = prepare(a).unwrap();
-        assert_eq!(o.mic, Some(None), "an empty device means the default mic");
-        assert!(
-            !o.mic_explicit,
-            "the default mic warns when it is unavailable instead of failing"
-        );
+    fn the_mic_device_is_required() {
+        // `--mic` alone is a clap error, as it is upstream (no `num_args`).
+        assert!(crate::parse_record_args(&["--test-pattern", "--mic"]).is_err());
 
         let a = crate::parse_record_args(&["--test-pattern", "--mic", "default"]).unwrap();
         assert_eq!(a.mic.as_deref(), Some("default"));
