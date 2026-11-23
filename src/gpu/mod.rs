@@ -114,6 +114,7 @@
 
 mod decor;
 mod device;
+pub mod dmabuf;
 mod readback;
 mod uniforms;
 #[cfg(test)]

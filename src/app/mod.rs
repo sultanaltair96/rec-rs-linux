@@ -1559,8 +1559,10 @@ impl App {
                 self.st.preview_frame = None;
                 self.st.frames_shown += 1;
                 if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
+                    // "preview frame" is what the self-test (and the audit)
+                    // greps for; the texture path says where it came from.
                     eprintln!(
-                        "rec: debug: preview texture {}x{} at {:.3}s",
+                        "rec: debug: preview frame {}x{} at {:.3}s (the compositor's texture)",
                         tex.width, tex.height, tex.pts
                     );
                 }
