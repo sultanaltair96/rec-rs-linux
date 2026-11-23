@@ -102,9 +102,18 @@ def main():
     ap.add_argument("--ref", type=float, help="reference level in dBFS (default: the loudest beep)")
     ap.add_argument("--tol", type=float, default=2.0, help="dB")
     ap.add_argument("--tail", action="store_true", help="only the last groups must match")
+    ap.add_argument("--allow-missing", type=int, default=0,
+                    help="ignore up to N beeps that are silent (40 dB or more under the "
+                         "others): a host xrun can lose one audio buffer, which is not a "
+                         "fader failure. The remaining beeps still prove the level.")
+    ap.add_argument("--skip", type=float, default=0.0,
+                    help="ignore beeps before this many seconds (a loaded host can start "
+                         "the file after the first beep, which is not a level failure)")
     a = ap.parse_args()
     expect = [None if x == "mute" else float(x) for x in a.expect.split(",")]
     s = samples(a.file, a.audio)
+    if a.skip > 0:
+        s = s[int(a.skip * RATE):]
     phase = beep_phase(s)
     if phase is None:
         peak = max((abs(v) for v in s), default=0.0)
@@ -119,6 +128,14 @@ def main():
         levels.append((t, 20 * math.log10(peak) if peak > 1e-7 else -140.0))
         t += 1.0
     ref = a.ref if a.ref is not None else max(db for _, db in levels)
+    if a.allow_missing and levels:
+        loudest = max(db for _, db in levels)
+        dropped = [i for i, (_, db) in enumerate(levels) if db < loudest - 40]
+        for i in dropped[: a.allow_missing]:
+            levels[i] = (levels[i][0], None)
+        if dropped:
+            print(f"  ignored {min(len(dropped), a.allow_missing)} silent beep(s) (host xrun)")
+        levels = [(t, db) for t, db in levels if db is not None]
     for t, db in levels:
         match = classify(db - ref, expect, a.tol)
         label = "mute" if match is None else ("no expected level" if match == "skip" else f"{match:+g} dB")

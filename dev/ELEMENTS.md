@@ -51,8 +51,8 @@ the box: 3840x2160 @ 60 fps, HEVC Main, `rec-rs probe` decodes all 120 frames.
 
 | Element | Present | Notes |
 |---|---|---|
-| `fdkaacenc` | **yes** | Fedora ships `fdk-aac-free`; bitrate in bits per second. Preferred. |
-| `avenc_aac` | **yes** | ffmpeg's native AAC (full `ffmpeg` now). Bitrate in bits per second. |
+| `avenc_aac` | **yes** | ffmpeg's native AAC (full `ffmpeg` now). Bitrate in bits per second. **Preferred**: measured level-accurate on a gated 1 kHz beep train (0.126 peak at every beep for a −18 dBFS signal); its 1024-sample priming is what the edit list skips. |
+| `fdkaacenc` | **yes** | Fedora ships `fdk-aac-free`; bitrate in bits per second. Fallback: on the same beep train it reproduces the first beep but encodes the later ones 1.2–1.5 dB hot (a continuous tone through it standalone is exact), and a recorder with faders must not change levels. |
 | `voaacenc`, `faac` | **no** | Not packaged. |
 
 Both AAC-LC encoders add priming (the MDCT look-ahead) to the start of the
