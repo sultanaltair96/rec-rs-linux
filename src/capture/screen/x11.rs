@@ -401,6 +401,146 @@ impl Server {
             },
         ))
     }
+
+    /// The desktop's background colour: the root window's background pixel,
+    /// interpreted with the root visual's masks.
+    /// The visible parts of `excluded` inside `area` (root coordinates).
+    pub fn excluded_pieces(&self, excluded: &[u32], area: Rect) -> Vec<Rect> {
+        if excluded.is_empty() {
+            return vec![];
+        }
+        let stack = self.stacking_order();
+        let mut out = vec![];
+        for &id in excluded {
+            let Ok(cookie) = self.conn.get_window_attributes(id) else {
+                continue;
+            };
+            let Ok(attrs) = cookie.reply() else {
+                continue;
+            };
+            // Iconified or withdrawn: nothing of it is in the picture.
+            if attrs.map_state != MapState::VIEWABLE {
+                continue;
+            }
+            let Some(rect) = self.window_rect(id) else {
+                continue;
+            };
+            let Some(inside) = intersect(rect, area) else {
+                continue;
+            };
+            // The parts of it that a window stacked above still covers are not
+            // ours to paint out: they are that window's pixels.
+            let mut pieces = vec![inside];
+            let at = stack.iter().position(|w| *w == id).unwrap_or(stack.len());
+            for above in stack.iter().skip(at + 1) {
+                if let Some(cover) = self.window_rect(*above)
+                    && intersect(cover, inside).is_some()
+                {
+                    pieces = subtract_rects(&pieces, cover);
+                }
+            }
+            out.extend(pieces);
+        }
+        out
+    }
+
+    /// The window list in bottom-to-top stacking order.
+    fn stacking_order(&self) -> Vec<Window> {
+        self.window_list("_NET_CLIENT_LIST_STACKING")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                self.conn
+                    .query_tree(self.root)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| r.children)
+                    .unwrap_or_default()
+            })
+    }
+
+    /// A window's rectangle in root coordinates, including its window-manager
+    /// decorations (`_NET_FRAME_EXTENTS`), so an excluded window leaves no
+    /// title bar behind.
+    fn window_rect(&self, id: Window) -> Option<Rect> {
+        let geometry = self.conn.get_geometry(id).ok()?.reply().ok()?;
+        let (x, y) = self.window_origin(id);
+        let (left, right, top, bottom) = self.frame_extents(id);
+        let x0 = x as i64 - left as i64;
+        let y0 = y as i64 - top as i64;
+        Some(Rect::new(
+            x0.max(0) as usize,
+            y0.max(0) as usize,
+            geometry.width as usize + left as usize + right as usize,
+            geometry.height as usize + top as usize + bottom as usize,
+        ))
+    }
+
+    /// `_NET_FRAME_EXTENTS`: left, right, top, bottom. Zero without a window
+    /// manager (Xvfb, a bare session).
+    fn frame_extents(&self, id: Window) -> (u32, u32, u32, u32) {
+        let Some(value) = self.property(id, "_NET_FRAME_EXTENTS", 32) else {
+            return (0, 0, 0, 0);
+        };
+        if value.len() < 16 {
+            return (0, 0, 0, 0);
+        }
+        let at = |i: usize| {
+            u32::from_ne_bytes([
+                value[i * 4],
+                value[i * 4 + 1],
+                value[i * 4 + 2],
+                value[i * 4 + 3],
+            ])
+        };
+        (at(0), at(1), at(2), at(3))
+    }
+}
+
+/// `rects` minus `cut`: the parts of each rectangle that `cut` does not cover.
+///
+/// Axis-aligned subtraction, up to four pieces per rectangle. This is what
+/// turns "our window's rectangle" into "the parts of our window that are not
+/// hidden behind a window stacked above it".
+pub fn subtract_rects(rects: &[Rect], cut: Rect) -> Vec<Rect> {
+    let mut out = Vec::with_capacity(rects.len() + 3);
+    for r in rects {
+        let Some(overlap) = intersect(*r, cut) else {
+            out.push(*r);
+            continue;
+        };
+        let (r_right, r_bottom) = (r.x + r.width, r.y + r.height);
+        let (o_right, o_bottom) = (overlap.x + overlap.width, overlap.y + overlap.height);
+        // Above and below the cut, full width.
+        if overlap.y > r.y {
+            out.push(Rect::new(r.x, r.y, r.width, overlap.y - r.y));
+        }
+        if o_bottom < r_bottom {
+            out.push(Rect::new(r.x, o_bottom, r.width, r_bottom - o_bottom));
+        }
+        // Left and right of the cut, only in the band the cut covers.
+        if overlap.x > r.x {
+            out.push(Rect::new(r.x, overlap.y, overlap.x - r.x, overlap.height));
+        }
+        if o_right < r_right {
+            out.push(Rect::new(
+                o_right,
+                overlap.y,
+                r_right - o_right,
+                overlap.height,
+            ));
+        }
+    }
+    out.retain(|r| r.width > 0 && r.height > 0);
+    out
+}
+
+/// The overlapping part of two rectangles, if they overlap at all.
+pub fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 /// What to capture, resolved before the first frame.
@@ -604,6 +744,24 @@ fn run(
     let mut cursor = None;
     let mut cursor_fetched = Instant::now();
     let mut last = Instant::now();
+    // The recorder's own windows (the app's preview), read once: a capture that
+    // starts with them listed paints them out of every frame.
+    let excluded = super::excluded_windows();
+    // The captured area in root coordinates, where the exclusion rectangles
+    // are computed.
+    let area_root = Rect::new(
+        spec.origin.0.max(0) as usize,
+        spec.origin.1.max(0) as usize,
+        spec.rect.width,
+        spec.rect.height,
+    );
+    if !excluded.is_empty() {
+        eprintln!(
+            "rec: note: leaving {} of rec's own windows out of the capture (their area is \
+             filled with the desktop colour around them)",
+            excluded.len()
+        );
+    }
     // Where the pointer was when the last frame was made: a cursor that moves
     // over an otherwise static screen is a new frame, because the cursor is
     // part of the picture we produce.
@@ -662,6 +820,29 @@ fn run(
         }
         if changed {
             let mut data = data;
+            if !excluded.is_empty() {
+                let stride = spec.rect.width * 4;
+                for piece in server.excluded_pieces(&excluded, area_root) {
+                    let local = Rect::new(
+                        piece.x - area_root.x,
+                        piece.y - area_root.y,
+                        piece.width,
+                        piece.height,
+                    );
+                    // What is really behind a mapped window cannot be read
+                    // back, so stand in with the desktop colour around it.
+                    let colour =
+                        ring_colour(&data, stride, spec.rect.width, spec.rect.height, local);
+                    fill_rect(
+                        &mut data,
+                        stride,
+                        spec.rect.width,
+                        spec.rect.height,
+                        local,
+                        colour,
+                    );
+                }
+            }
             if opts.cursor || opts.clicks {
                 let (px, py) = pointer.map(|(x, y, _)| (x, y)).unwrap_or((0, 0));
                 // XFixes hands over the whole bitmap on every call, so fetch it
@@ -724,6 +905,88 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// A colour standing in for what is behind an excluded window: the median of
+/// the desktop pixels in a thin ring just outside it, from the same frame.
+///
+/// The pixels actually *under* a mapped window cannot be read back (the server
+/// has already composited over them, and a compositor's targets are not ours),
+/// so this is the closest honest approximation: on a plain desktop it is exactly
+/// the background, on a wallpaper it is the wallpaper's colour beside the
+/// window. The ring is empty when the window fills the frame; then the fill is
+/// black.
+fn ring_colour(data: &[u8], stride: usize, width: usize, height: usize, rect: Rect) -> [u8; 4] {
+    const BAND: usize = 4;
+    let (mut r, mut g, mut b) = (Vec::new(), Vec::new(), Vec::new());
+    let mut push = |x: usize, y: usize| {
+        if x >= width || y >= height {
+            return;
+        }
+        let at = y * stride + x * 4;
+        if at + 4 > data.len() {
+            return;
+        }
+        b.push(data[at]);
+        g.push(data[at + 1]);
+        r.push(data[at + 2]);
+    };
+    let (x0, y0) = (rect.x, rect.y);
+    let (x1, y1) = (
+        (rect.x + rect.width).min(width),
+        (rect.y + rect.height).min(height),
+    );
+    // Every other pixel of each band: enough for a median, cheap at 4K.
+    for step in 1..=BAND {
+        let top = y0.checked_sub(step);
+        let bottom = y1 + step - 1;
+        for x in (x0..x1).step_by(2) {
+            if let Some(y) = top {
+                push(x, y);
+            }
+            push(x, bottom);
+        }
+        let left = x0.checked_sub(step);
+        let right = x1 + step - 1;
+        for y in (y0..y1).step_by(2) {
+            if let Some(x) = left {
+                push(x, y);
+            }
+            push(right, y);
+        }
+    }
+    let median = |v: &mut Vec<u8>| -> u8 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    [median(&mut b), median(&mut g), median(&mut r), 0]
+}
+
+/// Fill `rect` of a packed BGRA frame with one colour, clipped to the frame.
+fn fill_rect(
+    data: &mut [u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    rect: Rect,
+    colour: [u8; 4],
+) {
+    let x0 = rect.x.min(width);
+    let y0 = rect.y.min(height);
+    let x1 = (rect.x + rect.width).min(width);
+    let y1 = (rect.y + rect.height).min(height);
+    for y in y0..y1 {
+        let row = y * stride;
+        for x in x0..x1 {
+            let at = row + x * 4;
+            if at + 4 <= data.len() {
+                data[at..at + 4].copy_from_slice(&colour);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -894,6 +1157,161 @@ mod tests {
     fn green_of(frame: &VideoFrame, x: usize, y: usize) -> u8 {
         let p = &frame.planes[0];
         p.data[y * p.stride + x * 4 + 1]
+    }
+
+    #[test]
+    fn subtracting_a_rectangle_covers_the_possible_shapes() {
+        let a = Rect::new(10, 10, 100, 100);
+        // Nothing overlaps: unchanged.
+        assert_eq!(subtract_rects(&[a], Rect::new(200, 200, 10, 10)), vec![a]);
+        // Fully covered: gone.
+        assert!(subtract_rects(&[a], Rect::new(0, 0, 500, 500)).is_empty());
+        // A corner cut: the three remaining pieces, each disjoint from the cut.
+        let cut = Rect::new(10, 10, 40, 40);
+        let pieces = subtract_rects(&[a], cut);
+        assert!(!pieces.is_empty());
+        let area = |r: &[Rect]| r.iter().map(|r| r.width * r.height).sum::<usize>();
+        assert_eq!(area(&pieces), 100 * 100 - 40 * 40);
+        for p in &pieces {
+            assert_eq!(
+                intersect(*p, cut),
+                None,
+                "piece {p:?} still overlaps the cut"
+            );
+            // And every piece is inside the original.
+            assert!(p.x >= a.x && p.y >= a.y);
+            assert!(p.x + p.width <= a.x + a.width);
+            assert!(p.y + p.height <= a.y + a.height);
+        }
+        // A band across the middle leaves two pieces.
+        let pieces = subtract_rects(&[a], Rect::new(0, 50, 200, 20));
+        assert_eq!(area(&pieces), 100 * 100 - 100 * 20);
+        // Several cuts in a row are just repeated subtraction.
+        let pieces = subtract_rects(
+            &subtract_rects(&[a], Rect::new(10, 10, 50, 50)),
+            Rect::new(80, 80, 20, 20),
+        );
+        assert_eq!(area(&pieces), 100 * 100 - 50 * 50 - 20 * 20);
+    }
+
+    fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+        let x0 = a.x.max(b.x);
+        let y0 = a.y.max(b.y);
+        let x1 = (a.x + a.width).min(b.x + b.width);
+        let y1 = (a.y + a.height).min(b.y + b.height);
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    #[test]
+    fn excluded_windows_are_painted_out_of_the_frame() {
+        let Some(server) = live_server() else {
+            return;
+        };
+        // The desktop's background is a colour we choose, so the fill can be
+        // checked exactly instead of "not red". The fill is the desktop colour
+        // around the window, which on a plain desktop is exactly this.
+        let background = [0x56u8, 0x34, 0x12, 0]; // BGRA of 0x00123456
+        server
+            .conn
+            .change_window_attributes(
+                server.root,
+                &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                    .background_pixel(0x00123456),
+            )
+            .unwrap();
+        server
+            .conn
+            .clear_area(true, server.root, 0, 0, 0, 0)
+            .unwrap();
+        server.conn.flush().unwrap();
+
+        // Our window (red by construction) with a blue window stacked on top of
+        // its right half: only the uncovered part may be painted out.
+        let _lock = super::super::EXCLUSION_TEST_LOCK.lock().unwrap();
+        let ours = TestWindow::open(server, "exclude-own", 200, 500, 200, 100);
+        let above = TestWindow::open(live_server().unwrap(), "exclude-above", 320, 520, 120, 60);
+        fill(&above, 0, 0, 120, 60, 0x000000ff);
+        let _guard = ExcludedGuard::set(vec![ours.win]);
+
+        let (mut source, frames) = capture_display(
+            &ours.server,
+            CaptureOptions {
+                cursor: false,
+                clicks: false,
+            },
+        );
+        let f = last_frame(&mut source, frames);
+        // Inside our window and not covered: the desktop background, not red.
+        assert_eq!(
+            pixel(&f, 250, 550),
+            background,
+            "our window was not painted out"
+        );
+        // The part covered by a window above ours keeps that window's pixels.
+        assert_eq!(
+            red_of(&f, 380, 550),
+            0,
+            "the window above was painted out too"
+        );
+        let blue = pixel(&f, 380, 550);
+        assert_eq!(
+            blue[0], 255,
+            "the window above ours should still be blue: {blue:?}"
+        );
+        // The rest of the desktop is untouched.
+        assert_eq!(pixel(&f, 1100, 700), background);
+
+        // Without the exclusion the same capture contains our window again.
+        drop(_guard);
+        let (mut source, frames) = capture_display(
+            &ours.server,
+            CaptureOptions {
+                cursor: false,
+                clicks: false,
+            },
+        );
+        let f = last_frame(&mut source, frames);
+        assert_eq!(red_of(&f, 250, 550), 255, "the window should be back");
+    }
+
+    /// Clears the exclusion list however the test ends.
+    struct ExcludedGuard;
+
+    impl ExcludedGuard {
+        fn set(ids: Vec<u32>) -> ExcludedGuard {
+            super::super::set_excluded_windows(ids);
+            ExcludedGuard
+        }
+    }
+
+    impl Drop for ExcludedGuard {
+        fn drop(&mut self) {
+            super::super::set_excluded_windows(vec![]);
+        }
+    }
+
+    /// Capture display 1 until a frame arrives, then stop.
+    fn capture_display(
+        server: &Server,
+        opts: CaptureOptions,
+    ) -> (Source, Arc<Mutex<Vec<VideoFrame>>>) {
+        let (spec, _) = resolve_display(server, 1, None).unwrap();
+        let mut source = Source::new(spec, opts);
+        let (sink, frames) = collector();
+        VideoSource::start(&mut source, sink).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        VideoSource::stop(&mut source).unwrap();
+        (source, frames)
+    }
+
+    fn last_frame(_source: &mut Source, frames: Arc<Mutex<Vec<VideoFrame>>>) -> VideoFrame {
+        frames.lock().unwrap().last().expect("a frame").clone()
+    }
+
+    fn pixel(frame: &VideoFrame, x: usize, y: usize) -> [u8; 4] {
+        let p = &frame.planes[0];
+        let at = y * p.stride + x * 4;
+        [p.data[at], p.data[at + 1], p.data[at + 2], p.data[at + 3]]
     }
 
     #[test]
