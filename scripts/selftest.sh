@@ -334,7 +334,10 @@ if wanted stream-whip; then
     status=0
     scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
     if [ "$status" -eq 0 ] && [ -s "$OUT/stream-whip.log" ]; then
-        echo "PASS  stream-whip  ($(grep -m1 '^PASS  whip-sync' "$OUT/stream-whip.log" | sed 's/^PASS  whip-sync  (//; s/)$//'))"
+        # Five sessions in a row, every mean within ±15 ms.
+        offs=$(grep -h '^PASS  whip-run' "$OUT/stream-whip.log" \
+               | sed 's/^PASS  whip-run-[0-9]*  (A\/V offset mean //; s/ ms)$//' | paste -sd ' ' -)
+        echo "PASS  stream-whip  (5 sessions, A/V offsets: $offs ms)"
         pass=$((pass+1))
     elif [ "$status" -eq 3 ]; then
         echo "SKIP  stream-whip  (MediaMTX could not be downloaded)"; skip=$((skip+1))
