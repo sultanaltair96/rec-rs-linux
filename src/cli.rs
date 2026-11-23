@@ -63,9 +63,9 @@ pub struct RecordArgs {
     /// Do not record system audio.
     #[arg(long)]
     pub no_system_audio: bool,
-    /// Microphone: `default`, a unique ID or a name substring (default: the
-    /// system default mic).
-    #[arg(long, value_name = "DEVICE")]
+    /// Microphone: an optional unique ID or name substring; no value or
+    /// `default` means the system default mic.
+    #[arg(long, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
     pub mic: Option<String>,
     /// Display name of the --mic device, used to find it again when its unique
     /// ID changed.
@@ -309,14 +309,21 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
     }
     let mic_backend = MicBackend::parse(&a.mic_backend)?;
     // A missing mic falls back to the default; audio never blocks a session.
-    let mic_explicit = a.mic.is_some() || a.mic_name.is_some();
+    // `--mic` alone (an empty value) and `--mic default` both mean the system
+    // default mic, which warns instead of failing when it is unavailable. Only
+    // a named device is an explicit request.
+    let mic_explicit = a
+        .mic
+        .as_deref()
+        .is_some_and(|m| !m.is_empty() && m != "default")
+        || a.mic_name.is_some();
     let mic = if a.no_mic {
         None
     } else {
         Some(
             a.mic
                 .as_deref()
-                .filter(|m| *m != "default")
+                .filter(|m| !m.is_empty() && *m != "default")
                 .map(str::to_string),
         )
     };
@@ -467,4 +474,38 @@ pub fn prepare(a: RecordArgs) -> Result<Options> {
             .collect::<Result<Vec<_>>>()?,
     };
     Ok(opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ported from rec-rs src/main.rs `goal_command_line_parses` (MIT OR
+    /// Apache-2.0): upstream's `--mic` takes an optional device, and `--mic`
+    /// alone means the default microphone.
+    #[test]
+    fn the_mic_device_is_optional() {
+        let a = crate::parse_record_args(&["--test-pattern", "--mic"]).unwrap();
+        assert_eq!(a.mic.as_deref(), Some(""));
+        let o = prepare(a).unwrap();
+        assert_eq!(o.mic, Some(None), "an empty device means the default mic");
+        assert!(
+            !o.mic_explicit,
+            "the default mic warns when it is unavailable instead of failing"
+        );
+
+        let a = crate::parse_record_args(&["--test-pattern", "--mic", "default"]).unwrap();
+        assert_eq!(a.mic.as_deref(), Some("default"));
+        let o = prepare(a).unwrap();
+        assert_eq!(o.mic, Some(None));
+        assert!(!o.mic_explicit);
+
+        let a = crate::parse_record_args(&["--test-pattern", "--mic", "Rec-Test"]).unwrap();
+        let o = prepare(a).unwrap();
+        assert_eq!(o.mic, Some(Some("Rec-Test".to_string())));
+        assert!(o.mic_explicit, "a named device fails when it is missing");
+
+        // `--no-mic` still conflicts with any `--mic`, value or not.
+        assert!(crate::parse_record_args(&["--test-pattern", "--no-mic", "--mic"]).is_err());
+    }
 }
