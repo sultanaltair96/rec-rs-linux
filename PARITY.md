@@ -46,22 +46,22 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | `stop` / `pause` / `resume` | pidfile + SIGUSR1/SIGUSR2/SIGTERM | pidfile in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`), SIGINT to stop | 0 | done | unit `record::tests::pidfile_lives_in_the_runtime_dir`, `no_recorder_means_a_clear_error`; selftest `pause-resume` runs `pause`/`resume`; `stop` demo in the phase report |
 | `save-replay` | SIGINFO writes the buffer to MP4 | `SIGRTMIN+1` (no SIGINFO on Linux); buffer is 1D | 0 (signal), 1D (buffer) | partial | unit `record::tests::save_replay_signal_is_a_real_time_signal` |
 | `stream-key DEST [--delete]` | Keychain | Secret Service (`secret-service` crate), `REC_STREAM_KEY` meanwhile | 1D | todo | the command fails with phase 1D and names the env override |
-| `gui [--start-recording] [--settings] [--window ID]` | The app | egui/wgpu app | 1E | todo | command exists and fails with phase 1E |
+| `gui [--start-recording] [--settings] [--window ID]` | The app | egui 0.36 on wgpu 30, winit 0.30; a hidden `--test-pattern` for self-tests | 1E | done | unit `app::ui_tests::*` (11 cases); selftest `gui`: the real window records under headless sway and shows preview frames, a second launch hands over, `pause`/`resume`/`stop` reach it, SIGTERM finalizes |
 
 ## Main window and app behaviour
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Live preview of what will be recorded | Rendered at preview size, composited | Same preview from the composited frames | 1E (with 1C) | todo | — |
-| Own windows excluded from capture | ScreenCaptureKit filter | Not possible through the portal: the compositor owns the stream and a portal client cannot name windows to exclude. On X11 the recorder is an ordinary client, so its own windows are captured like any other | 1A | n-a | documented in the phase 1A notes; the app (1E) should hide its own preview windows while recording, as upstream does by excluding them |
+| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) becomes an egui texture at the preview's pixel size, sampled in one pass on the CPU; 1C's compositor `Renderer::texture()` on the shared wgpu device replaces that copy in phase 2, and the `record::Options::preview` tap moves to the composited frame in 1G/2 | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
+| Own windows excluded from capture | ScreenCaptureKit filter | Not possible through the portal: the compositor owns the stream and a portal client cannot name windows to exclude. On X11 the recorder is an ordinary client, so its own windows are captured like any other | 1A | n-a | documented in the phase 1A notes; the app cannot exclude its window either, so on X11 a visible Rec window is in the picture (hide it with Ctrl+W); the tray keeps the recording running |
 | Preview low-power mode (half res, 15 fps) | Setting | Same setting, honoured by the preview | 1E | todo | — |
 | Scene: Screen | Full display or window | Same, scaled to the output with Lanczos | 1C (composite), 1A (capture) | partial | unit `gpu::tests::a_screen_at_the_output_size_is_bit_exact`, `a_small_screen_is_not_upscaled`, `lanczos_matches_a_cpu_reference`; golden `screen`, `screen-4k-to-1080` |
-| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, drawn by wgpu | 0 (geometry), 1C (GPU) | done | unit `compose::tests::snapping`, `corners_and_free_positions`; `gpu::tests::renders_overlay_with_border_into_the_frame`, `placement_follows_the_geometry_for_corners_and_free_positions`, `mirroring_flips_the_camera`; goldens `screen-cam-rounded`, `screen-cam-pill` |
-| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU (u8 coverage), drawn by wgpu with the same blending order | 0 (masks), 1C (GPU) | done | unit `compose::tests::shape_coverage`, `pill_has_round_ends`, `shadow_spreads_beyond_the_shape`; `gpu::tests::every_shape_matches_the_mask_geometry`, `the_border_has_the_width_and_colour_of_the_spec`, `the_drop_shadow_falls_off_outside_the_overlay`, `mirroring_flips_the_camera`; goldens `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-squircle-shadow` |
-| Overlay changes live while recording, baked in, no extra encode | Yes | Yes: the compositor runs before the encoder, and the mask/border/shadow texture is cached per size and style so moving it only changes a transform | 1C | done | unit `gpu::tests::renders_overlay_with_border_into_the_frame` (moves it between frames), `gpu::decor::tests::the_key_ignores_the_position_but_not_the_style` |
+| Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, drawn by wgpu; the preview drag uses `compose::overlay_rect`/`snap_corner` and the session seam | 0 (geometry), 1C (GPU), 1E (drag) | done | unit `compose::tests::snapping`, `corners_and_free_positions`; `gpu::tests::renders_overlay_with_border_into_the_frame`, `placement_follows_the_geometry_for_corners_and_free_positions`, `mirroring_flips_the_camera`; goldens `screen-cam-rounded`, `screen-cam-pill`; drag: unit `app::ui_tests::main_window_shows_every_card` |
+| Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU, drawn by wgpu; every control is in the sidebar and the settings window | 0 (masks), 1C (GPU), 1E (controls) | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow`; snapshot `main-window.png` (overlay card) |
+| Overlay changes live while recording, baked in, no extra encode | Yes | The compositor restyles from the next frame; the app sends the spec through the session seam (`set_pip`), which the writer exposes to the session in 1G | 1C (compositor), 1G/1E (session seam) | partial | `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; the seam is unit tested (`app::session::tests::session_ext_names_the_compositor`) |
 | Scene: Camera full frame | AVCapture | V4L2 into a cover-fitted, mirrored full frame | 1B (source), 1C (composite) | partial | unit `gpu::tests::the_camera_scene_covers_the_frame`, `mirroring_flips_the_camera`; golden `cam` |
-| Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app/CLI rule is 1E/1G | 1C/1E | partial | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame` |
-| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2 or portal camera, PipeWire audio | 1A/1B | done | selftest `pattern-screen`, `pattern-mic`, `pattern-system-audio`; unit camera/audio suites; the recorder-side camera wiring is 1G |
+| Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app only offers camera scenes while recording if the session started with the camera (the session seam is 1G) | 1C/1E/1G | partial | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`, `app::ui_tests::main_window_shows_every_card`; `State::can_switch_live` |
+| Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2 or portal camera, PipeWire audio; the sidebar lists them and passes the choice through `settings` | 1A/1B (sources), 1E (UI) | done (sources), partial (the app's lists fill in live) | selftest `pattern-screen`, `pattern-mic`, `pattern-system-audio`; unit camera/audio suites, `app::ui_tests::main_window_shows_every_card` |
 | Record/Stop button and timer | Yes | App | 1E | todo | — |
 | Pause/Resume button | Yes | App (the session API exists) | 1E | todo | session API: selftest `pause-resume` |
 | Audio mixer: meter with peak hold, fader, mute, dB | Yes, after the fader | Same widgets on the same session API | 1E | todo | levels in the status line; unit `mixer::tests::volume_gain` |
@@ -72,23 +72,110 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Stream to YouTube/Twitch/Kick + custom servers, Go Live all-at-once, all-or-nothing | Yes | Same destinations and presets, built-in RTMP/WHIP | 1D | todo | unit `live::tests::shared_preset_fits_every_destination` |
 | Per-destination live status (duration, bitrate, drops, reconnect) and LIVE 2/3 | Yes | Same from the output status | 1D | todo | — |
 | One encode for every destination, within all limits | Yes | Same `shared_preset` logic | 0 (choice), 1D (encode) | partial | unit `shared_preset_fits_every_destination`, `settings::tests::live_encode_fits_every_enabled_destination` |
-| Replay/stream run with or without a recording, survive recording start/stop, gaps bridged | Yes | Same design (live encode independent of the session) | 1D | todo | — |
-| Settings window: folder, container | Yes | Same, persisted as JSON | 0 (model), 1E (window) | partial | unit `settings::tests::json_roundtrip_and_defaults_for_missing_fields`, `prores_forces_mov` |
-| Resolution, frame rate, codec, bitrate settings | Yes | Same settings → record args | 0 | done | unit `settings::tests::record_args_parse_with_the_cli` |
-| Cursor and click settings | Yes | Portal cursor modes | 1A | todo | — |
-| Audio device and track layout settings | Yes | PipeWire devices; `microphones()` (with the default first) feeds the mixer list | 1B (devices), 1E (UI) | partial | unit `audio_levels_do_not_restart_capture`, `capture::audio::tests::mic_matching`; integration `devices` |
-| Camera device + overlay settings | Yes | V4L2 device selection + the same overlay model | 1B (device), 1C (overlay), 1E (UI) | partial | unit `overlay_settings_round_trip_through_the_cli`, `camera::v4l2::tests::device_matching`; real hardware under "Needs a real desktop" |
-| Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model | 1D | todo | unit `settings::tests::live_encode_fits_every_enabled_destination` |
-| Settings persist in Application Support | `~/Library/Application Support/rec-rs/settings.json` | `$XDG_CONFIG_HOME/rec-rs/settings.json` | 0 | done | unit `settings::tests::settings_live_in_the_xdg_config_dir` |
+| Replay/stream run with or without a recording, survive recording start/stop, gaps bridged | Yes | Same design: the live encode is attached to every capture session and keeps the capture alive with the window closed | 1D | todo | the lifecycle is in place: `App::live_wanted`, `sync_preview`, `toggle_stream` |
+| Settings window: folder, container | Yes | Same, persisted as JSON; folder picker via `rfd` on the XDG portal | 0 (model), 1E (window) | done | unit `app::ui_tests::the_settings_window_round_trips_to_settings_json` |
+| Resolution, frame rate, codec, bitrate settings | Yes | Same settings → record args | 0 (model), 1E (window) | done | unit `settings::tests::record_args_parse_with_the_cli`, snapshot `settings-window.png` |
+| Cursor and click settings | Yes | Portal cursor modes | 1A | todo | the settings UI exists (snapshot `settings-window.png`) |
+| Audio device and track layout settings | Yes | PipeWire devices; `microphones()` (default mic first) feeds the sidebar's list | 1B (devices), 1E (UI) | partial | unit `audio_levels_do_not_restart_capture`, `capture::audio::tests::mic_matching`; snapshot `settings-window.png`; the mixer list is exercised by `app::ui_tests::main_window_shows_every_card` |
+| Camera device + overlay settings | Yes | V4L2/portal camera selection + the same overlay model | 1B (device), 1C (overlay), 1E (UI) | partial | unit `overlay_settings_round_trip_through_the_cli`, `camera::v4l2::tests::device_matching`; snapshot `settings-window.png`; real hardware under the manual list |
+| Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model, locked while a stream runs | 1D (model), 1E (UI) | partial | unit `app::ui_tests::the_live_encode_section_is_locked_while_streaming`, `settings::tests::live_encode_fits_every_enabled_destination` |
+| Settings persist in Application Support | `~/Library/Application Support/rec-rs/settings.json` | `$XDG_CONFIG_HOME/rec-rs/settings.json` | 0 | done | unit `settings::tests::settings_live_in_the_xdg_config_dir`, `app::ui_tests::the_settings_window_round_trips_to_settings_json` |
+| App menu (Settings ⌘, Hide ⌘H, Quit ⌘Q, Check for Updates, Window menu) | Yes, macOS menu bar | The toolbar's ⋯ menu plus Ctrl+, / Ctrl+W / Ctrl+Q; native window decorations | 1E | done | unit `app::ui_tests::the_app_menu_has_updates_unless_flatpak`; snapshots `main-window.png`, `settings-window.png` |
+| Dock icon and Dock menu | NSStatusItem/Dock | n-a: Linux has no Dock; the tray and the app menu carry the same commands | — | n-a | — |
+| Closing the window keeps the app running and stops the preview | Yes | Tray-resident app: Ctrl+W or the close button hides the window and drops preview frames | 1E | done | unit `app::preview::tests::only_the_newest_frame_is_kept_and_none_while_hidden`; real-desktop check below |
+| Quitting (Dock/menu/logout) finalizes a running recording | Yes | Same: Ctrl+Q, the tray's Quit, SIGTERM and a logout's SIGTERM finalize first | 1E | done | selftest `gui` (SIGTERM mid-recording leaves a probed file and the app exits 0) |
+| Menu bar item with red dot, elapsed time, full menu | NSStatusItem | StatusNotifierItem (`ksni`) with the same menu, an ARGB icon and the title/tooltip | 1E | partial | unit `app::tray::tests::menu_matches_upstream_in_order`, `titles_match_upstream`, `icon_shows_a_red_dot_while_capturing`; visibility per desktop in the manual list below |
+| Global hotkeys ⇧⌘R / ⇧⌘S | Carbon | XDG GlobalShortcuts portal, Ctrl+Shift+R/S defaults, X11 `XGrabKey` fallback, ⇧⌘S only while the replay buffer is on | 1E | partial | unit `hotkey::tests::*` (triggers, backend choice, keycodes, lock masks); the portal/X11 paths need a real desktop (below) |
+| Hotkey conflict reported in the UI | Yes | Same: a refused grab, a declined portal dialog or a missing portal shows "Ctrl+Shift+R unavailable" in the window and the tray | 1E | done | unit `hotkey::tests::registration_results_are_queued_once`, `app::tray::tests::menu_matches_upstream_in_order`; selftest `gui` log shows the unavailable path |
+| Quit or SIGTERM mid-recording finalizes the file | Yes | SIGINT/SIGTERM/SIGHUP stop and finalize | 0 (CLI), 1E (app) | done | selftest `gui`, `pause-resume`; crash test in the phase report |
+| Single instance (a second launch shows the window) | Launch Services | Unix socket in `$XDG_RUNTIME_DIR` (else `/tmp/rec-rs-$UID`); the second launch says what it wants and exits | 1E | done | unit `app::control::tests::the_second_launch_talks_to_the_first`, `a_stale_socket_is_replaced`; selftest `gui` (second launch handed over) |
 | Dock icon, app menu (Settings ⌘,, Hide ⌘H, Quit ⌘Q, Window menu) | Yes | Native window menu + `.desktop` actions | 1E/1F | todo | — |
-| Closing the window keeps the app running and stops the preview | Yes | Tray-resident app | 1E | todo | — |
-| Quitting (Dock/menu/logout) finalizes a running recording | Yes | Same: finalize before exit | 1E | todo | — |
-| Menu bar item with red dot, elapsed time, full menu | NSStatusItem | StatusNotifierItem (`ksni`) with the same menu | 1E | todo | — |
-| Global hotkeys ⇧⌘R / ⇧⌘S | Carbon | XDG GlobalShortcuts portal, Ctrl+Shift+R/S defaults, X11 fallback | 1E | todo | — |
-| Hotkey conflict reported in the UI | Yes | Same: the portal reports the shortcut as taken | 1E | todo | — |
-| Quit or SIGTERM mid-recording finalizes the file | Yes | SIGINT/SIGTERM/SIGHUP stop and finalize | 0 | done | selftest `pause-resume` (stop path), `stop` demo, crash test in the phase report |
 | Re-launch with responsibility disclaimed (macOS permission prompt attribution) | Yes | n-a: Linux has no TCC; the portal attributes the dialog itself | — | n-a | — |
 | "Re-confirm screen recording" prompt | macOS-specific | n-a: the portal's restore token avoids repeated prompts | — | n-a | — |
+| "Check for Updates…" | Sparkle | GitHub Releases for `sultanaltair96/rec-rs-linux`; opens the release page when newer; hidden in Flatpak (Flatpak updates the app) | 1E | done | unit `app::updater::tests::*` (parse, numeric compare, offline), `app::ui_tests::the_app_menu_has_updates_unless_flatpak`; selftest has no network check |
+| Add the AppImage to the desktop menu | Move to Applications | Writes `~/.local/share/applications/rec-rs.desktop` and a scalable icon, atomically | 1E | done | unit `app::install::tests::*` (entry text, quoting, replace, atomic, stale entry) |
+| AppImage/Flatpak self-update | Sparkle replaces the bundle | AppImage: the release check; Flatpak: the software centre | 1E | partial | unit `app::install::tests::spots_flatpak_and_appimage`, `updates_are_flatpak_managed` |
+
+### The 19 upstream app tests on Linux
+
+Upstream's `src/app` carries 19 tests. What happened to each (the pure-logic ones keep their
+assertions; the rest say why not):
+
+| Upstream test | Linux |
+|---|---|
+| widgets: `fader_scale` | ported unchanged |
+| widgets: `fader_follows_the_pointer` | ported unchanged (same synthetic pointer events) |
+| widgets: `fader_scrolls_in_fine_steps` | ported unchanged |
+| widgets: `disabled_fader_ignores_input` | ported unchanged |
+| widgets: `mute_button_toggles` | ported unchanged (the button also gets an accessible label now) |
+| preview: `preview_size_follows_the_area_in_pixels` | ported unchanged; low power halves it |
+| preview: `preview_texture_is_not_srgb` | n-a: there is no Metal texture format to check; the Linux equivalent is `app::preview::tests::frames_are_shown_byte_for_byte_without_a_second_scale` (egui textures are gamma-encoded, values are not converted) |
+| preview: `preview_pixels` (`#[ignore]`, CoreImage/Metal harness) | n-a: replaced by `Tap::image` unit tests (BGRA byte-exact, bilinear resample, NV12/I420 → BT.709 RGB) |
+| mod: `missing_permissions_banner_points_at_its_button` | n-a: Linux has no TCC and no Request Permissions button; replaced by `app::tests::the_preview_banner_names_the_phase` |
+| ui: `levels_as_text_and_typed` | ported unchanged, plus the `-∞`/`off` cases |
+| install: `installs_a_copy_without_quarantine` | n-a: no quarantine flag; replaced by `installs_the_desktop_entry_and_icon` |
+| install: `replaces_an_older_copy` | ported as `replaces_an_older_entry` (the new AppImage's `Exec` replaces the old) |
+| install: `spots_read_only_and_translocated_apps` | n-a: App Translocation is macOS-only; replaced by `spots_flatpak_and_appimage` |
+| install: `plans_by_where_the_download_really_is` | n-a: no move to Applications; replaced by `updates_are_flatpak_managed` |
+| install: `compares_real_paths` | ported as `compares_real_paths` (a symlinked destination folder) |
+| install: `never_leaves_the_destination_missing` | ported as `never_leaves_the_destination_missing` (the desktop entry is replaced by an atomic rename) |
+| install: `stages_apart_from_other_copies` | ported as `staging_is_apart_from_other_copies` |
+| install: `reopens_a_new_instance_with_the_same_options` | n-a: the app never moves itself, so it never reopens; the single-instance handover is covered by `app::control::tests::the_second_launch_talks_to_the_first` and `desktop_entry_starts_this_appimage` |
+| install: `original_of_a_translocated_app` (`#[ignore]`, real macOS bundle) | n-a: no translocated bundle exists on Linux |
+
+New app tests beyond those: `app::theme` (3), `app::preview` (6), `app::control` (4), `app::tray`
+(3), `app::install` (10), `app::updater` (3), `app::linux_desktop` (2), `app::session` (4),
+`app::mod` (4), `app::ui` (3), `hotkey` (5), and the 11 `egui_kittest` UI tests. Those 11 create a wgpu device each; they hold a test-wide
+mutex because concurrent device creation on Mesa's lavapipe crashed the test binary every few runs
+(the whole suite still takes about 3 s).
+
+### Needs a real desktop (manual checks, phase 1E)
+
+Everything in the app table above is exercised headlessly: `cargo test` (unit and `egui_kittest`
+UI tests, wgpu on Mesa's lavapipe) and `scripts/selftest.sh gui`, which starts the real window on
+headless sway, records twice, hands a second launch over, pauses/resumes through the CLI, stops
+once with `rec-rs stop` and once with SIGTERM, and probes both files. What needs a panel, a portal
+and a file manager:
+
+| Check | Desktop | Expected |
+|---|---|---|
+| Tray item appears and shows state | GNOME with the AppIndicator/KStatusNotifierItem extension, KDE Plasma | A grey dot when idle, a red dot plus `mm:ss` while recording, the time frozen when paused, " LIVE" while streaming without a recording; the tooltip repeats it in words (some hosts show no title) |
+| Tray menu acts | Any SNI host | Start/Stop, Pause/Resume, Save Replay (only while the buffer runs), Go Live/Stop Streaming, Show Rec Window, Settings, Reveal Last Recording (only with a recording), Open Recordings Folder, Check for Updates… (absent in Flatpak), Quit |
+| Click the tray item | Any SNI host | Shows (or re-shows) the main window; the preview resumes |
+| Close the window while recording | Any desktop | Recording continues; the tray stays; Show Rec Window brings the window back without a gap in the file |
+| Global hotkeys, Wayland | KDE Plasma, GNOME 45+ (GlobalShortcuts portal) | The first Ctrl+Shift+R shows the desktop's shortcut dialog; accepting toggles recording. Ctrl+Shift+S is bound only while the replay buffer is on, and released when it is switched off |
+| Global hotkeys, X11 | Any X11 session | `XGrabKey`: Ctrl+Shift+R toggles, also with CapsLock or NumLock on; a combination another app owns shows "Ctrl+Shift+R unavailable" in the window and the tray |
+| Reveal Last | Nautilus, Dolphin, Thunar | Opens the folder with the file selected (FileManager1 `ShowItems`); without a FileManager1 implementation it opens the folder |
+| Folder picker | Any portal desktop | Settings › Choose… opens the desktop's folder dialog and the chosen folder persists |
+| Accent colour | Any desktop with the settings portal (KDE, GNOME) | Rec uses the desktop's accent for faders, selection and the switch; Rec blue when the portal does not answer |
+| Preview quality and sync | Real display, 1080p60 | The preview shows the same frame as the recording, stays smooth while recording, and is drawn pixel-aligned (crisp text at 2×) |
+| Logout mid-recording | GNOME/KDE session | Logging out finalizes the file first (SIGTERM → the quit path), and the file plays |
+| Flatpak build | Flatpak sandbox | The tray works without owning a D-Bus name; "Check for Updates…" is absent and the software centre updates the app |
+
+### Window snapshots and the upstream screenshots
+
+`tests/snapshots/main-window.png` (1040×660) and `settings-window.png` (520×820) are rendered by
+`egui_kittest` with wgpu on lavapipe; `UPDATE_SNAPSHOTS=1 cargo test` rewrites them and the tests
+fail on any pixel difference beyond the tolerance. Compared by layout against
+`reference/rec-rs/docs/screenshots/main.png` and `settings.png` (the porting agent could not view
+images, so this is a description of the diff from the code and sizes):
+
+- Same: the 40 pt toolbar strip with "Rec" on the left, the 304 pt inspector sidebar on the right
+  made of letter-spaced icon-headed sections and rounded cards, the 84 pt bottom strip with the
+  round record button, Pause, the monospace timer, two mixer rows (label, mute, meter over fader,
+  dB field), Open Folder/Reveal Last on the right, the centred preview with a 2 px red border while
+  recording, and Inter Regular/Medium/SemiBold.
+- Different: upstream's window is borderless with a hidden title and inset traffic lights; ours
+  keeps native decorations, so the 76 pt traffic-light inset is gone and the title bar is the
+  desktop's.
+- Different: the top-right carries the ⋯ app menu (Settings, Check for Updates, Reveal, Open
+  Folder, Quit) because Linux has no menu bar, plus the "Ctrl+Shift+R unavailable" note when the
+  hotkey failed; upstream uses Dock/menu-bar items.
+- Different: no camera overlay is visible in the main snapshot (the test host has no camera); the
+  overlay card and shape picker are there.
+- Settings: same sections and macOS-style pop-up buttons, sliders and switch; ours adds the
+  "Levels" hint row and the live-encode "up to WxH codec at N Mb/s" line. The snapshot is the light
+  fallback (headless), while a desktop's appearance selects light or dark.
 
 ## Output format guarantees
 
@@ -150,27 +237,27 @@ version that does it).
 | Cursor shown (default) | Yes, embedded by ScreenCaptureKit | Embedded by the compositor (portal) or composited from XFixes (X11) | 1A | done | live test `a_window_is_captured_with_its_own_pixels` (XFixes path); cursor modes chosen from the portal's `AvailableCursorModes` |
 | Click highlight (`--clicks`) | Yes | Ring drawn into the CPU frame; X11 only, because desktop portals do not report mouse buttons | 1A | partial | live test `a_click_draws_a_ring_at_the_pointer` (XTEST); `--clicks` warns on Wayland |
 | One-time screen permission | TCC grant | ScreenCast restore token in `$XDG_STATE_HOME/rec-rs/portal-token`, replayed through `SelectSources` | 1A | done | selftest `screen-token`; unit `token::tests::*` |
-| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes, composited on the GPU | 1C/1E | partial | scene model: unit `tests::scene_option`; rendering: `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; goldens `screen`, `screen-cam-*`, `cam` |
+| Scenes | Three fixed scenes, switchable live, cut only | Same three scenes, composited on the GPU; the picker enforces the camera rule while recording | 1C/1E | partial | scene model: unit `tests::scene_option`; rendering: `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; goldens `screen`, `screen-cam-*`, `cam`; unit `app::ui_tests::main_window_shows_every_card` |
 | Multiple displays/sources at once | No | No (a portal session may hand over several streams; the first is used) | — | n-a | matches upstream |
 | System audio | Yes | PipeWire default sink monitor | 1B | done | selftest `pattern-system-audio` (48 kHz and 44.1 kHz: 5 beeps at −6 dBFS, spacing 1.000 s); integration `system-48k`/`system-44k` |
 | Microphone | Yes | PipeWire `Audio/Source` capture at the device's own rate | 1B | done | selftest `pattern-mic`; integration `mic-default`, `mic-by-name`, `mic-unplug` |
 | Webcam overlay with shapes/border/shadow/mirror, live while recording | Yes | V4L2/portal source (1B) + wgpu compositor (1C); the recorder wires them (1G) | 1B/1C/1G | partial | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; camera source units; goldens `screen-cam-*`; real camera under "Needs a real desktop" |
 | Separate audio tracks | Up to 4 | Mix + 2 stems | 0 (stems), 1C (mix) | partial | selftest: 2 tracks (video + system stem) |
-| Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | partial | selftest `gain`; unit `fader_glides_and_passes_unity_through` |
+| Per-source gain and mute, live | Yes | Same ramp/fader | 0 (maths), 1E (widgets) | done | selftest `gain`; unit `fader_glides_and_passes_unity_through`, `app::ui_tests::the_level_can_be_typed`, `a_muted_channel_greys_its_meter` |
 | Audio filters (noise suppression, compressor) | No (known gap) | No | — | n-a | matches upstream |
 | Hardware H.264/HEVC | VideoToolbox | VA-API on a GPU host; the container has no GPU, so it records with x264enc/x265enc (the writer skips VA without /dev/dri and trial-encodes it otherwise) | 1C | todo | dev/ELEMENTS.md |
 | ProRes | 422 | `avenc_prores_ks` 422 | 0 | done | selftest `pattern-prores` |
 | 10-bit / HDR | No | No | — | n-a | matches upstream |
-| Constant frame rate | Exact grid | Exact grid | 0 | done | selftest + ffprobe PTS |
+| Constant frame rate | Exact grid | Exact grid, also when the encoder is slower than the grid: four frames may wait in the app source and the pacer blocks, so every slot is written and memory stays bounded (4K HEVC: 120 frames at 60/1, 1.2 GB peak) | 0 | done | selftest + ffprobe PTS; selftest `pattern-4k-hevc` (120 frames at 60/1) |
 | Crash-safe files | Fragments every 2 s | Fragments every 2 s | 0 | done | crash test decodes |
-| Pause / resume, sample-accurate, app and CLI | Yes | Yes (CLI done; app 1E) | 0 | done | selftest `pause-resume` |
+| Pause / resume, sample-accurate, app and CLI | Yes | Yes; the app's button and `rec-rs pause`/`resume` hit the same session | 0 (CLI), 1E (app) | done | selftest `pause-resume`, `gui` |
 | Replay buffer 15–300 s | Yes | Planned | 1D | todo | — |
 | Streaming (RTMP/RTMPS, WHIP, multi-destination, HEVC, reconnect) | Yes | Planned | 1D | todo | preset maths done |
 | Screen scaling: GPU Lanczos | Metal MPS, which antialiases a downscale | wgpu Lanczos (a = 3), separable, per plane in the encoded domain, **stretched by the reduction factor** so a downscale antialiases, edge clamp, never upscaling | 1C | done | unit `gpu::tests::lanczos_matches_a_cpu_reference` (≤2/255 against an independent CPU implementation), `downscaling_a_one_pixel_pattern_leaves_only_its_mean` (a 1-px 5K pattern leaves 0.7/255 ripple inside the frame, against 121.7 for an unstretched kernel; ffmpeg's own swscale/zimg reach 22.6/29.7 at the replicated edge against our 22.7), `the_scaler_matches_ffmpeg_lanczos` (PSNR 50.3 dB 4K→1080p, 51.4 dB 5K→1080p against swscale's Lanczos; 58.1/57.0 dB against zimg), `a_small_screen_is_not_upscaled`; golden `screen-4k-to-1080`; measured 77 ms/frame 4K→1080p and 116 ms 5K→1080p on lavapipe (`tests/golden/README.md`) |
-| Live preview | Yes | wgpu preview | 1E | todo | — |
-| Level meters with peak hold, after the fader | Yes | Same | 1E | todo | unit `mixer::tests::volume_gain` (meter gain) |
-| Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | todo | — |
-| Menu bar control | StatusItem | StatusNotifierItem | 1E | todo | — |
+| Live preview | Yes | The captured frame as an egui texture now (CPU resample); 1C's compositor texture (`Renderer::texture()`) removes the copy in phase 2 | 1E (1C for the texture) | done | unit `app::preview::tests::*`; selftest `gui` (`preview frame 704x396`); snapshot `main-window.png` |
+| Level meters with peak hold, after the fader | Yes | Same | 1E | done | unit `app::tests::meters_decay_and_hold_peaks`, `app::ui_tests::a_muted_channel_greys_its_meter` |
+| Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | partial | unit `hotkey::tests::*`; needs a real desktop (below) |
+| Menu bar control | StatusItem | StatusNotifierItem | 1E | partial | unit `app::tray::tests::*`; needs a real desktop (below) |
 | Headless CLI | Yes | Yes | 0 | done | this phase is CLI-first; selftest runs headless |
 | Small footprint | ~22 MB app | Rust + system GStreamer/PipeWire (Flatpak runtime) | 1F | todo | — |
 | Encoder input: IOSurface straight to VideoToolbox | Zero copy | dmabuf → VA-API where available, else CPU frames | 1C | todo | — |
@@ -179,7 +266,7 @@ version that does it).
 
 | Gap | Upstream | Linux | Phase | Status |
 |---|---|---|---|---|
-| Scenes are three fixed ones, no layout editor, no transitions, live switch needs a camera start | Yes | Same | 1C/1E | partial |
+| Scenes are three fixed ones, no layout editor, no transitions, live switch needs a camera start | Yes | Same; the picker disables camera scenes the running recording cannot switch to | 1C/1E | partial |
 | No application capture or multi-display capture | Yes | Same | — | n-a |
 | Region capture is CLI-only | Yes | Same (the app may add it later) | 1E | todo |
 | No audio filters, hotkeys not configurable | Yes | Same | — | n-a |
@@ -349,3 +436,28 @@ Flatpak portal host. These are the exact checks to run on a real machine:
   tested, but this host has no Flatpak portal camera; the manual checklist above is the proof.
 - **MJPEG decoding is on the CPU** (zune-jpeg). Fine for a 720p/1080p webcam on one core; a 4K MJPEG
   camera would want the GPU path, which is not claimed.
+
+## Phase 1E summary
+
+Done (proved by tests or the self-test): the main window and settings window on egui 0.36/wgpu 30
+with the paper-rs look, the live preview path (the session's frames as an egui texture, low-power
+mode, nothing buffered while hidden), the mixer widgets (fader scale, drag/click/scroll/double
+click/typed dB, mute greying the meter), the settings window and its `settings.json` round trip,
+the app menu and its shortcuts, the tray model (menu, title, tooltip, ARGB icon), the single-instance
+socket, the pidfile/signal controls against the running app, quitting that finalizes a recording,
+"Check for Updates" against GitHub Releases, AppImage self-integration, and the headless self-test
+case that runs the real app.
+
+Partial (a named part is missing, listed per row): the preview shows the captured frame rather than
+the composited one until 1G moves the `record::Options::preview` tap into the writer's emission loop
+(the compositor itself, and the shared-device texture the app will switch to, are 1C and done);
+overlay restyling and scene switching at run time wait for the session seam that 1G adds; the camera
+needs 1B; the replay buffer and streaming are 1D (the cards and their gating are here); "Reveal
+Last" selects the file only where FileManager1 exists; the tray and the global hotkeys are complete
+in code but their visibility and the portal dialog need a real desktop (manual list above).
+
+Known gaps: SNI hosts disagree about title text (the tooltip carries the state everywhere); the
+X11 fallback cannot be exercised under a Wayland-only session and vice versa; the update check
+opens the release page rather than replacing the binary (Flatpak and AppImage packaging own that,
+phase 1F). No audio filters and no configurable hotkeys, matching upstream.
+

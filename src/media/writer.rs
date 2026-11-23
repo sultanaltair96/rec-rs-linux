@@ -1060,6 +1060,21 @@ fn open_sink(
         .do_timestamp(false)
         .build();
     set(video_src.upcast_ref(), "max-buffers", 4);
+    // A slow encoder (4K x265 runs at a few frames a second on a CPU) must not
+    // let the app source queue grow: without a byte limit the buffers it
+    // accepts stay queued for the whole take, one 4K BGRA frame (33 MB) per
+    // grid slot — 4 GB for a two-second 4K take, which is what the 4 GB dev
+    // container killed. Four frames may wait and the pacer blocks when they
+    // are all queued: every grid slot is still written (the file stays
+    // constant frame rate) and memory stays bounded. Dropping here instead
+    // would write a variable-frame-rate file whenever the encoder is slower
+    // than the grid.
+    set(
+        video_src.upcast_ref(),
+        "max-bytes",
+        (spec.width as u64) * (spec.height as u64) * 4 * 4,
+    );
+    video_src.set_property("block", true);
     let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
     let enc_capsfilter = gst::ElementFactory::make("capsfilter").build()?;
     enc_capsfilter.set_property(
@@ -1161,6 +1176,7 @@ fn open_sink(
                 .max_bytes(1 << 20)
                 .build();
             set(src.upcast_ref(), "max-buffers", 16);
+            src.set_property_from_str("leaky-type", "downstream");
             let convert = gst::ElementFactory::make("audioconvert").build()?;
             let resample = gst::ElementFactory::make("audioresample").build()?;
             let aparse = gst::ElementFactory::make("aacparse").build()?;

@@ -195,6 +195,10 @@ pub struct Options {
     pub live: Option<Arc<live::Live>>,
     /// Stream destinations (URL, key) to start with the session.
     pub streams: Vec<(String, String)>,
+    /// The app's preview tap: every captured frame is offered here as well
+    /// (None = no preview). Called on the capture thread; must not block.
+    /// Phase 2 moves this to the composited output frame.
+    pub preview: Option<crate::media_types::FrameSink>,
 }
 
 impl std::fmt::Debug for Options {
@@ -322,7 +326,15 @@ impl Session {
 
     fn start_sources(&mut self, o: &Options) -> Result<()> {
         let shared = self.shared.clone();
-        let vsink: FrameSink = Arc::new(move |f| shared.with(|w| w.push_video(f)));
+        let vsink: FrameSink = {
+            let preview = o.preview.clone();
+            Arc::new(move |f| {
+                if let Some(p) = &preview {
+                    p(f.clone());
+                }
+                shared.with(|w| w.push_video(f))
+            })
+        };
         let asink: AudioSink = {
             let shared = self.shared.clone();
             Arc::new(move |kind, chunk| shared.with(|w| w.push_audio(kind, &chunk)))

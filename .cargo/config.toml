@@ -1,0 +1,6 @@
+# The wgpu tests of the compositor (src/gpu) and of the UI (src/app) each create
+# a Vulkan device; running both suites at once on Mesa's software driver
+# segfaults the test binary every few runs. One test at a time keeps the suite
+# deterministic on a GPU-less host (with a GPU it would be faster, not needed).
+[env]
+RUST_TEST_THREADS = "1"

@@ -34,10 +34,10 @@ wanted() { [ -z "$(echo "$only" | tr -d ' ')" ] || [ "${only#* $1 }" != "$only" 
 case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
-        echo "h264-bitrate sync audio-gaps pause-resume gain compositor"
+        echo "h264-bitrate sync audio-gaps pause-resume gain compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "pattern-mic pattern-system-audio"
-        echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay gui"
+        echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay"
         exit 0 ;;
 esac
 
@@ -66,7 +66,27 @@ check pattern-prores --test-pattern -t 2 --codec prores --no-mic
 # HEVC Main (x265enc, RPM Fusion's gst-plugins-bad-freeworld).
 check pattern-hevc --test-pattern -t 2 --codec hevc --no-mic
 # 4K60 through the automatic codec choice: hevc above 1080p, upstream's rule.
-check pattern-4k-hevc --test-pattern --noise -r 4k -t 2 --no-mic
+# A software 4K HEVC encoder runs at a few frames a second, so this also proves
+# the writer keeps the constant-frame-rate grid (all 120 slots) while its queue
+# stays bounded (1.2 GB peak here, not the 4+ GB an unbounded app source took).
+if wanted pattern-4k-hevc; then
+    f="$OUT/pattern-4k-hevc.mov"
+    frames=0; rate=0
+    if timeout "$TIMEOUT" "$REC" record -q -o "$f" --test-pattern --noise -r 4k -t 2 --no-mic \
+           >/dev/null 2>"$OUT/pattern-4k-hevc.log" \
+       && "$REC" probe "$f" >"$OUT/pattern-4k-hevc.probe" 2>&1 \
+       && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/pattern-4k-hevc.log"; then
+        frames=$(ffprobe -v error -select_streams v -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f")
+        rate=$(ffprobe -v error -select_streams v -show_entries stream=r_frame_rate -of csv=p=0 "$f")
+    fi
+    if [ "$frames" = 120 ] && [ "$rate" = "60/1" ]; then
+        echo "PASS  pattern-4k-hevc  ($(grep -c '^track' "$OUT/pattern-4k-hevc.probe") tracks, $frames frames at $rate, queue bounded)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  pattern-4k-hevc  ($frames frames at '$rate', want 120 at 60/1; see $OUT/pattern-4k-hevc.log / .probe)"
+        fail=$((fail+1))
+    fi
+fi
 
 # Bitrate and profile: a 1080p60 H.264 recording asked for 8 Mb/s must land
 # within 25% of it, at profile High (upstream's H.264 profile; the
@@ -299,7 +319,88 @@ screen_test screen-x11 xvfb.sh x11 1280 800 30
 # X11: --window <app> captures one client's own surface.
 screen_test screen-window xvfb.sh window 400 300 30
 
-# Cases that belong to later phases (they need capture, the app or streaming).
+# The app: start the real GUI (window on headless sway, the software renderer)
+# recording the test pattern, add a second launch (it must hand over to the
+# running instance), stop it with `rec-rs stop` and check the finalized file.
+# The tray and the global hotkeys need a desktop; this case proves the app
+# degrades without them (the log says so) and that the recording is complete.
+if wanted gui; then
+    if ! command -v sway >/dev/null 2>&1; then
+        echo "SKIP  gui  (needs sway; the dev image has it)"; skip=$((skip+1))
+    else
+        d="$OUT/gui"
+        rm -rf "$d"; mkdir -p "$d/rt" "$d/out"; chmod 700 "$d/rt"
+        printf '{"output_dir": "%s", "resolution": "1080p", "fps": 30, "mic_enabled": false, "system_audio": true}\n' \
+            "$d/out" >"$d/settings.json"
+        # One session script: sway and the app must die together, whatever the
+        # case does.
+        cat >"$d/run.sh" <<INNER
+#!/bin/sh
+export XDG_RUNTIME_DIR="$d/rt" REC_SETTINGS="$d/settings.json"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+sway >"$d/sway.log" 2>&1 &
+sway_pid=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/wayland-1" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+[ -S "\$XDG_RUNTIME_DIR/wayland-1" ] || { kill \$sway_pid; exit 10; }
+export WAYLAND_DISPLAY=wayland-1 REC_DEBUG=1
+"$REC" gui --test-pattern --start-recording >"$d/app.log" 2>&1 &
+app=\$!
+sleep 7
+# A second launch hands over to the running app instead of starting another.
+"$REC" gui >"$d/second.log" 2>&1 || true
+# The shell controls reach the app through the pidfile and signals.
+"$REC" pause >"$d/controls.log" 2>&1 && echo paused >>"$d/controls.log" || echo "pause failed" >>"$d/controls.log"
+sleep 1
+"$REC" resume >>"$d/controls.log" 2>&1 && echo resumed >>"$d/controls.log" || echo "resume failed" >>"$d/controls.log"
+sleep 1
+"$REC" stop >"$d/stop.out" 2>>"$d/app.log" || true
+# A second recording, ended by SIGTERM: quitting must finalize it first (the
+# app prints the file's path on quit).
+"$REC" gui --start-recording --test-pattern >>"$d/second.log" 2>&1 || true
+sleep 5
+kill -TERM \$app 2>/dev/null || true
+wait \$app
+echo "app exit=\$?" >"$d/exit"
+kill -TERM \$sway_pid 2>/dev/null || true
+sleep 0.5; kill -KILL \$sway_pid 2>/dev/null || true
+exit 0
+INNER
+        chmod +x "$d/run.sh"
+        if command -v dbus-run-session >/dev/null 2>&1; then
+            timeout "$TIMEOUT" dbus-run-session -- "$d/run.sh" >"$d/session.log" 2>&1 || true
+        else
+            timeout "$TIMEOUT" "$d/run.sh" >"$d/session.log" 2>&1 || true
+        fi
+        file=$(cat "$d/stop.out" 2>/dev/null || true)
+        quit_file=$(grep -o '/[^ ]*\.mov' "$d/app.log" 2>/dev/null | tail -1)
+        frames=0; quit_frames=0
+        [ -n "$file" ] && [ -f "$file" ] &&
+            frames=$(ffprobe -v error -select_streams v -count_frames \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$file" 2>/dev/null || echo 0)
+        [ -n "$quit_file" ] && [ -f "$quit_file" ] &&
+            quit_frames=$(ffprobe -v error -select_streams v -count_frames \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$quit_file" 2>/dev/null || echo 0)
+        if [ -n "$file" ] && [ -f "$file" ] && [ "$frames" -ge 90 ] &&
+           [ -n "$quit_file" ] && [ -f "$quit_file" ] && [ "$quit_frames" -ge 30 ] &&
+           "$REC" probe "$file" >"$d/probe.txt" 2>&1 &&
+           "$REC" probe "$quit_file" >"$d/probe-quit.txt" 2>&1 &&
+           grep -q "already running" "$d/second.log" 2>/dev/null &&
+           grep -q "paused" "$d/controls.log" 2>/dev/null &&
+           grep -q "resumed" "$d/controls.log" 2>/dev/null &&
+           grep -q "app running" "$d/app.log" 2>/dev/null &&
+           grep -q "preview frame" "$d/app.log" 2>/dev/null &&
+           grep -q "app exit=0" "$d/exit" 2>/dev/null &&
+           [ ! -e "$d/rt/rec-rs.pid" ]; then
+            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, pause/resume/stop via the CLI, clean exit)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"
+            fail=$((fail+1))
+        fi
+    fi
+fi
+
 later() {
     wanted "$1" || return 0
     echo "SKIP  $1  ($2)"; skip=$((skip+1))
@@ -309,7 +410,6 @@ later scene-webcam    "phase 1G: the writer composites the camera over the scree
 later replay          "phase 1D: replay buffer"
 later stream-rtmp     "phase 1D: RTMP"
 later stream-whip     "phase 1D: WHIP"
-later gui             "phase 1E: the app"
 
 echo "$pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]
