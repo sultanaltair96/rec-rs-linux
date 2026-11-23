@@ -22,8 +22,11 @@ rec_binary() {
     fi
 }
 
+# Where a live case writes everything it produces (MediaMTX's log, its
+# recordings, the harness output). The selftest points this at the case's own
+# folder, so a failure's server log and recordings sit next to the case report.
 live_root() {
-    printf '%s' "${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/live"
+    printf '%s' "${REC_LIVE_DIR:-${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/live}"
 }
 
 # wait_port PORT [SECS]

@@ -88,12 +88,17 @@ pub fn primitive_samples(element: &str) -> u64 {
 ///
 /// | decoder | offset (samples) |
 /// |---|---|
-/// | `avdec_aac` (gst-libav, the default) | -272 |
+/// | `avdec_aac` (gst-libav, the default) | +400 |
 /// | `fdkaacdec` | +720 |
 /// | `faad` | 0 (untested, no element in the image) |
+///
+/// Measured on clips written by `rec-rs record --replay` and checked with
+/// `scripts/synccheck.py` — the decoder's warm-up depends on the timestamps it
+/// is fed, which is why this is a measured constant next to the encoder
+/// priming table above rather than a formula.
 pub fn decoder_offset(element: &str) -> i64 {
     match element {
-        "avdec_aac" => -272,
+        "avdec_aac" => 400,
         "fdkaacdec" => 720,
         _ => 0,
     }

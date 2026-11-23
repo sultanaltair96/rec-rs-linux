@@ -839,6 +839,43 @@ struct Shared {
     want_key: bool,
     /// Drop video until the next keyframe (after congestion or reconnect).
     skip_to_key: bool,
+    /// The first keyframe, held until an audio packet next to it arrives.
+    ///
+    /// A server's recorder writes one timestamp order across both tracks, so
+    /// whatever it receives first fixes the stream's start; audio that turns up
+    /// older than that is discarded ("received too late", which MediaMTX logs)
+    /// and the recording's sound ends up shifted. The audio encoder lags the
+    /// video one at start, so the session begins on a keyframe **with an audio
+    /// packet within one AAC frame of it** (the same rule as WHIP): the two
+    /// tracks start together and nothing is older than the start.
+    pending_key: Option<(f64, Tag)>,
+    /// When the held keyframe arrived, so a stream without audio still starts.
+    pending_key_at: Option<Instant>,
+    /// Last timestamp sent per tag type (8 audio, 9 video): a server discards
+    /// a sample older than the track's position ("received too late"), so a
+    /// tag that would go back in time is dropped, not written.
+    last_ts: [Option<u32>; 2],
+    /// Newest audio timestamp queued (not yet sent), used to keep the picture
+    /// from running ahead of the sound.
+    ///
+    /// A server's recorder writes samples in one timestamp order across both
+    /// tracks, so audio older than the video it already wrote is dropped
+    /// ("received too late", which MediaMTX logs). The two encoders are
+    /// separate pipelines and the audio one lags under load: video is dropped
+    /// rather than queued more than `MAX_AV_SKEW_MS` ahead of the audio, so the
+    /// tracks stay in step at the server (a stutter, not a drifting track).
+    newest_audio: Option<u32>,
+    /// Video tags dropped because the picture was too far ahead of the sound.
+    ahead_drops: u64,
+    /// Host time of the stream's start (the first audio packet next to the
+    /// first keyframe), set once per connection by `maybe_start`.
+    t0: Option<f64>,
+    /// First audio time seen before the stream started, and the newest audio
+    /// time seen, for the start decision.
+    first_audio_pts: Option<f64>,
+    audio_pts: Option<f64>,
+    /// Tags dropped because they were older than their track's last one.
+    late_drops: u64,
 }
 
 pub struct RtmpOutput {
@@ -846,12 +883,21 @@ pub struct RtmpOutput {
     shared: Arc<(Mutex<Shared>, Condvar)>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    t0: Option<f64>,
 }
 
 /// Queued media older than this (by timestamp span) means the network is not
 /// keeping up: drop video until the next keyframe.
 const MAX_QUEUE_MS: u32 = 3000;
+
+/// One AAC-LC packet at 48 kHz, in seconds: how close the first audio packet
+/// has to be to the first keyframe to start the stream on it.
+const AAC_FRAME_SECS: f64 = 1024.0 / 48_000.0;
+
+/// How far the picture may run ahead of the sound before video is dropped
+/// instead of queued. A server writes one timestamp order across both tracks;
+/// audio older than the video it already wrote is discarded ("received too
+/// late"), which shifts or holes the recording's sound.
+const MAX_AV_SKEW_MS: u32 = 120;
 
 impl RtmpOutput {
     pub fn start(url: &str, key: &str) -> Result<RtmpOutput> {
@@ -880,7 +926,6 @@ impl RtmpOutput {
             shared,
             stop,
             thread: Some(thread),
-            t0: None,
         })
     }
 }
@@ -918,10 +963,16 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
             s.state = "live".into();
             s.error = None;
             s.live_since.get_or_insert_with(Instant::now);
-            // Start the new connection from a keyframe.
+            // Start the new connection from a keyframe, with a fresh timeline.
             s.queue.retain(|t| t.typ == 8);
             s.skip_to_key = true;
             s.want_key = true;
+            s.last_ts = [None; 2];
+            s.newest_audio = None;
+            s.t0 = None;
+            s.first_audio_pts = None;
+            s.pending_key = None;
+            s.pending_key_at = None;
         }
         let mut headers_sent = false;
         let result: Result<()> = (|| {
@@ -929,7 +980,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 if stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                let (tags, formats, wh) = {
+                let (mut tags, formats, wh) = {
                     let mut s = lock.lock().unwrap();
                     if s.queue.is_empty() {
                         s = cv.wait_timeout(s, Duration::from_millis(50)).unwrap().0;
@@ -940,6 +991,12 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                         s.width_height,
                     )
                 };
+                // The audio and video encoders are separate pipelines: their
+                // bursts interleave, so a batch can hold tags out of order.
+                // Send them by timestamp (stable, so equal timestamps keep
+                // their order) — a server discards a sample older than its
+                // track (MediaMTX: "received too late, discarding").
+                tags.sort_by_key(|t| t.ts);
                 if !headers_sent && let Some((hevc, record)) = &formats {
                     let meta = command(&[
                         Amf::Str("@setDataFrame".into()),
@@ -970,6 +1027,26 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                 if headers_sent {
                     let sid = conn.stream_id;
                     for t in tags {
+                        // Per track (audio 8, video 9) time never goes back.
+                        let slot = usize::from(t.typ == 9);
+                        let mut s = lock.lock().unwrap();
+                        let late = s.last_ts[slot].is_some_and(|last| t.ts < last);
+                        if late {
+                            s.late_drops += 1;
+                        } else {
+                            s.last_ts[slot] = Some(t.ts);
+                        }
+                        drop(s);
+                        if late {
+                            if std::env::var_os("REC_DEBUG").is_some() {
+                                eprintln!(
+                                    "rec: debug: rtmp: {} tag at {} ms is older than the track, dropped",
+                                    if t.typ == 9 { "video" } else { "audio" },
+                                    t.ts
+                                );
+                            }
+                            continue;
+                        }
                         let csid = if t.typ == 9 { C_VIDEO } else { C_AUDIO };
                         conn.send(csid, t.typ, sid, t.ts, &t.body)?;
                     }
@@ -1026,9 +1103,47 @@ pub(super) fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
     }
 }
 
+/// Start the RTMP timeline once a keyframe and an audio packet within one AAC
+/// frame of it are both known: the two tracks then begin together and no audio
+/// is older than the stream's start. A stream without audio starts 300 ms after
+/// its first keyframe anyway.
+fn maybe_start(shared: &Arc<(Mutex<Shared>, Condvar)>, latest_audio: Option<f64>) {
+    let (lock, cv) = &**shared;
+    let mut s = lock.lock().unwrap();
+    let Some((key_pts, _)) = s.pending_key.clone() else {
+        return;
+    };
+    let audio = latest_audio.or(s.first_audio_pts);
+    let ready = match audio {
+        Some(a) => (a - key_pts).abs() <= AAC_FRAME_SECS + 0.01,
+        None => s
+            .pending_key_at
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(300)),
+    };
+    if !ready {
+        return;
+    }
+    let t0 = audio.map_or(key_pts, |a| a.min(key_pts));
+    let (key_pts, mut key) = s.pending_key.take().unwrap();
+    key.ts = ((key_pts - t0) * 1000.0).round().max(0.0) as u32;
+    s.pending_key_at = None;
+    s.started = Some(Instant::now());
+    s.audio_pts = audio;
+    s.t0 = Some(t0);
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "rec: debug: rtmp: stream starts with the keyframe {:+.1} ms from the audio",
+            (key_pts - t0) * 1000.0
+        );
+    }
+    s.queue.push_back(key);
+    cv.notify_one();
+}
+
 impl Output for RtmpOutput {
     fn packet(&mut self, p: &EncodedPacket, f: &Formats) {
         let (lock, cv) = &*self.shared;
+        maybe_start(&self.shared, None);
         let mut s = lock.lock().unwrap();
         match p.kind {
             PacketKind::Video(_) => {
@@ -1041,7 +1156,7 @@ impl Output for RtmpOutput {
                 {
                     let had = s.formats.is_some();
                     s.formats = Some((hevc, f.record.clone()));
-                    if had && let Some(t0) = self.t0 {
+                    if had && let Some(t0) = s.t0 {
                         let ts = ((p.pts - t0) * 1000.0).round().max(0.0) as u32;
                         s.queue.push_back(Tag {
                             typ: 9,
@@ -1053,12 +1168,25 @@ impl Output for RtmpOutput {
                 if s.formats.as_ref().is_none_or(|(h, _)| *h != hevc) {
                     return;
                 }
-                if self.t0.is_none() {
+                if s.t0.is_none() {
                     if !p.keyframe {
                         return;
                     }
-                    self.t0 = Some(p.pts);
-                    s.started = Some(Instant::now());
+                    // Held until an audio packet next to it arrives (see
+                    // `pending_key`); `maybe_start` takes it from here.
+                    if s.pending_key.is_none() {
+                        s.pending_key = Some((
+                            p.pts,
+                            Tag {
+                                typ: 9,
+                                ts: 0,
+                                body: Arc::new(flv_video(hevc, true, &p.data)),
+                            },
+                        ));
+                        s.pending_key_at = Some(Instant::now());
+                    }
+                    cv.notify_one();
+                    return;
                 }
                 if s.width_height == (0, 0) {
                     s.width_height = (f.width, f.height);
@@ -1070,7 +1198,17 @@ impl Output for RtmpOutput {
                     }
                     s.skip_to_key = false;
                 }
-                let ts = ((p.pts - self.t0.unwrap()) * 1000.0).round().max(0.0) as u32;
+                let ts = ((p.pts - s.t0.unwrap()) * 1000.0).round().max(0.0) as u32;
+                // The picture must not run far ahead of the sound: a server's
+                // recorder writes one timestamp order and discards audio that
+                // is older than the video it already has.
+                if let Some(audio) = s.newest_audio
+                    && ts > audio + MAX_AV_SKEW_MS
+                {
+                    s.ahead_drops += 1;
+                    s.dropped += 1;
+                    return;
+                }
                 // Congestion: the queue spans too much time.
                 if let (Some(first), true) = (s.queue.front().map(|t| t.ts), !p.keyframe)
                     && ts.saturating_sub(first) > MAX_QUEUE_MS
@@ -1087,16 +1225,25 @@ impl Output for RtmpOutput {
                 });
             }
             PacketKind::Audio(AudioCodec::Aac) => {
-                let Some(t0) = self.t0 else {
-                    return;
-                };
-                if p.pts < t0 {
+                if s.t0.is_none() {
+                    // Before the timeline exists, audio only feeds the start
+                    // decision (`maybe_start`, on the next tag).
+                    s.first_audio_pts = s.first_audio_pts.or(Some(p.pts));
+                    drop(s);
+                    maybe_start(&self.shared, Some(p.pts));
+                    cv.notify_one();
                     return;
                 }
-                let ts = ((p.pts - t0) * 1000.0).round() as u32;
+                let t0 = s.t0.unwrap();
+                if p.pts < t0 - 1e-9 {
+                    return;
+                }
+                let ts = ((p.pts - t0) * 1000.0).round().max(0.0) as u32;
                 if s.queue.len() > 2000 {
                     return;
                 }
+                s.newest_audio = Some(s.newest_audio.map_or(ts, |a| a.max(ts)));
+                s.audio_pts = Some(p.pts);
                 s.queue.push_back(Tag {
                     typ: 8,
                     ts,
