@@ -107,6 +107,85 @@ else
     skipping "the app starts with no subcommand" "no xvfb-run in the test container"
 fi
 
+echo "== live elements in the bundle (elements -> plugin file)"
+if [ ! -d /tmp/squashfs-root ]; then
+    ( cd /tmp && env -u APPIMAGE_EXTRACT_AND_RUN "$APPIMAGE" --appimage-extract >/dev/null 2>&1 ) || true
+fi
+# The AppImage carries no gst-inspect, so the live path's elements are checked
+# through the plugin files that provide them. The streaming test below then uses
+# them for real, which is the stronger proof.
+for pair in \
+    fdkaacenc:libgstfdkaac.so fdkaacdec:libgstfdkaac.so \
+    avenc_aac:libgstlibav.so avdec_aac:libgstlibav.so \
+    voaacenc:libgstvoaacenc.so aacparse:libgstaudioparsers.so \
+    opusenc:libgstopus.so opusdec:libgstopus.so \
+    h264parse:libgstvideoparsersbad.so h265parse:libgstvideoparsersbad.so \
+    mp4mux:libgstisomp4.so videoscale:libgstvideoconvertscale.so \
+    x264enc:libgstx264.so x265enc:libgstx265.so; do
+    el=${pair%%:*}
+    plugin=${pair#*:}
+    if [ -f "/tmp/squashfs-root/usr/lib/gstreamer-1.0/$plugin" ]; then
+        echo "  present $el ($plugin)"
+    else
+        echo "  ABSENT  $el ($plugin)"
+    fi
+done | tee /tmp/live-elements.txt
+
+echo "== live: RTMP + WHIP + replay"
+if [ -f /tmp/mediamtx/.started ]; then
+    export REC_STREAM_KEY=appimage-test-key
+    rc=0
+    "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -r 720p --fps 30 -t 8 \
+        --stream rtmp://127.0.0.1:1935/rtmppkg \
+        --stream http://127.0.0.1:8889/whippkg/whip \
+        --replay 15 -o /tmp/live.mp4 >/tmp/live.log 2>&1 &
+    rec=$!
+    sleep 5
+    if "$APPIMAGE" save-replay >/tmp/live-save.log 2>&1; then
+        ok "save-replay reaches the running recorder from a second AppImage run"
+    else
+        cat /tmp/live-save.log
+        bad "save-replay from a second AppImage run"
+    fi
+    wait "$rec" || rc=$?
+    status=$(tr '\r' '\n' </tmp/live.log)
+    if [ "$rc" -eq 0 ]; then ok "record --stream --replay finished cleanly"; else echo "$status" | tail -8; bad "record --stream --replay"; fi
+    if echo "$status" | grep -q 'rtmp://127.0.0.1 live' && echo "$status" | grep -q 'whip://127.0.0.1 live'; then
+        ok "both destinations were live while recording"
+    else
+        bad "a destination never went live"
+    fi
+    replay=$(echo "$status" | grep -o 'replay saved .*' | head -1 | sed 's/replay saved //')
+    if [ -n "$replay" ] && "$APPIMAGE" probe "$replay" >/tmp/live-replay.probe 2>&1; then
+        grep '^track' /tmp/live-replay.probe | sed 's/^/  /'
+        ok "the replay clip plays ($(basename "$replay"))"
+    else
+        cat /tmp/live-replay.probe 2>/dev/null
+        bad "the replay clip"
+    fi
+    for kind in rtmp whip; do
+        case "$kind" in
+            rtmp) dir=/tmp/mediamtx/recordings/rtmppkg ;;
+            whip) dir=/tmp/mediamtx/recordings/whippkg ;;
+        esac
+        # MediaMTX puts an RTMP stream key in a subdirectory of the path.
+        newest=$(find "${dir:-/nonexistent}" -name '*.mp4' 2>/dev/null | head -1)
+        if [ -n "$newest" ] && "$APPIMAGE" probe "$newest" >/tmp/live-$kind.probe 2>&1; then
+            tracks=$(grep '^track' /tmp/live-$kind.probe | tr '\n' ' ')
+            audio=$(printf '%s' "$tracks" | grep -o 'audio [a-z0-9]*' | head -1)
+            case "$tracks" in
+                *video*h264*audio*) ok "MediaMTX recorded $kind with video and $audio" ;;
+                *) echo "  $tracks"; bad "MediaMTX $kind recording has video and audio" ;;
+            esac
+        else
+            cat /tmp/live-$kind.probe 2>/dev/null
+            bad "MediaMTX has no $kind recording"
+        fi
+    done
+else
+    skipping "streaming from the AppImage" "MediaMTX did not start in this container"
+fi
+
 echo "== the bundled plugin set"
 cd /tmp
 rm -rf squashfs-root

@@ -47,10 +47,10 @@ for image in $IMAGES; do
     echo "================ $image"
     case "$image" in
         fedora:*)
-            setup='dnf -y -q install util-linux pipewire-libs xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers libglvnd-egl libglvnd-glx >/dev/null 2>&1'
+            setup='dnf -y -q install util-linux pipewire-libs xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers libglvnd-egl libglvnd-glx curl tar >/dev/null 2>&1'
             ;;
         debian:*)
-            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd xvfb xauth libgl1-mesa-dri mesa-vulkan-drivers libglx-mesa0 libegl1 libxcb-render0 libxcb-shm0 libxcb-dri3-0 libxcb-randr0 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 >/dev/null'
+            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd xvfb xauth ca-certificates libgl1-mesa-dri mesa-vulkan-drivers libglx-mesa0 libegl1 curl libxcb-render0 libxcb-shm0 libxcb-dri3-0 libxcb-randr0 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 >/dev/null'
             ;;
         *)
             setup='true'
@@ -61,6 +61,7 @@ for image in $IMAGES; do
             -e IMAGE_NAME="$IMAGE_NAME" \
             "$image" \
             sh -c "$setup
+                   sh /repo/packaging/test-mediamtx.sh
                    useradd -m tester
                    su tester -c 'sh /repo/packaging/appimage/test-inside.sh'" \
             2>&1 | tee "$LOG/$name.log"; then

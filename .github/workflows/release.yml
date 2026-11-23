@@ -115,14 +115,22 @@ jobs:
       - name: Check out the tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          sparse-checkout: Cargo.toml
+          sparse-checkout: |
+            Cargo.toml
+            packaging/desktop/io.github.sultanaltair96.Rec.metainfo.xml
 
-      - name: The tag is the version the binary reports
+      - name: The tag, Cargo.toml and the metainfo agree on the version
         run: |
           want=${GITHUB_REF_NAME#v}
           got=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          echo "tag=$want cargo=$got"
+          # The newest <release> entry of the AppStream metadata (the first one
+          # after the releases tag, which is where Flathub reads it from).
+          meta=$(sed -n '/<releases>/,/<\/releases>/p' \
+                   packaging/desktop/io.github.sultanaltair96.Rec.metainfo.xml |
+                 sed -n 's/.*<release version="\([^"]*\)".*/\1/p' | head -1)
+          echo "tag=$want cargo=$got metainfo=$meta"
           test "$want" = "$got"
+          test "$want" = "$meta"
 
       - name: Collect the assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

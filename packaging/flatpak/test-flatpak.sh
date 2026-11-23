@@ -58,11 +58,13 @@ exec docker run --rm --init -i --name "$NAME" \
     -v "$VOLUME:/var/lib/flatpak" \
     -w "$REPO" \
     "$IMAGE" \
-    sh -c "set -e; dnf -y -q install flatpak util-linux xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers >/dev/null 2>&1; \
+    sh -c "set -e; dnf -y -q install flatpak util-linux xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers curl tar dbus-daemon dbus-tools gnome-keyring >/dev/null 2>&1; \
            useradd -m tester; \
+           install -d -o tester -g tester -m 0700 /run/user/1000; \
            su - tester -c 'mkdir -p ~/.config ~/Videos && \
                printf \"XDG_VIDEOS_DIR=\\\"\$HOME/Videos\\\"\\n\" > ~/.config/user-dirs.dirs'; \
            flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo; \
            flatpak install -y --noninteractive --reinstall --bundle /out/rec.flatpak; \
            chown -R tester /out; \
-           su - tester -c 'sh $REPO/packaging/flatpak/test-inside.sh'"
+           sh $REPO/packaging/test-mediamtx.sh; \
+           su - tester -c 'sh $REPO/packaging/flatpak/with-session.sh $REPO/packaging/flatpak/test-inside.sh'"

@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 9.5 MB bundle (runtime shared) | 101 MiB AppImage (GStreamer inside) |
+| Size | 11.4 MB bundle (runtime shared) | 104 MiB AppImage (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -110,6 +110,14 @@ stays MIT OR Apache-2.0 (mere aggregation).
 runtime); the writer already knows its priming (`REC_AAC_PRIMING`, see
 `src/media/writer.rs`). ProRes 422 is `avenc_prores_ks`, Opus is `opusenc`.
 
+The live path (phase 1D) asks for `fdkaacenc`/`fdkaacdec` first and then
+`avenc_aac`/`avdec_aac`; in the sandbox `gst-inspect` reports **`fdkaacenc` and
+`fdkaacdec` ABSENT, `avenc_aac` and `avdec_aac` present**, so both RTMP and the
+replay use `avenc_aac`, and replay audio decodes with `avdec_aac`. `aacparse`,
+`opusenc`, `h264parse`, `h265parse`, `mp4mux` and `videoscale` are all present.
+The streaming test proves it end to end: MediaMTX's own recording of the RTMP
+stream has video + **aac** audio, the WHIP stream video + **opus**.
+
 Ubuntu and the dev container use `x264enc`/`x265enc` from RPM Fusion or
 gst-plugins-ugly/bad; the Flatpak ends up with the same two elements, so the
 writer's candidate order picks the same encoders everywhere.
@@ -167,18 +175,24 @@ the build cache between runs. The result is a single-file bundle.
 
 `test-flatpak.sh` installs that bundle system-wide in a **plain `fedora:43`
 container with only `flatpak`** (not the builder image), as a normal user, and
-checks 12 things: H.264 record to `~/Videos` through the CLI, the file appearing
+checks 19 things: H.264 record to `~/Videos` through the CLI, the file appearing
 on the host side of the Videos mount, `probe` inside the sandbox, the default
-output folder, HEVC, ProRes, the no-subcommand entry point, the settings path
-(writable, private to the app, visible in `~/.var/app`), the exported desktop actions
-(rewritten to `flatpak run ... gui --start-recording` / `--settings`), and the installed
-desktop/metainfo/icon files, and the GUI: `flatpak run` with no subcommand
-opens the window (Xvfb + the runtime's Mesa, still up after 8 s). Result:
-**12/12 pass**, encoder names printed by the recorder (`x264enc`, `x265enc`,
-`avenc_prores_ks`) and `probe` reporting `video h264 1920x1080 @ 60.000 fps` /
-HEVC.
+output folder, HEVC, ProRes, the GUI window under Xvfb, the settings path
+(writable, private to the app, visible in `~/.var/app`), the exported desktop
+actions, the installed desktop/metainfo/icon files, **live streaming** (RTMP +
+WHIP from one encode with a 15 s replay buffer; MediaMTX's own recordings probed
+from inside the sandbox for video + AAC/Opus audio; the replay buffer filling),
+and **the Secret Service** (`stream-key` stored and deleted through
+`org.freedesktop.secrets`, with gnome-keyring running in the container).
+Result: **18/18 pass, 1 skip**. The skip is `save-replay` from a *second*
+`flatpak run`: each instance gets its own PID namespace, so the pid in the
+pidfile is the recorder's namespace-local pid and the signal hits the caller
+instead (exit 163). The runtime directory is shared between instances, so the
+fix is the unix control socket the port plan already names for `save-replay` —
+a code change in 1D/1E, not packaging. The AppImage, which has no sandbox, runs
+the full `save-replay` proof.
 
-Bundle size: **9.5 MB** (`rec.flatpak`, 9,589,680 bytes) — the runtime is shared. The manifest
+Bundle size: **11.4 MB** (`rec.flatpak`, 11,423,152 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -191,15 +205,16 @@ part of the bundle.
   ```yaml
   - type: git
     url: https://github.com/sultanaltair96/rec-rs-linux
-    tag: v0.1.0
+    tag: v<version>
     commit: <sha>
   ```
 
 * `packaging/update-sources.sh` must be run and the result committed whenever
   `Cargo.lock` changes (every later phase adds crates).
-* The metainfo's screenshots still point at upstream's macOS captures; replace
-  them with Linux screenshots (and remote URLs) now that the window runs. The
-  `TODO(packaging)` comment in the file says so.
+* The metainfo's screenshots are the app's own kittest snapshots
+  (`tests/snapshots/`, copied into `packaging/desktop/screenshots/`) served from
+  the raw URL on `main`. Refresh them with the snapshots whenever the window
+  changes; nothing else in the metadata needs editing for a release.
 * The app entry point works: `flatpak run io.github.sultanaltair96.Rec` opens
   the window, and the container test proves it stays up for 8 s under Xvfb with
   the runtime's Mesa (llvmpipe). The tray appears when the desktop offers a
@@ -291,23 +306,30 @@ library, see the table above). It records H.264, HEVC and ProRes with the test
 pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
-Result: **Debian 13 8/8 pass** and **Fedora 43 7/7 pass + 1 skip**. The
+Result: **Debian 13 14/14 pass** and **Fedora 43 13/13 pass + 1 skip**. The
 encoders are `x264enc`, `x265enc` and `avenc_prores_ks`, `probe` reports
 `video h264 1920x1080 @ 60.000 fps` and HEVC, 28 plugins are bundled, and the
-GUI opens under Xvfb on Debian 13 (window still up after 8 s). On Fedora 43's
-container the same check **skips**: the host's software Vulkan (lavapipe over
-Xvfb) refuses to enumerate a device (`vkEnumeratePhysicalDevices` returns
-`VK_ERROR_INCOMPATIBLE_DRIVER`) and its GL adapter cannot present to the X
-window, so there is no adapter for wgpu to use. The Flatpak, which carries the
-runtime's Mesa, opens its window in the same container — the difference is the
-host's rendering stack, not the package. A real Fedora desktop with a GPU
-driver is check 8 in the list below.
+GUI opens under Xvfb on Debian 13 (window still up after 8 s). The **live path**
+runs for real: RTMP + WHIP from one encode with a 15 s replay buffer, a
+`save-replay` clip from a second AppImage process (the AppImage has no PID
+namespace, so this works), and MediaMTX's own recordings probe with video +
+**aac** (RTMP) and video + **opus** (WHIP). `fdkaacenc`/`fdkaacdec` are absent
+from the bundle (Ubuntu has no fdk-aac); `avenc_aac`, `avdec_aac` and `voaacenc`
+are present, so the live path's fallback is what runs.
 
-Sizes: AppImage **101.3 MiB** (106,228,216 bytes), `.zsync` 178 KiB. Most of it
+On Fedora 43's container the GUI check **skips**: the host's software Vulkan
+(lavapipe over Xvfb) refuses to enumerate a device
+(`vkEnumeratePhysicalDevices` returns `VK_ERROR_INCOMPATIBLE_DRIVER`) and its GL
+adapter cannot present to the X window. The Flatpak, which carries the runtime's
+Mesa, opens its window in the same container — the difference is the host's
+rendering stack, not the package. A real Fedora desktop with a GPU driver is
+check 8 in the list below.
+
+Sizes: AppImage **104.3 MiB** (109,414,904 bytes), `.zsync` 183 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
-libplacebo, libaom, ...) plus egui/wgpu and the embedded Inter fonts. That is
-the price of AAC, ProRes and the app in a single file; the Flatpak gets the
-codecs from the runtime and is 9.6 MB.
+libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
+fonts. That is the price of AAC, ProRes, the app and streaming in a single file;
+the Flatpak gets the codecs from the runtime and is 11.4 MB.
 
 AppImages normally mount themselves with FUSE; containers have no FUSE, so both
 scripts use the runtime's own `APPIMAGE_EXTRACT_AND_RUN=1`, which extracts the
@@ -340,10 +362,11 @@ which package provides it:
   `Start Recording` → `rec-rs gui --start-recording`, `Settings` →
   `rec-rs gui --settings`.
 * **AppStream metainfo**: description, feature list, homepage/bugtracker/VCS
-  links, OARS 1.1 content rating, licence `MIT OR Apache-2.0`, an 0.1.0 release,
-  `provides` for both binaries and screenshots. The screenshots are upstream's
-  macOS captures at the pinned commit with a `TODO(packaging)` until Linux
-  screenshots exist.
+  links, OARS 1.1 content rating, licence `MIT OR Apache-2.0`, a release entry,
+  `provides` for both binaries and screenshots. The screenshots are the app's own
+  kittest snapshots (main and settings window), so they show the real Linux UI;
+  the release entry must match `Cargo.toml` and the tag (release.yml checks
+  both).
 * **Icons**: hicolor PNGs at 16, 24, 32, 48, 64, 128, 256 and 512 px, converted
   from upstream's `support/icon.png` (1024×1024, MIT OR Apache-2.0, same
   repository) with Lanczos resampling. There is no SVG: upstream ships a PNG and

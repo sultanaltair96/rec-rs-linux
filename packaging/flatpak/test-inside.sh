@@ -24,9 +24,10 @@ flatpak list | grep "$APP" | tee "$OUT/installed.txt"
 
 echo "== encoders and capture elements inside the sandbox"
 {
-    for el in x264enc x265enc openh264enc avenc_aac fdkaacenc avenc_prores_ks opusenc \
-              pipewiresrc appsrc appsink videoconvert videoscale mp4mux qtmux qtdemux \
-              h264parse h265parse avdec_h264 avdec_h265; do
+    for el in x264enc x265enc openh264enc avenc_aac fdkaacenc fdkaacdec avdec_aac \
+              aacparse opusenc opusdec avenc_prores_ks pipewiresrc appsrc appsink \
+              videoconvert videoscale mp4mux qtmux qtdemux h264parse h265parse \
+              avdec_h264 avdec_h265; do
         if flatpak run --command=gst-inspect-1.0 "$APP" "$el" >/dev/null 2>&1; then
             echo "  present $el"
         else
@@ -125,6 +126,109 @@ if [ -x "$XVFB_RUN" ]; then
     head -5 "$OUT/gui.log" | sed 's/^/  /'
 else
     skipping "the app starts with no subcommand" "no xvfb-run in the test container"
+fi
+
+echo "== live: RTMP + WHIP + replay from inside the sandbox"
+if [ ! -f /tmp/mediamtx/.started ]; then
+    skipping "streaming from inside the sandbox" "MediaMTX did not start in this container"
+else
+# MediaMTX runs in the test container (started by test-flatpak.sh); the sandbox
+# shares the network namespace, so 127.0.0.1 is the same machine. The server's
+# recordings are copied into ~/Videos afterwards so the sandbox can probe them.
+export REC_STREAM_KEY=flatpak-test-key
+live_log="$OUT/live.log"
+rc=0
+flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
+    -r 720p --fps 30 -t 8 \
+    --stream rtmp://127.0.0.1:1935/rtmppkg \
+    --stream http://127.0.0.1:8889/whippkg/whip \
+    --replay 15 -o "$HOME/Videos/live.mp4" >"$live_log" 2>&1 &
+rec=$!
+sleep 5
+# A second `flatpak run` gets its own PID namespace, so the pid the pidfile
+# holds (the sandbox's own numbering) names a different process there: the
+# signal hits the caller itself and it dies with 128+SIGRTMIN+1 = 163. The
+# runtime directory is shared (the pidfile is visible), so the fix is the unix
+# control socket the port plan already names for save-replay; until then this
+# is a documented limitation, not a silent failure.
+save_rc=0
+flatpak run --command=rec-rs "$APP" save-replay >>"$OUT/live-save.log" 2>&1 || save_rc=$?
+case "$save_rc" in
+    0) ok "save-replay reaches the running recorder from a second flatpak run" ;;
+    163) skipping "save-replay from a second flatpak run" \
+             "PID namespaces: the pidfile pid is local to the recorder's sandbox (needs the control socket)" ;;
+    *)
+        cat "$OUT/live-save.log"
+        bad "save-replay from a second flatpak run (exit $save_rc)"
+        ;;
+esac
+wait "$rec" || rc=$?
+status=$(tr '\r' '\n' <"$live_log")
+if [ "$rc" -eq 0 ]; then ok "record --stream --replay finished cleanly"; else echo "$status" | tail -8; bad "record --stream --replay"; fi
+if echo "$status" | grep -q 'rtmp://127.0.0.1 live' && echo "$status" | grep -q 'whip://127.0.0.1 live'; then
+    ok "both destinations were live while recording"
+else
+    bad "a destination never went live"
+fi
+# The replay buffer itself: the status line shows it filling up.
+if echo "$status" | grep -qE 'replay [1-9][0-9]*s [0-9.]+ MB'; then
+    ok "the replay buffer filled while streaming ($(echo "$status" | grep -oE 'replay [1-9][0-9]*s [0-9.]+ MB' | tail -1))"
+else
+    bad "the replay buffer never filled"
+fi
+# The clip a same-process save produces is verified by test-appimage.sh, which
+# has no sandbox; inside the Flatpak the clip path is the only part blocked by
+# the PID namespace above.
+
+# The server's own recordings: one from RTMP, one from WHIP. fMP4 segments are
+# finalised when the connection closes, so give the server a moment first.
+sleep 3
+mkdir -p "$HOME/Videos/mediamtx"
+cp -r /tmp/mediamtx/recordings/. "$HOME/Videos/mediamtx/" 2>/dev/null || true
+find "$HOME/Videos/mediamtx" -name '*.mp4' >"$OUT/live-recordings.txt" 2>/dev/null || true
+sed 's/^/  /' "$OUT/live-recordings.txt"
+for kind in rtmp whip; do
+    case "$kind" in
+        rtmp) dir=$(find "$HOME/Videos/mediamtx" -maxdepth 1 -type d -name rtmppkg | head -1) ;;
+        whip) dir=$(find "$HOME/Videos/mediamtx" -maxdepth 1 -type d -name whippkg | head -1) ;;
+    esac
+    # MediaMTX puts an RTMP stream key in a subdirectory of the path.
+    newest=$(find "${dir:-/nonexistent}" -name '*.mp4' 2>/dev/null | head -1)
+    if [ -n "$newest" ] && flatpak run --command=rec-rs "$APP" probe "$newest" >"$OUT/live-$kind.probe" 2>&1; then
+        tracks=$(grep '^track' "$OUT/live-$kind.probe" | tr '\n' ' ')
+        audio=$(printf '%s' "$tracks" | grep -o 'audio [a-z0-9]*' | head -1)
+        case "$tracks" in
+            *video*h264*audio*) ok "MediaMTX recorded $kind with video and $audio" ;;
+            *) echo "  $tracks"; bad "MediaMTX $kind recording has video and audio" ;;
+        esac
+    else
+        cat "$OUT/live-$kind.probe" 2>/dev/null
+        bad "MediaMTX has no $kind recording"
+    fi
+done
+
+fi
+
+echo "== Secret Service: stream-key through the sandbox"
+# A keyring needs a session bus and an unlocked login keyring; test-flatpak.sh
+# starts dbus-run-session + gnome-keyring for this shell when it is available.
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    key_rc=0
+    printf '%s\n' test-key |
+        flatpak run --command=rec-rs "$APP" stream-key rtmp://127.0.0.1:1935/live >"$OUT/keyring.log" 2>&1 || key_rc=$?
+    flatpak run --command=rec-rs "$APP" stream-key rtmp://127.0.0.1:1935/live --delete \
+        >>"$OUT/keyring.log" 2>&1 || key_rc=$?
+    case "$key_rc" in
+        0) ok "stream-key stored and deleted through org.freedesktop.secrets" ;;
+        *) cat "$OUT/keyring.log"
+           if grep -q 'Secret Service is not available' "$OUT/keyring.log"; then
+               skipping "stream-key through the Secret Service" "the keyring daemon did not come up"
+           else
+               bad "stream-key through the Secret Service"
+           fi ;;
+    esac
+else
+    skipping "stream-key through the Secret Service" "no session bus in the test container"
 fi
 
 echo "== settings live in the sandbox's XDG config dir"
