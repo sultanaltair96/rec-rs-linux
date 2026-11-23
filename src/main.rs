@@ -308,10 +308,13 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         } => app::run(start_recording, settings, window, test_pattern),
         Cmd::Record(a) => record(a),
         Cmd::Devices => devices(),
+        // Control over the shared runtime-directory socket, so these work from
+        // a second Flatpak instance (its PID namespace hides the recorder's
+        // pid); the pidfile signal stays as the fallback (record.rs).
         Cmd::Stop => record::stop_running(),
-        Cmd::Pause => record::signal_running(libc::SIGUSR1),
-        Cmd::Resume => record::signal_running(libc::SIGUSR2),
-        Cmd::SaveReplay => record::signal_running(record::save_replay_signal()),
+        Cmd::Pause => record::pause_running(),
+        Cmd::Resume => record::resume_running(),
+        Cmd::SaveReplay => record::save_replay_running(),
         Cmd::StreamKey { dest, delete } => stream_key(&dest, delete),
         Cmd::LiveSelftest(a) => live::harness::run(a),
         Cmd::Permissions { request, wait } => permissions(request, wait),

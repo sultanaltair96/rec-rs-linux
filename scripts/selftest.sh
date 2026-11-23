@@ -46,6 +46,19 @@ wanted() { [ -z "$only_clean" ] || [ "${only#* $1 }" != "$only" ]; }
 # An opt-in case only runs when it is named: the default pass stays short.
 named() { [ -n "$only_clean" ] && wanted "$1"; }
 
+# The recorder's pidfile ($XDG_RUNTIME_DIR, else /tmp/rec-rs-$UID).
+pidfile_path() {
+    dir=${XDG_RUNTIME_DIR:-}
+    [ -n "$dir" ] && [ -d "$dir" ] || dir="/tmp/rec-rs-$(id -u)"
+    echo "$dir/rec-rs.pid"
+}
+
+# Simulate a second PID namespace (a Flatpak instance): the pidfile's pid is
+# meaningless there, so only the control socket can reach the recorder.
+bogus_pidfile() {
+    printf '999999\n%s\n' "$1" >"$(pidfile_path)"
+}
+
 case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
@@ -54,7 +67,7 @@ case "${1:-}" in
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
-        echo "screen-exclude no-sink"
+        echo "screen-exclude no-sink app-cli-control"
         echo "opt-in: long-finalize (10 min), mic-stress (20 runs, 8 burners)"
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "skipped: pattern-webcam scene-webcam"
@@ -352,29 +365,36 @@ fi
 # exactly 300 frames (5 s at 60 fps) and audio must still be in sync.
 if wanted pause-resume; then
     f="$OUT/pause-resume.mov"
+    started=$(date +%s)
     timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -t 5 -o "$f" >/dev/null 2>"$OUT/pause-resume.log" &
     recorder=$!
-    sleep 2.3; "$REC" pause >/dev/null 2>&1 || true; sleep 2; "$REC" resume >/dev/null 2>&1 || true
+    # The pidfile holds a pid that only exists inside the recorder's namespace
+    # (as in a Flatpak): the socket in the shared runtime dir must carry the
+    # commands, and they must report success.
+    pause_ok=no; resume_ok=no
+    sleep 2.3; bogus_pidfile "$f"; "$REC" pause >/dev/null 2>>"$OUT/pause-resume.log" && pause_ok=yes
+    sleep 2; bogus_pidfile "$f"; "$REC" resume >/dev/null 2>>"$OUT/pause-resume.log" && resume_ok=yes
     wait "$recorder" || true
+    wall=$(( $(date +%s) - started ))
     frames=$(ffprobe -v error -select_streams v -count_frames -show_entries stream=nb_read_frames -of csv=p=0 "$f" 2>/dev/null || echo 0)
     dur=$(ff duration "$f")
     # --duration is exact in grid slots; a loaded host's software encoder can
-    # drop slots (the writer counts them and keeps the grid), so 90% of the
-    # 300 frames is the bar, with the duration and the sync still exact.
-    if python3 scripts/synccheck.py "$f" --max-ms 1 >"$OUT/pause-resume.check" 2>&1 \
+    # drop slots (the writer counts them and keeps the grid), so 90% of the 300
+    # frames is the bar. The 1 ms sync bar holds whenever every slot was kept;
+    # with dropped slots the flash/beep pairing cannot be measured.
+    if [ "$pause_ok" = yes ] && [ "$resume_ok" = yes ] && [ "$wall" -ge 6 ] \
        && [ "$frames" -ge 270 ] && awk -v d="$dur" 'BEGIN { exit !(d > 4.9 && d < 5.2) }'; then
-        echo "PASS  pause-resume  ($frames/300 frames over ${dur}s, audio in sync across the pause)"
-        pass=$((pass+1))
-    elif [ "$frames" -ge 270 ] && awk -v d="$dur" 'BEGIN { exit !(d > 4.9 && d < 5.2) }' \
-         && [ "$(grep -c 'flashes$' "$OUT/pause-resume.check" 2>/dev/null || echo 0)" -ge 0 ]; then
-        # A loaded host drops slots, so flashes go missing and the flash/beep
-        # pairing cannot measure sync; the grid, the duration and the audio
-        # timeline are still checked, and the 1 ms bar is enforced on the runs
-        # that kept up.
-        echo "PASS  pause-resume  ($frames/300 frames over ${dur}s; sync not measurable on a loaded host: $(grep -m1 'audio 0' "$OUT/pause-resume.check" | sed 's/.*offset //' 2>/dev/null))"
-        pass=$((pass+1))
+        if python3 scripts/synccheck.py "$f" --max-ms 1 >"$OUT/pause-resume.check" 2>&1; then
+            echo "PASS  pause-resume  ($frames/300 frames over ${dur}s, ${wall}s wall with a 2 s pause over the socket, foreign pid, audio in sync)"
+            pass=$((pass+1))
+        elif [ "$frames" -lt 300 ]; then
+            echo "PASS  pause-resume  ($frames/300 frames over ${dur}s, ${wall}s wall, pause over the socket; sync not measurable with dropped slots)"
+            pass=$((pass+1))
+        else
+            bad pause-resume "all 300 frames but audio out of sync; see $OUT/pause-resume.check"
+        fi
     else
-        bad pause-resume "$frames/300 frames, duration $dur; see $OUT/pause-resume.check"
+        bad pause-resume "$frames/300 frames, duration $dur, pause=$pause_ok resume=$resume_ok, wall ${wall}s; see $OUT/pause-resume.log"
     fi
 fi
 
@@ -581,19 +601,44 @@ if wanted timeout-stop; then
     timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -o "$f" >/dev/null 2>"$OUT/timeout-stop.log" &
     pid=$!
     sleep 2
-    if "$REC" stop >"$OUT/timeout-stop.out" 2>>"$OUT/timeout-stop.log"; then
+    # A second recorder refuses while one is live (and leaves the first alone).
+    second=no
+    if timeout 20 "$REC" record -q --test-pattern --no-mic -t 1 -o "$OUT/second.mov" \
+           >"$OUT/timeout-stop.second" 2>&1; then
+        second=started
+    elif grep -q "another recorder is running" "$OUT/timeout-stop.second"; then
+        second=refused
+    fi
+    bogus_pidfile "$f"
+    if [ "$second" = refused ] && "$REC" stop >"$OUT/timeout-stop.out" 2>>"$OUT/timeout-stop.log"; then
         sleep 0.3
         frames=$(frame_count "$f" 2>/dev/null || echo 0)
         if [ "$frames" -ge 60 ] && ffmpeg -v error -i "$f" -f null - 2>>"$OUT/timeout-stop.log"; then
-            echo "PASS  timeout-stop  ($frames frames after \`rec-rs stop\`)"
+            echo "PASS  timeout-stop  ($frames frames after \`rec-rs stop\` with a foreign pid; a second recorder refused)"
             pass=$((pass+1))
         else
             bad timeout-stop "$frames frames"
         fi
     else
-        bad timeout-stop "rec-rs stop failed"
+        bad timeout-stop "rec-rs stop failed (second recorder: $second)"
     fi
     wait "$pid" 2>/dev/null || true
+    # The pidfile signal stays the fallback when nothing listens (a shell with
+    # no socket, an older recorder): removing the socket file makes the next
+    # stop take the SIGINT path, with a real pid.
+    f2="$OUT/timeout-stop-signal.mov"
+    timeout "$TIMEOUT" "$REC" record -q --test-pattern --no-mic -o "$f2" >/dev/null 2>"$OUT/timeout-stop-signal.log" &
+    pid2=$!
+    sleep 2
+    rm -f "${XDG_RUNTIME_DIR:-/tmp/rec-rs-$(id -u)}/rec-rs-control.sock"
+    if "$REC" stop >"$OUT/timeout-stop-signal.out" 2>>"$OUT/timeout-stop-signal.log" &&
+       [ "$(cat "$OUT/timeout-stop-signal.out")" = "$f2" ]; then
+        echo "PASS  timeout-stop-signal  (SIGINT fallback with the socket gone)"
+        pass=$((pass+1))
+    else
+        bad timeout-stop-signal "the signal fallback failed; see $OUT/timeout-stop-signal.log"
+    fi
+    wait "$pid2" 2>/dev/null || true
 fi
 
 # G15(a): the microphone stem under CPU pressure. Eight burners, then twenty
@@ -678,6 +723,89 @@ if named long-finalize; then
         bad long-finalize "see $OUT/long-finalize.log"
     fi
     unset REC_DEBUG
+fi
+
+# An idle app must not block a CLI recording (upstream refuses only while a
+# recording is live), and `rec-rs stop` must reach whichever one records — here
+# the CLI, from a "second Flatpak instance" whose pidfile pid is foreign.
+if wanted app-cli-control; then
+    if ! command -v sway >/dev/null 2>&1; then
+        echo "SKIP  app-cli-control  (needs sway; the dev image has it)"; skip=$((skip+1))
+    else
+        d="$OUT/app-cli-control"
+        rm -rf "$d"; mkdir -p "$d/rt" "$d/out"; chmod 700 "$d/rt"
+        printf '{"output_dir": "%s", "resolution": "720p", "fps": 30, "mic_enabled": false, "system_audio": false}\n' \
+            "$d/out" >"$d/settings.json"
+        cat >"$d/run.sh" <<INNER
+#!/bin/sh
+export XDG_RUNTIME_DIR="$d/rt" REC_SETTINGS="$d/settings.json"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+sway >"$d/sway.log" 2>&1 &
+sway_pid=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/wayland-1" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+[ -S "\$XDG_RUNTIME_DIR/wayland-1" ] || { kill \$sway_pid; exit 10; }
+export WAYLAND_DISPLAY=wayland-1
+# The app, idle: it holds its control socket, not the recorder socket.
+"$REC" gui --test-pattern >"$d/app.log" 2>&1 &
+app=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/rec-rs-control.sock" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+# A CLI recording starts next to the idle app.
+"$REC" record -q --test-pattern --no-mic -t 30 -o "$d/out/cli.mov" >"$d/cli.log" 2>&1 &
+cli=\$!
+i=0
+while [ ! -S "\$XDG_RUNTIME_DIR/rec-rs-recorder.sock" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
+sleep 1.5
+# A second recorder refuses while the CLI records.
+if "$REC" record -q --test-pattern --no-mic -t 1 -o "$d/out/blocked.mov" >"$d/blocked.log" 2>&1; then
+    echo started >"$d/blocked"
+elif grep -q "another recorder is running" "$d/blocked.log"; then
+    echo refused >"$d/blocked"
+else
+    echo failed >"$d/blocked"
+fi
+# The pidfile's pid means nothing here (another PID namespace); stop must use
+# the recorder socket.
+printf '999999\n%s\n' "$d/out/cli.mov" >"$d/rt/rec-rs.pid"
+"$REC" stop >"$d/stop.out" 2>>"$d/cli.log"
+echo "stop rc=\$?" >"$d/stop.rc"
+wait \$cli 2>/dev/null || true
+sleep 0.3
+if kill -0 \$app 2>/dev/null; then echo alive >"$d/app.state"; else echo dead >"$d/app.state"; fi
+# The app still answers a second launch after the CLI's recording ended.
+"$REC" gui >"$d/second.log" 2>&1 || true
+kill -TERM \$app 2>/dev/null || true
+wait \$app
+echo "app exit=\$?" >"$d/exit"
+kill -TERM \$sway_pid 2>/dev/null || true
+sleep 0.5; kill -KILL \$sway_pid 2>/dev/null || true
+exit 0
+INNER
+        chmod +x "$d/run.sh"
+        if command -v dbus-run-session >/dev/null 2>&1; then
+            timeout "$TIMEOUT" dbus-run-session -- "$d/run.sh" >"$d/session.log" 2>&1 || true
+        else
+            timeout "$TIMEOUT" "$d/run.sh" >"$d/session.log" 2>&1 || true
+        fi
+        frames=0
+        [ -f "$d/out/cli.mov" ] &&
+            frames=$(ffprobe -v error -select_streams v -count_frames \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$d/out/cli.mov" 2>/dev/null || echo 0)
+        if [ -f "$d/out/cli.mov" ] && [ "$frames" -ge 60 ] &&
+           "$REC" probe "$d/out/cli.mov" >"$d/probe.txt" 2>&1 &&
+           [ "$(cat "$d/stop.out" 2>/dev/null)" = "$d/out/cli.mov" ] &&
+           grep -qx refused "$d/blocked" 2>/dev/null &&
+           grep -qx alive "$d/app.state" 2>/dev/null &&
+           grep -q "already running" "$d/second.log" 2>/dev/null &&
+           grep -q "app exit=0" "$d/exit" 2>/dev/null; then
+            echo "PASS  app-cli-control  (idle app + CLI recording $frames frames, stop over the socket with a foreign pid, second recorder refused, app survived)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  app-cli-control  (cli '$d/out/cli.mov' $frames frames, blocked '$(cat "$d/blocked" 2>/dev/null)', app '$(cat "$d/app.state" 2>/dev/null)'; see $d/app.log, $d/cli.log, $d/blocked.log, $d/session.log)"
+            fail=$((fail+1))
+        fi
+    fi
 fi
 
 # Cases that belong to later phases (they need a real device, the app or
@@ -969,6 +1097,14 @@ app=\$!
 sleep 7
 # A second launch hands over to the running app instead of starting another.
 "$REC" gui >"$d/second.log" 2>&1 || true
+# ...and a CLI recorder refuses while the app is recording (upstream's rule).
+if "$REC" record -q --test-pattern --no-mic -t 1 -o "$d/blocked.mov" >"$d/blocked.log" 2>&1; then
+    echo started >"$d/blocked"
+elif grep -q "another recorder is running" "$d/blocked.log"; then
+    echo refused >"$d/blocked"
+else
+    echo failed >"$d/blocked"
+fi
 # The shell controls reach the app through the pidfile and signals.
 "$REC" pause >"$d/controls.log" 2>&1 && echo paused >>"$d/controls.log" || echo "pause failed" >>"$d/controls.log"
 sleep 1
@@ -1006,13 +1142,14 @@ INNER
            "$REC" probe "$file" >"$d/probe.txt" 2>&1 &&
            "$REC" probe "$quit_file" >"$d/probe-quit.txt" 2>&1 &&
            grep -q "already running" "$d/second.log" 2>/dev/null &&
+           grep -qx refused "$d/blocked" 2>/dev/null &&
            grep -q "paused" "$d/controls.log" 2>/dev/null &&
            grep -q "resumed" "$d/controls.log" 2>/dev/null &&
            grep -q "app running" "$d/app.log" 2>/dev/null &&
            grep -q "preview frame" "$d/app.log" 2>/dev/null &&
            grep -q "app exit=0" "$d/exit" 2>/dev/null &&
            [ ! -e "$d/rt/rec-rs.pid" ]; then
-            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, pause/resume/stop via the CLI, clean exit)"
+            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, a second recorder refused, pause/resume/stop via the CLI, clean exit)"
             pass=$((pass+1))
         else
             echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"

@@ -830,6 +830,39 @@ pub fn run(o: Options) -> Result<Stats> {
         libc::signal(libc::SIGHUP, on_signal as *const () as usize);
     }
     install_control_signals();
+    // Control over the shared socket first (it crosses PID namespaces, as a
+    // Flatpak's do): a second launch's `stop`/`pause`/`resume`/`save-replay`
+    // reaches this recorder, and a live listener makes a second recorder refuse
+    // to start. The signals stay as the fallback for a bare shell.
+    let _control = crate::app::control::serve_recorder(std::sync::Arc::new(|cmd| {
+        use crate::app::control::Control;
+        match cmd {
+            Control::Stop => {
+                STOP.store(true, Ordering::SeqCst);
+                true
+            }
+            Control::Pause => {
+                PAUSE_REQ.store(true, Ordering::SeqCst);
+                true
+            }
+            Control::Resume => {
+                RESUME_REQ.store(true, Ordering::SeqCst);
+                true
+            }
+            Control::SaveReplay => {
+                REPLAY_REQ.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }))
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!("another recorder is running; stop it with `rec-rs stop`")
+        } else {
+            anyhow::anyhow!("could not open the control socket: {e}")
+        }
+    })?;
     let mic_desc = match &o.mic {
         None => "off".to_string(),
         Some(None) => "default".to_string(),
@@ -1060,21 +1093,68 @@ pub fn signal_running(sig: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-/// Ask a running `rec-rs record` to stop (like Ctrl-C) and wait for it to
+/// Send a control command to the running recorder: over the socket first (it
+/// crosses PID namespaces, so a second `flatpak run` reaches the recorder),
+/// then, when nothing listens, the pidfile signal as before.
+fn control(cmd: crate::app::control::Control, sig: libc::c_int) -> Result<()> {
+    match crate::app::control::send_to_recorder(cmd) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!("the running recorder does not handle `{}`", cmd.name()),
+        Err(_) => {
+            // No socket, or a stale one from a crash: drop it and use the
+            // pidfile signal, which still works outside a namespace.
+            crate::app::control::remove_stale_recorder_socket();
+            signal_running(sig)
+        }
+    }
+}
+
+/// Pause the running recording (socket, else SIGUSR1).
+pub fn pause_running() -> Result<()> {
+    control(crate::app::control::Control::Pause, libc::SIGUSR1)
+}
+
+/// Resume the running recording (socket, else SIGUSR2).
+pub fn resume_running() -> Result<()> {
+    control(crate::app::control::Control::Resume, libc::SIGUSR2)
+}
+
+/// Save the running recorder's replay buffer (socket, else SIGRTMIN+1).
+pub fn save_replay_running() -> Result<()> {
+    control(
+        crate::app::control::Control::SaveReplay,
+        save_replay_signal(),
+    )
+}
+
+/// Ask a running recorder (the app or `rec-rs record`) to stop, wait for it to
 /// finish, then print the file.
+///
+/// The socket carries the command when one listens (a Flatpak instance's pid is
+/// meaningless in another instance); the signal is the fallback. Either way the
+/// wait is on the pidfile, which the recorder removes once the file is
+/// finalized, so a pid from another namespace never matters.
 pub fn stop_running() -> Result<()> {
     let path = pidfile_path();
     let (pid, file) = running().map_err(|_| anyhow::anyhow!("no recording in progress"))?;
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        let _ = std::fs::remove_file(&path);
-        bail!("no recording in progress (stale pidfile removed)");
+    let pid_live = unsafe { libc::kill(pid, 0) } == 0;
+    match crate::app::control::send_to_recorder(crate::app::control::Control::Stop) {
+        Ok(true) => {}
+        Ok(false) => bail!("the running recorder does not handle `stop`"),
+        Err(_) => {
+            crate::app::control::remove_stale_recorder_socket();
+            if !pid_live {
+                let _ = std::fs::remove_file(&path);
+                bail!("no recording in progress (stale pidfile removed)");
+            }
+            unsafe { libc::kill(pid, libc::SIGINT) };
+        }
     }
-    unsafe { libc::kill(pid, libc::SIGINT) };
     let deadline = Instant::now() + Duration::from_secs(90);
-    // Done when the recorder removes its pidfile (file finalized) or exits.
-    while unsafe { libc::kill(pid, 0) } == 0 && path.exists() {
+    // Done when the recorder removes its pidfile (file finalized).
+    while path.exists() {
         if Instant::now() > deadline {
-            bail!("recorder (pid {pid}) did not exit within 90s");
+            bail!("the recorder did not finish within 90s");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
