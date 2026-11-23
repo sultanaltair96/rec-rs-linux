@@ -157,11 +157,13 @@ fn record(a: RecordArgs) -> Result<()> {
         );
         if std::env::var_os("REC_DEBUG").is_some() {
             eprintln!(
-                "rec: debug: audio {} gaps filled, {} resyncs, {} overruns; video {} retries; finalise {} ms over {} fragments",
+                "rec: debug: audio {} gaps filled, {} resyncs, {} overruns; video {} in, {} retries, latency max {:.3}s; finalise {} ms over {} fragments",
                 stats.audio_gaps_filled,
                 stats.audio_resyncs,
                 stats.audio_overruns,
+                stats.video_frames_in,
                 stats.video_retries,
+                stats.screen_latency_max,
                 stats.finalize_millis,
                 stats.fragments
             );

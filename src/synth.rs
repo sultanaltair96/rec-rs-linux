@@ -15,7 +15,7 @@
 //! [`AudioChunk`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -183,12 +183,46 @@ fn draw(pattern: &Pattern, n: u64, rng: &mut Rng) -> VideoFrame {
     }
 }
 
+/// The origin the video and audio threads share.
+///
+/// It is created with the current time but reset once, when the first of the
+/// two sources starts: a source opened long before it is started (the writer
+/// builds its pipeline in between, which takes seconds at 4K) must not stamp
+/// its first frame in the past.
+struct Origin {
+    at: AtomicU64,
+    started: AtomicBool,
+}
+
+impl Origin {
+    fn new() -> Origin {
+        Origin {
+            at: AtomicU64::new(media_types::now().to_bits()),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// The first start resets the origin; every later call reads it, so the
+    /// video flashes and the beeps stay on one timeline.
+    fn begin(&self) -> f64 {
+        if !self.started.swap(true, Ordering::SeqCst) {
+            self.at
+                .store(media_types::now().to_bits(), Ordering::SeqCst);
+        }
+        f64::from_bits(self.at.load(Ordering::SeqCst))
+    }
+
+    fn get(&self) -> f64 {
+        f64::from_bits(self.at.load(Ordering::SeqCst))
+    }
+}
+
 /// The synthetic video source.
 pub struct Synth {
     pattern: Pattern,
     /// Host time of frame 0 and of beep 0: video and audio share it, so flash
     /// k and beep k are stamped exactly `origin + k` seconds.
-    origin: f64,
+    origin: Arc<Origin>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     running: bool,
@@ -199,7 +233,7 @@ impl Synth {
     pub fn new(pattern: Pattern) -> Synth {
         Synth {
             pattern,
-            origin: media_types::now(),
+            origin: Arc::new(Origin::new()),
             stop: Arc::new(AtomicBool::new(false)),
             handle: None,
             running: false,
@@ -209,13 +243,13 @@ impl Synth {
     /// Host time of the first frame (and of the matching beep).
     #[allow(dead_code)] // the tests and phase 1 sources that align to the pattern
     pub fn origin(&self) -> f64 {
-        self.origin
+        self.origin.get()
     }
 
     /// The matching synthetic system audio, on the same origin.
     pub fn audio(&self, system: bool) -> SynthAudio {
         SynthAudio {
-            origin: self.origin,
+            origin: self.origin.clone(),
             enabled: system,
             stop: Arc::new(AtomicBool::new(false)),
             handle: None,
@@ -253,7 +287,7 @@ impl VideoSource for Synth {
         }
         self.running = true;
         let pattern = self.pattern;
-        let origin = self.origin;
+        let origin = self.origin.begin();
         let stop = self.stop.clone();
         let period = 1.0 / pattern.fps as f64;
         self.handle = Some(std::thread::spawn(move || {
@@ -297,7 +331,7 @@ impl Drop for Synth {
 /// The synthetic system audio: a beep every second, delivered in real time like
 /// a device.
 pub struct SynthAudio {
-    origin: f64,
+    origin: Arc<Origin>,
     /// False when the recording has system audio off (then nothing is
     /// delivered, so the writer sees no audio at all).
     enabled: bool,
@@ -328,7 +362,7 @@ impl AudioSource for SynthAudio {
         }
         self.running = true;
         let stop = self.stop.clone();
-        let origin = self.origin;
+        let origin = self.origin.begin();
         let rate = crate::mixer::RATE;
         // Self-test hook: drop every Nth buffer like a glitching device.
         let drop_every: i64 = std::env::var("REC_SYNTH_DROP_AUDIO")
@@ -485,6 +519,84 @@ mod tests {
                 "frame {i} at {t}"
             );
         }
+    }
+
+    /// A source opened long before it starts must not stamp its first frame in
+    /// the past: the writer builds its pipeline between opening and starting
+    /// the sources (6.4 s at 4K), and a creation-time origin made the file
+    /// begin that far behind.
+    #[test]
+    fn a_late_start_does_not_stamp_the_first_frame_in_the_past() {
+        let mut s = Synth::new(Pattern {
+            width: 32,
+            height: 18,
+            fps: 120,
+            ..Default::default()
+        });
+        let created = s.origin();
+        let pts = Arc::new(std::sync::Mutex::new(vec![]));
+        let pts2 = pts.clone();
+        std::thread::sleep(Duration::from_millis(200));
+        let started = media_types::now();
+        s.start(Arc::new(move |f: VideoFrame| {
+            pts2.lock().unwrap().push(f.pts)
+        }))
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        s.stop().unwrap();
+        let pts = pts.lock().unwrap().clone();
+        assert!(!pts.is_empty());
+        assert!(
+            pts[0] > created + 0.1,
+            "first frame {:.4} is at the creation time {:.4}",
+            pts[0],
+            created
+        );
+        assert!(
+            pts[0] + 0.02 >= started,
+            "first frame {:.4} predates the start {:.4}",
+            pts[0],
+            started
+        );
+    }
+
+    /// The video start sets the shared origin; an audio start that follows
+    /// reads it, so flashes and beeps stay aligned.
+    #[test]
+    fn video_and_audio_share_the_origin_after_a_late_start() {
+        let mut s = Synth::new(Pattern {
+            width: 32,
+            height: 18,
+            fps: 120,
+            ..Default::default()
+        });
+        let mut a = s.audio(true);
+        std::thread::sleep(Duration::from_millis(100));
+        let video = Arc::new(std::sync::Mutex::new(vec![]));
+        let video2 = video.clone();
+        s.start(Arc::new(move |f: VideoFrame| {
+            video2.lock().unwrap().push(f.pts)
+        }))
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let audio = Arc::new(std::sync::Mutex::new(vec![]));
+        let audio2 = audio.clone();
+        a.start(Arc::new(move |_, chunk: AudioChunk| {
+            audio2.lock().unwrap().push(chunk.pts)
+        }))
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        a.stop().unwrap();
+        s.stop().unwrap();
+        let video = video.lock().unwrap().clone();
+        let audio = audio.lock().unwrap().clone();
+        assert!(!video.is_empty() && !audio.is_empty());
+        assert!(
+            (video[0] - audio[0]).abs() < 0.05,
+            "video {} and audio {} start apart",
+            video[0],
+            audio[0]
+        );
     }
 
     /// The audio source delivers 10 ms chunks on the same timeline, in real

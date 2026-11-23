@@ -628,7 +628,7 @@ impl Session {
                 let now = media_types::now();
                 let mut failure = None;
                 pacer_shared.with(|w| {
-                    w.emit_until(now - w.lag());
+                    w.emit_until(now - w.lag(), 4);
                     failure = w.failure().map(str::to_string);
                 });
                 if let Some(f) = failure {
