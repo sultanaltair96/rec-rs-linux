@@ -27,6 +27,12 @@ pub const RATE: f64 = 48_000.0;
 const MAX_WAIT: i64 = 24000; // 0.5 s
 /// Treat timestamp jumps up to this many samples as continuous.
 const SNAP: i64 = 96; // 2 ms
+/// Samples the mix bus may hold for one source. Four times the 0.5 s emission
+/// lag, so real jitter is never dropped, while a source whose clock jumps
+/// (a device bug, wall-clock timestamps) cannot make the buffer grow without
+/// bound. A chunk beyond it is dropped and counted in [`Mixer::overruns`]; the
+/// source resyncs on its next sane buffer.
+const MAX_BUFFER: i64 = 2 * RATE as i64;
 
 /// Index of a source in the per-source arrays.
 fn idx(k: AudioKind) -> usize {
@@ -66,6 +72,9 @@ pub struct Mixer {
     active: [bool; 2],
     /// Samples that would have clipped (the limiter held them back).
     pub clipped: u64,
+    /// Chunks dropped because their timestamp was more than `MAX_BUFFER`
+    /// ahead of the mix (a clock jump, not a real gap).
+    pub overruns: u64,
     resamplers: [Option<Resampler>; 2],
     limiter: Limiter,
 }
@@ -81,6 +90,7 @@ impl Mixer {
             horizon: [None, None],
             active: [system, mic],
             clipped: 0,
+            overruns: 0,
             resamplers: [None, None],
             limiter: Limiter { gain: 1.0 },
         }
@@ -118,8 +128,17 @@ impl Mixer {
             start = h;
         }
         let end = start + frames.len() as i64;
+        let need = (end - self.base).max(0);
+        if need > MAX_BUFFER {
+            // A timestamp far ahead of the mix (a device clock jump, a source
+            // that switched to wall-clock time) would make the buffer grow
+            // without bound. Drop the chunk; memory stays flat and the source
+            // resyncs on its next sane buffer.
+            self.overruns += 1;
+            return;
+        }
         self.horizon[i] = Some(self.horizon[i].map_or(end, |h| h.max(end)));
-        let need = (end - self.base).max(0) as usize;
+        let need = need as usize;
         if self.buf.len() < need {
             self.buf.resize(need, [0.0, 0.0]);
         }
@@ -649,4 +668,47 @@ mod tests {
         let mono = mono.scaled(&env);
         assert_eq!((mono.frames(), mono.samples[2]), (8, 0.4f32));
     }
+    #[test]
+    fn a_far_future_chunk_cannot_grow_the_mix_buffer() {
+        // A source whose clock jumps (wall-clock timestamps, a device bug) must
+        // not make the mix allocate the samples of the jump. The chunk is
+        // dropped and counted; a sane buffer afterwards still mixes.
+        let mut m = Mixer::new(0.0, true, true);
+        m.push(AudioKind::System, 0.0, RATE, vec![[0.1, 0.1]; 480]);
+        m.push(AudioKind::Mic, 1000.0, RATE, vec![[0.1, 0.1]; 480]);
+        assert_eq!(m.overruns, 1, "the far-future chunk is dropped");
+        assert!(
+            m.buf.len() <= MAX_BUFFER as usize,
+            "mix buffer {} samples",
+            m.buf.len()
+        );
+        // The mic's next sane buffer still lands on the shared timeline.
+        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.2, 0.2]; 480]);
+        let (_, frames) = m.pull_frames(true).expect("mixed audio");
+        assert!((frames[100][0] - 0.3).abs() < 1e-6, "{}", frames[100][0]);
+    }
+
+    #[test]
+    fn the_mix_buffer_stays_bounded_when_one_source_never_delivers() {
+        // Only the system source feeds the bus for ten minutes of audio; the
+        // mic stays silent. The bus emits MAX_WAIT behind the newest source and
+        // never buffers more than that.
+        let mut m = Mixer::new(0.0, true, true);
+        let mut pulled = 0usize;
+        for k in 0..(600 * 100) {
+            let t = k as f64 * 0.01;
+            m.push(AudioKind::System, t, RATE, vec![[0.05, 0.05]; 480]);
+            while let Some((_, frames)) = m.pull_frames(false) {
+                pulled += frames.len();
+            }
+        }
+        assert!(pulled > 0);
+        assert!(
+            m.buf.len() <= MAX_BUFFER as usize,
+            "mix buffer {} samples",
+            m.buf.len()
+        );
+        assert_eq!(m.overruns, 0, "a silent source is not an overrun");
+    }
+
 }

@@ -37,11 +37,15 @@ TIMEOUT="${REC_TIMEOUT:-120}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 pass=0; fail=0; skip=0
 only=" $* "
-wanted() { [ -z "$(echo "$only" | tr -d ' ')" ] || [ "${only#* $1 }" != "$only" ]; }
+only_clean=$(echo "$only" | tr -d ' ')
+wanted() { [ -z "$only_clean" ] || [ "${only#* $1 }" != "$only" ]; }
+# An opt-in case only runs when it is named: the default pass stays short.
+named() { [ -n "$only_clean" ] && wanted "$1"; }
 
 case "${1:-}" in
     --list)
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
+        echo "pattern-4k-long (20 s, RSS bound)"
         echo "tracks audio-tracks sync audio-gaps pause-resume gain h264-bitrate"
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
@@ -187,6 +191,35 @@ if wanted pattern-4k-hevc; then
             pass=$((pass+1))
         else
             bad pattern-4k-hevc "codec=$codec ${w}x${h} $prim/$rng tracks=$(tracks "$f") frames=$n"
+        fi
+    fi
+fi
+
+# A slow encoder must not grow memory: twenty seconds of noisy 4K60 is far
+# below real time on a CPU (x265 ~15 fps here), so the writer drops grid slots
+# (counted, timeline kept). Peak resident memory is sampled from /proc while it
+# runs; the appsrc and every queue are bounded to a couple of frames, so the
+# figure is the encoder's frame pool, not a growing backlog.
+if wanted pattern-4k-long; then
+    f="$OUT/pattern-4k-long.mov"
+    "$REC" record --test-pattern --noise -r 4k -t 20 --no-mic -o "$f" >"$OUT/pattern-4k-long.out" 2>&1 &
+    pid=$!
+    peak=0
+    while kill -0 "$pid" 2>/dev/null; do
+        rss=$(awk '/VmHWM/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+        [ -n "$rss" ] && [ "$rss" -gt "$peak" ] && peak=$rss
+        sleep 0.25
+    done
+    if wait "$pid" && decodes "$f"; then
+        frames=$(frame_count "$f")
+        dropped=$(sed -n 's/.*video frames, [0-9]* duplicated, \([0-9]*\) dropped.*/\1/p' "$OUT/pattern-4k-long.out" | head -1)
+        fps=$(awk -v n="$frames" 'BEGIN { printf "%.1f", n / 20 }')
+        # 1.5 GB: the encoder's 4K pools plus two queued frames, no backlog.
+        if [ "$peak" -lt 1500000 ] && [ "$frames" -gt 0 ]; then
+            echo "PASS  pattern-4k-long  (20 s 4K60 noise: peak RSS $((peak / 1024)) MB, $frames frames ($fps fps), ${dropped:-0} dropped)"
+            pass=$((pass+1))
+        else
+            bad pattern-4k-long "peak RSS $((peak / 1024)) MB, $frames frames, ${dropped:-0} dropped"
         fi
     fi
 fi
@@ -495,7 +528,7 @@ fi
 
 # Ten minutes at a small size: measures the finalise with hundreds of
 # fragments. Opt-in: name it explicitly (`scripts/selftest.sh long-finalize`).
-if wanted long-finalize; then
+if named long-finalize; then
     f="$OUT/long-finalize.mp4"
     start=$(date +%s%N)
     export REC_DEBUG=1

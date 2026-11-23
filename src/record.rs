@@ -256,11 +256,37 @@ impl Session {
             bitrate: o.bitrate,
         };
         let path = o.write.then_some(o.output.as_path());
+        // The microphone is opened before the writer: its track is only
+        // created when the device is really there. A track whose source never
+        // delivers makes the muxer wait for it and stalls every other stream
+        // (measured: a requested but silent mic stopped 4K video).
+        let mut mic_source: Option<Box<dyn crate::media_types::AudioSource>> = None;
+        if let Some(sel) = &o.mic {
+            let req = AudioRequest {
+                device: sel.clone(),
+                name: o.mic_name.clone(),
+            };
+            match testsrc::mic_from_env() {
+                // A synthetic microphone stands in for the device in tests.
+                Some(src) => mic_source = Some(src),
+                None => match audio_capture::open_mic(&req) {
+                    Ok(src) => mic_source = Some(src),
+                    // An explicit device request fails; the default mic only
+                    // warns, because audio never blocks a session (upstream's
+                    // rule).
+                    Err(e) if o.mic_explicit => {
+                        return Err(e.context("the microphone you asked for could not be opened"));
+                    }
+                    Err(e) => eprintln!("rec: warning: {e}; recording without the microphone"),
+                },
+            }
+        }
+        let has_mic = mic_source.is_some();
         let mut writer = Writer::new(
             path,
             &spec,
             o.system_audio,
-            o.mic.is_some(),
+            has_mic,
             o.audio_layout,
             o.volumes,
             o.scene,
@@ -275,7 +301,7 @@ impl Session {
         }
         // One shared live encode for the replay buffer and the streams.
         if let Some(l) = &o.live {
-            let _ = l.begin_session(o.system_audio, o.mic.is_some());
+            let _ = l.begin_session(o.system_audio, has_mic);
             writer.set_live(l.clone());
         }
         // Phase 1C's compositor draws the scenes; until it lands the writer
@@ -338,7 +364,7 @@ impl Session {
             video: None,
             camera: None,
             camera_desc: String::new(),
-            audio: vec![],
+            audio: mic_source.into_iter().collect(),
             output: o.write.then(|| o.output.clone()),
             started: Instant::now(),
             description: String::new(),
@@ -456,26 +482,6 @@ impl Session {
                 if o.system_audio {
                     self.audio.push(audio_capture::open_system()?);
                 }
-            }
-        }
-        if let Some(sel) = &o.mic {
-            let req = AudioRequest {
-                device: sel.clone(),
-                name: o.mic_name.clone(),
-            };
-            match testsrc::mic_from_env() {
-                // A synthetic microphone stands in for the device in tests.
-                Some(src) => self.audio.push(src),
-                None => match audio_capture::open_mic(&req) {
-                    Ok(src) => self.audio.push(src),
-                    // An explicit device request fails; the default mic only
-                    // warns, because audio never blocks a session (upstream's
-                    // rule).
-                    Err(e) if o.mic_explicit => {
-                        return Err(e.context("the microphone you asked for could not be opened"));
-                    }
-                    Err(e) => eprintln!("rec: warning: {e}; recording without the microphone"),
-                },
             }
         }
         if let Some(v) = &mut self.video {

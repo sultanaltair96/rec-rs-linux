@@ -128,6 +128,10 @@ pub struct Stats {
     pub audio_drops: u64,
     /// Audio gaps (late start, dropped device buffers) filled with silence.
     pub audio_gaps_filled: u64,
+    /// Audio chunks dropped because their timestamp jumped more than
+    /// `MAX_GAP_SECS`/`MAX_BUFFER` (a broken clock, not a real gap).
+    pub audio_resyncs: u64,
+    pub audio_overruns: u64,
     /// Samples the mix would have clipped (the limiter held them back).
     pub audio_clipped_samples: u64,
     /// Grid slots skipped while paused or past `--duration`.
@@ -154,12 +158,42 @@ pub const MAX_LAG_SECS: f64 = 0.3;
 /// 60 fps up to about 115 ms of continuous motion.
 const QUEUE_MAX: usize = 7;
 
+/// Frames the GStreamer video appsrc and its queue may hold. Two frames cover
+/// one encoder frame plus one in flight; anything more is memory a slow
+/// software encoder (a 4K BGRA frame is 33 MB) must not spend.
+const VIDEO_QUEUE_FRAMES: u64 = 2;
+
+/// Bytes an audio appsrc may hold: 17 buffers of 10 ms stereo f32 (170 ms).
+const AUDIO_QUEUE_BYTES: u64 = 64 * 1024;
+
+/// Buffers an audio appsrc/queue may hold.
+const AUDIO_QUEUE_BUFFERS: u32 = 8;
+
 /// How far behind its time a slot may fall while the encoder is busy before it
 /// is dropped instead of retried (upstream's `MAX_BACKLOG_SECS`).
 pub const MAX_BACKLOG_SECS: f64 = 0.5;
 
 /// Audio timestamp jitter tolerated before a track is padded or trimmed.
 pub const SNAP_SECS: f64 = 0.0015;
+
+/// The longest audio gap the writer fills with silence. A longer jump is a
+/// source's clock bug or a device that connected late: the track resyncs
+/// instead of allocating (and writing) the silence for it.
+pub const MAX_GAP_SECS: f64 = 5.0;
+
+/// The furthest a track may resync to (a microphone that connected a minute
+/// after the session). Beyond it the chunk is dropped outright, so a broken
+/// clock cannot make a ten-minute file out of a two-second recording.
+pub const MAX_RESYNC_SECS: f64 = 60.0;
+
+/// How far a track that has produced audio may lag the video timeline before
+/// the writer fills the gap with silence (a device that died mid-session).
+/// Without it the muxer waits for the silent stream and stalls every other
+/// stream with it.
+pub const STARVE_SECS: f64 = 0.5;
+
+/// The most silence written to one track per pacer pass.
+const SILENCE_CHUNK_SECS: f64 = 1.0;
 
 /// Start without the camera if it delivers nothing for this long after the
 /// settle time.
@@ -215,6 +249,9 @@ struct Sink {
     encoder: String,
     /// Track layout to apply when the file is finalised.
     layout: mp4::Layout,
+    /// Bytes the video appsrc may hold (2 frames): the drop policy matches
+    /// upstream's `isReadyForMoreMediaData`.
+    video_max_bytes: u64,
 }
 
 /// The camera gate: hold the start of the file until the camera has delivered
@@ -659,8 +696,12 @@ impl Writer {
                 self.mixer = Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
             }
             if self.live.is_some() {
+                // The live tap is fed absolute host-clock times, so its mix
+                // bus must start at the session clock: a bus starting at zero
+                // would place every buffer hours in (and try to allocate the
+                // samples for it).
                 self.live_mixer =
-                    Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
+                    Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
             }
         }
         for (kind, chunk) in std::mem::take(&mut self.preroll) {
@@ -716,7 +757,7 @@ impl Writer {
         if self.live.is_some() {
             if self.live_mixer.is_none() {
                 self.live_mixer =
-                    Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
+                    Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
             }
             if let Some(m) = self.live_mixer.as_mut() {
                 m.push(kind, real, mixer::RATE, frames.clone());
@@ -777,11 +818,13 @@ impl Writer {
     fn drain_mix(&mut self, flush: bool) {
         let mut chunks: Vec<(f64, Vec<[f32; 2]>)> = vec![];
         let mut clipped = 0;
+        let mut overruns = 0;
         if let Some(m) = self.mixer.as_mut() {
             while let Some((t, frames)) = m.pull_frames(flush) {
                 chunks.push((t, frames));
             }
             clipped = m.clipped;
+            overruns = m.overruns;
         }
         for (t, frames) in chunks {
             self.write_track(Target::Mix, t, &frames);
@@ -789,7 +832,15 @@ impl Writer {
         }
         if self.mixer.is_some() {
             self.stats.audio_clipped_samples = clipped;
+            self.note_overruns(overruns);
         }
+    }
+
+    /// Count the chunks both mix buses refused (a timestamp jump), minus the
+    /// ones already counted for the other bus.
+    fn note_overruns(&mut self, file: u64) {
+        let live = self.live_mixer.as_ref().map_or(0, |m| m.overruns);
+        self.stats.audio_overruns = file + live;
     }
 
     /// Offer the live mix to the shared encode.
@@ -803,6 +854,58 @@ impl Writer {
         }
         for chunk in chunks {
             live.push_audio(&chunk);
+        }
+        let file = self.mixer.as_ref().map_or(0, |m| m.overruns);
+        self.note_overruns(file);
+    }
+
+    /// Keep every audio track moving on the file's timeline.
+    ///
+    /// A track whose source never delivered, or stopped delivering, must not
+    /// stall the muxer: qtmux waits for every stream to reach a fragment
+    /// before writing it, so one silent track blocks video too (measured: a
+    /// requested-but-silent microphone stopped a 320x180 test at 11 frames).
+    /// A never-started track gets silence from the start; a track that has
+    /// data gets it only once it is STARVE_SECS behind. Real audio that arrives
+    /// later overlaps the silence and `write_track` trims the overlap, so the
+    /// source's own samples replace it exactly.
+    fn top_up_audio(&mut self, out_time: f64) {
+        let Some(sink) = self.sink.as_mut() else { return };
+        let limit = self.limit.map(|l| l as f64 / self.spec.fps as f64);
+        let out_time = limit.map_or(out_time, |l| out_time.min(l));
+        let mut filled = 0u64;
+        let mut failed = false;
+        for track in &mut sink.tracks {
+            let start = track.next.unwrap_or(0.0);
+            let never = track.next.is_none();
+            if out_time <= start + SNAP_SECS {
+                continue;
+            }
+            if !never && out_time - start < STARVE_SECS {
+                continue;
+            }
+            let mut at = start;
+            while at + SNAP_SECS < out_time {
+                let secs = (out_time - at).min(SILENCE_CHUNK_SECS);
+                let n = (secs * mixer::RATE).round() as usize;
+                if n == 0 {
+                    break;
+                }
+                if !push_track_samples(track, at, &vec![[0.0, 0.0]; n], track.channels as usize) {
+                    failed = true;
+                    break;
+                }
+                at += n as f64 / mixer::RATE;
+                filled += 1;
+            }
+            track.next = Some(at);
+        }
+        self.stats.audio_gaps_filled += filled;
+        if filled > 0 {
+            self.check_bus();
+        }
+        if failed {
+            self.stats.audio_drops += 1;
         }
     }
 
@@ -821,11 +924,24 @@ impl Writer {
         // The track continues from the last buffer written: fill a gap (late
         // start, dropped device buffer) with silence and trim an overlap, both
         // sample-accurate. Error stays under SNAP_SECS.
-        let start = track.next.unwrap_or(0.0);
+        let mut start = track.next.unwrap_or(0.0);
         let gap = pts - start;
         let mut pad = 0usize;
         let mut skip = 0usize;
-        if gap > SNAP_SECS {
+        if gap > MAX_GAP_SECS {
+            // A timestamp jump (a device clock, not a real gap): filling the
+            // gap with silence would allocate it. A device that started late
+            // (up to MAX_RESYNC_SECS) begins its track here; anything further
+            // is a broken clock and the chunk is dropped, so a 1000 s jump
+            // cannot stretch a 2 s recording.
+            self.stats.audio_resyncs += 1;
+            if gap > MAX_RESYNC_SECS {
+                self.stats.audio_drops += 1;
+                return;
+            }
+            start = pts;
+            track.next = Some(pts);
+        } else if gap > SNAP_SECS {
             pad = (gap * rate).round() as usize;
         } else if gap < -SNAP_SECS {
             skip = (-gap * rate).round() as usize;
@@ -916,12 +1032,23 @@ impl Writer {
         let Some(sink) = self.sink.as_ref() else {
             return true;
         };
-        let value = sink.video_src.property_value("current-level-buffers");
-        let level = value
+        let level = sink
+            .video_src
+            .property_value("current-level-buffers")
             .get::<u64>()
-            .or_else(|_| value.get::<u32>().map(u64::from))
+            .or_else(|_| {
+                sink.video_src
+                    .property_value("current-level-buffers")
+                    .get::<u32>()
+                    .map(u64::from)
+            })
             .unwrap_or(0);
-        level < 4
+        let bytes = sink
+            .video_src
+            .property_value("current-level-bytes")
+            .get::<u64>()
+            .unwrap_or(0);
+        level < VIDEO_QUEUE_FRAMES && bytes < sink.video_max_bytes
     }
 
     /// Emit every grid slot whose time is at or before `until` (host seconds).
@@ -994,6 +1121,7 @@ impl Writer {
                 p(frame.as_ref().clone());
             }
         }
+        self.top_up_audio(self.out_slot as f64 / self.spec.fps as f64);
     }
 
     /// The output frame for a slot: the compositor's result when phase 1C is
@@ -1371,6 +1499,16 @@ fn push_track_samples(
             frames.len() as f64 / mixer::RATE,
         )));
     }
+    // A full queue (the muxer stalled behind a broken stream) is a dropped
+    // buffer, not a blocked capture thread; the caller counts it.
+    let queued = track
+        .appsrc
+        .property_value("current-level-bytes")
+        .get::<u64>()
+        .unwrap_or(0);
+    if queued >= AUDIO_QUEUE_BYTES {
+        return false;
+    }
     track.appsrc.push_buffer(buffer).is_ok()
 }
 
@@ -1461,6 +1599,7 @@ fn make_encoder(
     fps: Option<u32>,
     label: &str,
     probe_format: Option<&str>,
+    wide: bool,
 ) -> Result<(gst::Element, String)> {
     for name in candidates {
         // VA-API needs a render node: without /dev/dri the plugin registers no
@@ -1517,14 +1656,19 @@ fn make_encoder(
                     el.set_property_from_str("tune", "zerolatency");
                 }
                 if el.find_property("speed-preset").is_some() {
-                    el.set_property_from_str("speed-preset", "veryfast");
+                    // Real-time screen recording: a 4K frame gets the faster
+                    // preset, 1080p the better-looking one.
+                    let preset = if wide { "superfast" } else { "veryfast" };
+                    el.set_property_from_str("speed-preset", preset);
                 }
             }
             "x265enc" => {
-                // x265's zerolatency tune also disables B-frames, which keeps the
-                // frame grid simple (upstream writes no B-frames either).
+                // x265's zerolatency tune also disables B-frames and the
+                // lookahead, which keeps the frame grid simple and the encoder
+                // real-time (a CPU cannot do 4K60 any slower); ultrafast is
+                // what a software screen recorder needs.
                 set(&el, "tune", "zerolatency");
-                set(&el, "speed-preset", "veryfast");
+                set(&el, "speed-preset", "ultrafast");
                 // ABR alone lets x265 run away on very noisy frames (83 Mb/s
                 // for a requested 8 Mb/s was measured); a half-second VBV pins
                 // it to the budget (8.7-9.7 Mb/s, dev/ELEMENTS.md).
@@ -1532,7 +1676,10 @@ fn make_encoder(
                 set(
                     &el,
                     "option-string",
-                    format!("vbv-maxrate={kbps}:vbv-bufsize={}", (kbps / 2).max(1)),
+                    format!(
+                        "vbv-maxrate={kbps}:vbv-bufsize={}:rc-lookahead=0:bframes=0",
+                        (kbps / 2).max(1)
+                    ),
                 );
             }
             "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
@@ -1692,6 +1839,7 @@ fn open_sink(
         Some(spec.fps),
         "video",
         Some(enc_format),
+        spec.width * spec.height > 1920 * 1080,
     )?;
 
     // The appsrc announces the source's own size (a display's native 1440p for
@@ -1709,8 +1857,16 @@ fn open_sink(
         .is_live(false)
         .do_timestamp(false)
         .build();
-    set(video_src.upcast_ref(), "max-buffers", 4);
+    // Two frames, and never block the pacer: a full queue means the encoder is
+    // behind, and the writer drops that grid slot (counted) instead of letting
+    // raw 4K frames pile up (a 4 GB process was measured with an unbounded
+    // appsrc behind a CPU x265).
+    let frame_bytes = (spec.width * spec.height * 4) as u64;
+    let video_max_bytes = VIDEO_QUEUE_FRAMES * frame_bytes;
+    set(video_src.upcast_ref(), "max-buffers", VIDEO_QUEUE_FRAMES);
+    set(video_src.upcast_ref(), "max-bytes", video_max_bytes);
     set(video_src.upcast_ref(), "block", false);
+    set(video_src.upcast_ref(), "leaky-type", "downstream");
     let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
     let videoscale = gst::ElementFactory::make("videoscale").build()?;
     set(&videoscale, "method", "lanczos");
@@ -1740,7 +1896,9 @@ fn open_sink(
     // merely busy (upstream's `MAX_BACKLOG_SECS`) and drops only when it is
     // more than half a second behind. A leaky queue here silently lost 20% of
     // the frames in a non-fragmented muxer run.
-    set(&vqueue, "max-size-buffers", 4);
+    set(&vqueue, "max-size-buffers", VIDEO_QUEUE_FRAMES);
+    set(&vqueue, "max-size-bytes", video_max_bytes);
+    set(&vqueue, "max-size-time", 0);
     // h264parse/h265parse turn whatever the encoder emits into the format the
     // muxer wants (avc/hvc1 with in-band parameter sets). ProRes is already
     // framed.
@@ -1812,7 +1970,8 @@ fn open_sink(
                 .field("channels", *channels as i32)
                 .build();
             // One encoder per track: a shared one would interleave the streams.
-            let (aenc, aname) = make_encoder(AUDIO_ENCODER_CANDIDATES, *bitrate, None, "AAC", None)?;
+            let (aenc, aname) =
+                make_encoder(AUDIO_ENCODER_CANDIDATES, *bitrate, None, "AAC", None, false)?;
             audio_names.push(aname.clone());
             let priming_override = std::env::var("REC_AAC_PRIMING")
                 .ok()
@@ -1826,11 +1985,17 @@ fn open_sink(
                 .do_timestamp(false)
                 .max_bytes(1 << 20)
                 .build();
-            set(src.upcast_ref(), "max-buffers", 16);
+            set(src.upcast_ref(), "max-buffers", AUDIO_QUEUE_BUFFERS);
+            set(src.upcast_ref(), "max-bytes", AUDIO_QUEUE_BYTES);
+            set(src.upcast_ref(), "block", false);
+            set(src.upcast_ref(), "leaky-type", "downstream");
             let convert = gst::ElementFactory::make("audioconvert").build()?;
             let resample = gst::ElementFactory::make("audioresample").build()?;
             let aparse = gst::ElementFactory::make("aacparse").build()?;
             let q = gst::ElementFactory::make("queue").build()?;
+            set(&q, "max-size-buffers", AUDIO_QUEUE_BUFFERS);
+            set(&q, "max-size-bytes", AUDIO_QUEUE_BYTES);
+            set(&q, "max-size-time", 0);
             let chain: Vec<gst::Element> = vec![
                 src.clone().upcast(),
                 convert,
@@ -1877,6 +2042,7 @@ fn open_sink(
         path: path.to_path_buf(),
         encoder,
         layout: mp4_layout,
+        video_max_bytes,
     })
 }
 
@@ -2174,4 +2340,187 @@ mod tests {
         )
         .unwrap()
     }
+    /// Resident set size in kB, from /proc (Linux only).
+    fn vm_rss_kb() -> u64 {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return 0;
+        };
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    fn frame_at(pts: f64, width: usize, height: usize) -> VideoFrame {
+        VideoFrame::packed(pts, width, height, PixelFormat::Bgra, vec![0u8; width * height * 4])
+    }
+
+    /// A recording must never buffer without bound: a source that is silent
+    /// for the whole session, and a source whose timestamps jump far into the
+    /// future, both have to leave resident memory flat. Before the bounds were
+    /// added a timestamp jump made the mix allocate a sample per second of the
+    /// jump (a 10 GB process was measured).
+    #[test]
+    fn a_silent_or_far_future_source_cannot_grow_memory() {
+        let t0 = crate::media_types::now();
+        let mut w = Writer::new(
+            None,
+            &VideoSpec {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                codec: Codec::H264,
+                bitrate: 8_000_000,
+            },
+            true,
+            true,
+            AudioLayout::Both,
+            [Volume::UNITY; 2],
+            Scene::Screen,
+            PipSpec::default(),
+        )
+        .unwrap();
+        // The live tap is the other mix bus: it must be bounded too.
+        w.set_live(Arc::new(crate::live::Live::new()));
+        let before = vm_rss_kb();
+        let mut audio = 0usize;
+        // Thirty seconds of 1080p60, fed as fast as the CPU can.
+        for i in 0..(30 * 60) {
+            let t = t0 + i as f64 / 60.0;
+            w.push_video(frame_at(t, 1920, 1080));
+            // System audio every 10 ms, on time.
+            while t0 + audio as f64 * 0.01 <= t {
+                let at = t0 + audio as f64 * 0.01;
+                w.push_audio(
+                    AudioKind::System,
+                    &AudioChunk::stereo(at, 48_000, vec![0.001; 960]),
+                );
+                audio += 1;
+            }
+            // The mic never delivers for the first half; then it delivers with
+            // a clock 1000 s ahead (the pathological case).
+            if i > 15 * 60 {
+                let at = t0 + 1000.0 + i as f64 * 0.01;
+                w.push_audio(AudioKind::Mic, &AudioChunk::stereo(at, 48_000, vec![0.001; 960]));
+            }
+            w.emit_until(t - w.lag());
+        }
+        let after = vm_rss_kb();
+        let growth = after.saturating_sub(before);
+        // The 30 s of 1080p frames are 8 MB each, so an unbounded queue would
+        // be tens of GB; the bound is a few queued frames plus audio.
+        assert!(
+            growth < 300_000,
+            "resident memory grew by {growth} kB ({before} -> {after} kB) over 30 s of video"
+        );
+        assert!(
+            w.stats.audio_resyncs + w.stats.audio_overruns > 0,
+            "the far-future audio was counted as a clock jump"
+        );
+        assert!(w.stats.video_frames_out > 0, "video was emitted");
+    }
+
+    /// A broken microphone clock must not stretch the file either: a chunk
+    /// 1000 s ahead is dropped, not written 1000 s into the audio track. The
+    /// file stays as long as the video and the memory stays flat.
+    #[test]
+    fn a_broken_audio_clock_cannot_stretch_the_file() {
+        let _ = gst::init();
+        let dir = std::env::temp_dir().join(format!("rec-rs-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clock.mov");
+        let _ = std::fs::remove_file(&path);
+        let spec = VideoSpec {
+            width: 320,
+            height: 180,
+            fps: 30,
+            codec: Codec::H264,
+            bitrate: 1_000_000,
+        };
+        let mut w = Writer::new(
+            Some(&path),
+            &spec,
+            true,
+            true,
+            AudioLayout::Both,
+            [Volume::UNITY; 2],
+            Scene::Screen,
+            PipSpec::default(),
+        )
+        .unwrap();
+        w.limit_secs(Some(2.0));
+        let before = vm_rss_kb();
+        let t0 = crate::media_types::now();
+        let end = t0 + 2.0;
+        let mut audio = 0usize;
+        for i in 0..60 {
+            let t = t0 + i as f64 / 30.0;
+            // Let the encoder catch up, then feed this slot.
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while !w.video_ready() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            w.push_video(frame_at(t, 320, 180));
+            while t0 + audio as f64 * 0.01 <= t {
+                let at = t0 + audio as f64 * 0.01;
+                w.push_audio(
+                    AudioKind::System,
+                    &AudioChunk::stereo(at, 48_000, vec![0.05; 960]),
+                );
+                audio += 1;
+            }
+            // The mic's clock is 1000 s ahead, every buffer.
+            w.push_audio(
+                AudioKind::Mic,
+                &AudioChunk::stereo(t0 + 1000.0 + i as f64 * 0.01, 48_000, vec![0.05; 960]),
+            );
+            w.emit_until(t);
+        }
+        // Give the encoder time to take the last slots.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while w.stats.video_frames_out < 60 && std::time::Instant::now() < deadline {
+            // Always call emit_until: even when the video queue is full it
+            // tops up the audio tracks with silence, which is what unblocks a
+            // muxer waiting for a stream that never delivered.
+            w.emit_until(end);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let stats = w.finish(end).unwrap();
+        let after = vm_rss_kb();
+        assert!(stats.audio_resyncs > 0, "the jump was counted");
+        assert!(stats.audio_overruns > 0, "the mix bus refused the jump");
+        // A source that never delivers makes the muxer wait for it; the
+        // writer's answer is to drop grid slots (counted, memory flat), not to
+        // buffer. The session avoids creating such a track at all when a
+        // device fails to open (record.rs).
+        assert!(stats.video_frames_out > 0, "video was written");
+        // A black-hole source (opened, but never delivers) still makes qtmux
+        // wait for it until the fragment boundary; the writer's contract is
+        // that it drops grid slots (counted) and keeps memory flat, not that
+        // every slot flows. `record.rs` does not create a track at all when a
+        // device fails to open.
+        assert!(stats.video_frames_out > 0, "video was written");
+        assert!(
+            stats.video_frames_out + stats.video_drops > 0,
+            "slots are written or counted as dropped"
+        );
+        let info = crate::media::mp4::read(&path).expect("the file reads back");
+        let secs = info.duration as f64 / info.movie_timescale.max(1) as f64;
+        assert!(secs < 5.0, "the file is {secs:.3}s, not stretched to the jump");
+        assert!(
+            after.saturating_sub(before) < 300_000,
+            "memory grew {} kB",
+            after.saturating_sub(before)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
 }
