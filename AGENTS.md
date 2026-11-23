@@ -130,7 +130,7 @@ PR or merge unless the parent says so.
 | `REC_SETTINGS` | Path to a settings file instead of `$XDG_CONFIG_HOME/rec-rs/settings.json` |
 | `REC_DEBUG` | Extra diagnostics: audio offsets, GStreamer warnings |
 | `REC_SYNTH_DROP_AUDIO=N` | The test pattern drops every Nth audio buffer, like a glitching device |
-| `REC_AAC_PRIMING=N` | Override the encoder priming the writer trims (0 disables it) |
+| `REC_AAC_PRIMING=N` | Override the AAC encoder priming the finalise writes as the edit list's `media_time` (0 writes no edit list) |
 | `REC_FRAGMENT_SECS=N` | Fragment interval for the muxer (0 = one regular movie, for comparison) |
 | `REC_PATTERN_SYSTEM_AUDIO=pipewire` | Test hook: with `--test-pattern`, capture real system audio instead of the pattern's beeps |
 | `REC_STREAM_KEY` | Stream key override until the Secret Service lands (phase 1D) |
