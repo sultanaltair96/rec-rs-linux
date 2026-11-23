@@ -195,7 +195,7 @@ WHIP; the test pattern synthesizes the system-audio beeps, so no device is
 needed), the replay buffer fills, and `stream-key` stores and deletes a key
 through `org.freedesktop.secrets`.
 
-Bundle size: **11.4 MB** (`rec.flatpak`, 11,420,360 bytes) — the runtime is shared. The manifest
+Bundle size: **11.4 MB** (`rec.flatpak`, 11,420,464 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -331,7 +331,7 @@ Mesa, opens its window in the same container — the difference is the host's
 rendering stack, not the package. A real Fedora desktop with a GPU driver is
 check 8 in the list below.
 
-Sizes: AppImage **104.4 MiB** (109,423,096 bytes), `.zsync` 183 KiB. Most of it
+Sizes: AppImage **104.4 MiB** (109,394,424 bytes), `.zsync` 183 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
 fonts. That is the price of AAC, ProRes, the app and streaming in a single file;
