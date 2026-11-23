@@ -64,13 +64,15 @@ stream, measured with a 10 ms 1 kHz click encoded and decoded again:
 | `avenc_aac` | sample 1027 (21.4 ms) | 1024 samples |
 
 `qtmux`/`mp4mux` 1.26 cannot write the MP4 edit list (`elst` with `media_time`)
-that tells a decoder to skip those samples — AVFoundation does, which is why
-upstream measures 0.0 ms. The writer therefore drops the priming frames and
-re-stamps the rest (`media::writer::aac_priming`, `REC_AAC_PRIMING` to
-override), which removes the 42.7 ms offset. The first kept frame then lacks
-decoder history, so the very first ~10 ms of audio in a file fades in; every
-later sample is exact (measured: 0.0 ms on every beep after the first, +9.9 ms
-on the first one). Phase 1C owns the proper fix (an edit-list writer).
+that tells a decoder to skip those samples. The recording is still written with
+the priming in place; at a normal stop `media::mp4::finalize` rebuilds the moov
+and gives every audio track an `elst` whose `media_time` is that encoder's
+priming (`media::writer::aac_priming`, `REC_AAC_PRIMING` to override, 0 writes
+no edit list), scaled to the track's timescale. Players that honour edit lists
+(ffmpeg, QuickTime) start at the first real sample, so the first beep is at 0.0
+ms as well (`scripts/selftest.sh sync --max-ms 1`). `rec-rs probe` reports the
+edit list per track; GStreamer's own decode does not apply it, which is why the
+probe's decode line for an audio track starts at 0.043 s.
 
 ## Muxers, parsers, decoders
 
