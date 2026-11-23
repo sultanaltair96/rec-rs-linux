@@ -190,6 +190,43 @@ fn id_stem(id: &str) -> Option<String> {
         .map(|(s, _)| s.to_string())
 }
 
+/// A running watch on the audio device set (phase 1E's hotplug source).
+///
+/// Dropping it stops the watch. `stop()` is the explicit form for the app's
+/// shutdown path.
+pub struct DeviceWatch {
+    inner: pipewire::Watch,
+}
+
+impl DeviceWatch {
+    /// Stop watching and join the watcher thread.
+    pub fn stop(self) {
+        self.inner.stop();
+    }
+}
+
+impl std::fmt::Debug for DeviceWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("audio::DeviceWatch").finish_non_exhaustive()
+    }
+}
+
+/// Call `cb` when a PipeWire `Audio/*` node appears or disappears (a USB or
+/// Bluetooth microphone plugged in, a sink removed, the default device
+/// switched). Events are coalesced over a 200 ms window, so a UAC device that
+/// adds several nodes produces one callback.
+///
+/// The callback runs on the watcher thread: reload the mic list there (or post
+/// it to the UI thread) but do not block on the recording session. The watch
+/// lives until the returned [`DeviceWatch`] is dropped. For the camera set,
+/// pair this with [`crate::capture::camera::watch_devices`]; 1E starts both and
+/// refreshes its lists.
+pub fn watch_devices(cb: impl Fn() + Send + 'static) -> Result<DeviceWatch> {
+    Ok(DeviceWatch {
+        inner: pipewire::watch_devices(cb)?,
+    })
+}
+
 /// One line for `rec-rs permissions`.
 pub fn permission_status() -> String {
     match microphones() {
