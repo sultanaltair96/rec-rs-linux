@@ -76,6 +76,32 @@ impl Decoded {
 /// but not by more than this.
 const TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// A track's presentation span: `(start, duration)` in seconds, with the
+/// edit list's skipped priming subtracted from the duration.
+fn track_span(t: &mp4::TrackInfo) -> (f64, f64) {
+    let ts = t.timescale.max(1) as f64;
+    let priming = t
+        .edits
+        .iter()
+        .find(|e| e.media_time > 0)
+        .map(|e| e.media_time as f64 / ts)
+        .unwrap_or(0.0);
+    (t.first_pts, (t.duration as f64 / ts - priming).max(0.0))
+}
+
+/// The asset's duration: the end of its longest track, like
+/// `AVURLAsset.duration` upstream (a dropped-slot file's audio can run one
+/// buffer past the video, and ffprobe reports that longer figure too).
+fn movie_duration(tracks: &[mp4::TrackInfo]) -> f64 {
+    tracks
+        .iter()
+        .map(|t| {
+            let (start, dur) = track_span(t);
+            start + dur
+        })
+        .fold(0.0, f64::max)
+}
+
 /// Probe a recording: structure, then a full decode.
 pub fn probe(file: &Path) -> Result<()> {
     gst::init().context("GStreamer could not be initialised")?;
@@ -115,33 +141,18 @@ pub fn probe(file: &Path) -> Result<()> {
     // movie duration: a crash-left fragmented file is as long as its fragments
     // (4.000 s, not 1.984 s), and a finalised file must not count the AAC
     // priming that its edit list skips (2.000/2.006 s, not 2.049 s).
-    let track_span = |t: &mp4::TrackInfo| -> (f64, f64) {
-        let ts = t.timescale.max(1) as f64;
-        let priming = t
-            .edits
-            .iter()
-            .find(|e| e.media_time > 0)
-            .map(|e| e.media_time as f64 / ts)
-            .unwrap_or(0.0);
-        (t.first_pts, (t.duration as f64 / ts - priming).max(0.0))
-    };
     // The demuxer's duration is the last resort; the mp4 tables are the truth.
     let fallback = if movie.movie_timescale > 0 && movie.duration > 0 {
         movie.duration as f64 / movie.movie_timescale as f64
     } else {
         duration.map(|d| d.seconds_f64()).unwrap_or(0.0)
     };
-    let media_secs = movie
-        .tracks
-        .iter()
-        .find(|t| t.handler == mp4::Handler::Video)
-        .or_else(|| movie.tracks.first())
-        .map(|t| {
-            let (start, dur) = track_span(t);
-            start + dur
-        })
-        .filter(|d| *d > 0.0)
-        .unwrap_or(fallback);
+    // The asset's duration is its longest track's end (AVURLAsset.duration),
+    // not the first video track's: a dropped slot can leave audio longer.
+    let media_secs = match movie_duration(&movie.tracks) {
+        d if d > 0.0 => d,
+        _ => fallback,
+    };
     let playable = !streams.is_empty();
     println!("playable  : {playable}");
     println!("duration  : {media_secs:.3}s");
@@ -472,4 +483,61 @@ fn run(pipeline: &gst::Pipeline) -> Result<Option<gst::ClockTime>> {
     }
     let _ = pipeline.set_state(gst::State::Null);
     Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::mp4::{Edit, Handler};
+
+    fn track(handler: Handler, timescale: u32, duration: u64, edits: Vec<Edit>) -> mp4::TrackInfo {
+        mp4::TrackInfo {
+            track_id: 1,
+            handler,
+            timescale,
+            duration,
+            enabled: true,
+            alternate_group: 0,
+            edits,
+            samples: 1,
+            bytes: 1,
+            first_pts: 0.0,
+            nominal_fps: None,
+        }
+    }
+
+    #[test]
+    fn the_asset_duration_is_the_longest_track() {
+        // A 2 s video with dropped slots leaves the audio one buffer longer
+        // (2.0213 s); AVFoundation and ffprobe report 2.021, not 2.000.
+        let video = track(Handler::Video, 3000, 6000, vec![]);
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            103_000,
+            vec![Edit {
+                segment_duration: 102_000,
+                media_time: 1024,
+            }],
+        );
+        let d = movie_duration(&[video, audio]);
+        let expected = (103_000.0 - 1024.0) / 48_000.0;
+        assert!((d - expected).abs() < 1e-9, "{d} != {expected}");
+        assert!(d > 2.0);
+    }
+
+    #[test]
+    fn the_edit_list_priming_is_not_counted() {
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            96_000,
+            vec![Edit {
+                segment_duration: 94_000,
+                media_time: 2048,
+            }],
+        );
+        let d = movie_duration(&[audio]);
+        assert!((d - (96_000.0 - 2048.0) / 48_000.0).abs() < 1e-9, "{d}");
+    }
 }

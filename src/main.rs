@@ -144,17 +144,28 @@ fn record(a: RecordArgs) -> Result<()> {
     }
     if !quiet {
         eprintln!(
-            "rec: saved {} ({} video frames, {} duplicated, {} dropped; audio buffers sys {} mic {}, {} dropped, {} gaps filled, {} clipped samples)",
+            "rec: saved {} ({} video frames, {} duplicated, {} dropped; audio buffers sys {} mic {} mix {}, {} dropped, {} clipped samples)",
             out.display(),
             stats.video_frames_out,
             stats.video_dups,
             stats.video_drops,
             stats.audio_sys_buffers,
             stats.audio_mic_buffers,
+            stats.audio_mix_buffers,
             stats.audio_drops,
-            stats.audio_gaps_filled,
             stats.audio_clipped_samples
         );
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!(
+                "rec: debug: audio {} gaps filled, {} resyncs, {} overruns; video {} retries; finalise {} ms over {} fragments",
+                stats.audio_gaps_filled,
+                stats.audio_resyncs,
+                stats.audio_overruns,
+                stats.video_retries,
+                stats.finalize_millis,
+                stats.fragments
+            );
+        }
     }
     println!("{}", out.display());
     Ok(())
