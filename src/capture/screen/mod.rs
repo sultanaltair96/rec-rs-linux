@@ -456,6 +456,15 @@ impl PortalSource {
         if let Some(note) = &prepared.cursor_note {
             warn_once(note);
         }
+        if !excluded_windows().is_empty() {
+            // Upstream's content filter leaves its own windows out; a portal
+            // client cannot, so say it where a recording's log will show it and
+            // let the app hide itself (phase 1E).
+            warn_once(
+                "a screen-cast portal cannot leave rec's own windows out of the stream, so the \
+                 app hides its windows while recording (the X11 backend paints them out instead)",
+            );
+        }
         // `--region` is a display crop; a window stream is already the window.
         let region = match prepared.want {
             Want::Monitor => req.region.as_ref(),
@@ -535,6 +544,48 @@ impl VideoSource for PortalSource {
     }
 }
 
+/// Windows that belong to the recorder itself, left out of the capture.
+///
+/// The app (phase 1E) hands over its own top-level window ids when it starts a
+/// recording, so a recording does not contain its own live preview — the job
+/// upstream gives ScreenCaptureKit's content filter (`README.md:128-129`).
+///
+/// On X11 the capture paints their visible area out of every frame. A portal
+/// stream cannot exclude windows at all (the compositor owns it), so the
+/// capture says so and the app has to hide its windows instead.
+static EXCLUDED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Leave these windows (X11 window ids) out of the capture.
+///
+/// Call it with an empty list to restore the default (capture everything).
+/// Only the X11 backend can honour it; see [`excluded_windows`] for why. The
+/// app (phase 1E) calls it when a recording starts and clears it when one ends.
+#[allow(dead_code)] // the app, phase 1E
+pub fn set_excluded_windows(ids: Vec<u32>) {
+    *EXCLUDED.lock().unwrap() = ids;
+}
+
+/// The windows [`set_excluded_windows`] was given.
+///
+/// `REC_EXCLUDE_WINDOWS=id,id` overrides it, so a script can prove the
+/// exclusion without an app to call the API (the self-test does).
+pub(crate) fn excluded_windows() -> Vec<u32> {
+    if let Ok(list) = std::env::var("REC_EXCLUDE_WINDOWS") {
+        let ids: Vec<u32> = list
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    EXCLUDED.lock().unwrap().clone()
+}
+
+/// Serialises the tests that touch the process-wide exclusion list.
+#[cfg(test)]
+pub(crate) static EXCLUSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// `rec-rs permissions` screen line, and with `request` the portal dialog.
 pub fn permission_status(request: bool, wait: u64) -> Result<String> {
     if request {
@@ -547,8 +598,28 @@ pub fn permission_status(request: bool, wait: u64) -> Result<String> {
 ///
 /// `wait` bounds the dialog. What the picker chose goes to stderr; the status
 /// line `permissions` prints is the answer on stdout.
+///
+/// An existing grant is forgotten first, so the dialog really appears: upstream
+/// clears its Screen Recording decision before prompting for the same reason
+/// (`tcc.rs:183-230`), because a system that remembers answers silently. The
+/// Linux grant is the portal's restore token, so removing it is the whole
+/// equivalent of `tccutil reset`.
 pub fn request_permission(wait: u64) -> Result<()> {
     let timeout = Duration::from_secs(wait.max(5));
+    let saved = token::path();
+    if saved.exists() {
+        match token::clear() {
+            Ok(()) => {
+                eprintln!("rec: forgetting the saved screen-capture grant so the system asks again")
+            }
+            // Keep going: the worst case is the silent answer this flag exists
+            // to avoid, and the portal may still prompt for another reason.
+            Err(e) => eprintln!(
+                "rec: warning: could not forget the saved screen-capture grant ({}): {e}",
+                saved.display()
+            ),
+        }
+    }
     let prepared = portal::prepare(Want::Monitor, CaptureOptions::default(), timeout)?;
     eprintln!("rec: screen-capture grant for {}", prepared.picked);
     prepared.close();
@@ -640,6 +711,16 @@ mod tests {
         let req = ScreenRequest::default();
         assert_eq!(req.display, 1);
         assert!(req.window.is_none() && req.region.is_none());
+    }
+
+    #[test]
+    fn excluded_windows_round_trip() {
+        let _lock = EXCLUSION_TEST_LOCK.lock().unwrap();
+        set_excluded_windows(vec![7, 9]);
+        assert_eq!(excluded_windows(), vec![7, 9]);
+        // The app clears it when a recording ends: back to capturing everything.
+        set_excluded_windows(vec![]);
+        assert!(excluded_windows().is_empty());
     }
 
     #[test]

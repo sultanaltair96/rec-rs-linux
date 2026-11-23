@@ -46,6 +46,7 @@ use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::compose::{PipSpec, Scene};
@@ -399,12 +400,38 @@ pub(crate) fn device_fingerprint(
     v
 }
 
+/// The X11 window id behind a winit handle, if it has one (Wayland windows have
+/// no X11 id: their capture goes through the portal).
+pub(crate) fn x11_window_id(handle: &RawWindowHandle) -> Option<u32> {
+    match handle {
+        RawWindowHandle::Xlib(h) => Some(h.window as u32),
+        RawWindowHandle::Xcb(h) => Some(h.window.get()),
+        _ => None,
+    }
+}
+
+/// Whether the capture backend can paint Rec's own windows out by itself
+/// (`capture::screen::set_excluded_windows`, X11). Elsewhere (the portal) the
+/// only exclusion is hiding them.
+pub(crate) fn exclusion_is_done_by_capture(
+    backend: Result<crate::capture::screen::Backend>,
+) -> bool {
+    matches!(backend, Ok(crate::capture::screen::Backend::X11))
+}
+
 /// Whether the main window must be hidden for a recording (G3): a display or
-/// region capture cannot exclude Rec's own window, so it would film the
-/// preview; a single-window capture cannot contain it, and the user can turn
-/// the behaviour off.
-pub(crate) fn hides_window_for_recording(settings: &Settings, main_visible: bool) -> bool {
-    settings.hide_window_when_recording && settings.window.is_none() && main_visible
+/// region capture that cannot exclude Rec's own window would film the preview;
+/// a single-window capture cannot contain it, the user can turn the behaviour
+/// off, and on X11 the capture paints our windows out (no hide needed).
+pub(crate) fn hides_window_for_recording(
+    settings: &Settings,
+    main_visible: bool,
+    capture_excludes_ours: bool,
+) -> bool {
+    settings.hide_window_when_recording
+        && settings.window.is_none()
+        && main_visible
+        && !capture_excludes_ours
 }
 
 /// Whether the mic a running preview opened is no longer the one the saved
@@ -913,6 +940,7 @@ impl App {
             self.st.preview_settings = None;
         }
         if want && self.st.preview.is_none() && self.st.error.is_none() {
+            self.exclude_own_windows();
             let cam = self.st.spare_cam.take();
             let r = self
                 .options(None)
@@ -956,6 +984,9 @@ impl App {
         self.st.preview_settings = None;
         self.st.error = None;
         let file = self.st.settings.new_output_file();
+        // The capture reads the exclusion list when it opens, so the recording
+        // (which replaces the preview's capture) gets the current windows.
+        self.exclude_own_windows();
         let r = std::fs::create_dir_all(&self.st.settings.output_dir)
             .map_err(anyhow::Error::from)
             .and_then(|_| self.options(Some(&file)))
@@ -976,7 +1007,11 @@ impl App {
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
                 // G3: a display (or region) capture includes Rec's own window
                 // unless it is hidden; a single-window capture cannot.
-                if hides_window_for_recording(&self.st.settings, self.main_visible) {
+                if hides_window_for_recording(
+                    &self.st.settings,
+                    self.main_visible,
+                    Self::capture_excludes_ours(),
+                ) {
                     self.hide_window_for_recording();
                 }
             }
@@ -989,6 +1024,41 @@ impl App {
         }
     }
 
+    /// Rec's own top-level X11 window ids, for
+    /// `capture::screen::set_excluded_windows` (G3): the capture paints their
+    /// visible parts out of every frame on X11. Empty on Wayland, where the ids
+    /// do not exist and the portal cannot exclude windows either way.
+    fn own_window_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for w in [self.main.as_ref(), self.settings_win.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(handle) = w.window.window_handle()
+                && let Some(id) = x11_window_id(&handle.as_raw())
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Hand our window ids to the capture that is about to start (G3). The
+    /// capture reads the list once, when it opens.
+    fn exclude_own_windows(&self) {
+        let ids = self.own_window_ids();
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!("rec: debug: excluding own windows {ids:?}");
+        }
+        crate::capture::screen::set_excluded_windows(ids);
+    }
+
+    /// Whether the capture excludes our windows itself (X11) rather than the app
+    /// having to hide them (portal).
+    fn capture_excludes_ours() -> bool {
+        exclusion_is_done_by_capture(crate::capture::screen::backend())
+    }
+
     /// Hide the main window for the running recording, and say so (G3).
     fn hide_window_for_recording(&mut self) {
         self.hide_main();
@@ -998,10 +1068,8 @@ impl App {
         self.st.notice = Some((message.into(), Instant::now()));
         // The window that would show the notice is the one being hidden.
         linux_desktop::notify("Rec", message);
-        // The X11 backend can subtract our windows from its GetImage instead
-        // (phase 1A adds `capture::screen::set_excluded_windows(Vec<u32>)` with
-        // the ids from `window.raw_window_handle()`); until that lands, hiding
-        // is the only exclusion on both backends.
+        // On X11 this is not reached: the capture paints our windows out
+        // (`set_excluded_windows`); hiding is the portal's only exclusion.
     }
 
     /// Bring the window back after a recording that hid it (G3).
@@ -1814,24 +1882,54 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_hidden_only_for_a_display_recording() {
-        // G3: a display or region capture would film Rec's own window; a
-        // single-window capture cannot, and the setting can turn it off.
+    fn the_window_is_hidden_only_where_the_capture_cannot_exclude_it() {
+        // G3: on the portal a display or region capture would film Rec's own
+        // window (hide it); on X11 the capture paints it out (do not hide). A
+        // single-window capture cannot contain it, and the setting can turn the
+        // hide off.
+        use crate::capture::screen::Backend;
         let mut settings = Settings::default();
         assert!(settings.hide_window_when_recording, "on by default");
-        assert!(hides_window_for_recording(&settings, true));
+        assert!(hides_window_for_recording(&settings, true, false), "portal");
         assert!(
-            !hides_window_for_recording(&settings, false),
+            !hides_window_for_recording(&settings, true, true),
+            "X11 excludes our windows itself"
+        );
+        assert!(
+            !hides_window_for_recording(&settings, false, false),
             "already hidden"
         );
         settings.window = Some(42);
         assert!(
-            !hides_window_for_recording(&settings, true),
+            !hides_window_for_recording(&settings, true, false),
             "a window capture cannot contain our window"
         );
         settings.window = None;
         settings.hide_window_when_recording = false;
-        assert!(!hides_window_for_recording(&settings, true));
+        assert!(!hides_window_for_recording(&settings, true, false));
+
+        // The backend decides which path is taken.
+        assert!(exclusion_is_done_by_capture(Ok(Backend::X11)));
+        assert!(!exclusion_is_done_by_capture(Ok(Backend::Portal)));
+        assert!(!exclusion_is_done_by_capture(Err(anyhow::anyhow!(
+            "no session"
+        ))));
+    }
+
+    #[test]
+    fn own_window_ids_come_from_x11_handles_only() {
+        // G3: the ids the app hands to `set_excluded_windows` are the X11 ones;
+        // a Wayland window has none (its capture cannot exclude anything).
+        use winit::raw_window_handle::{WaylandWindowHandle, XcbWindowHandle, XlibWindowHandle};
+        let xlib = RawWindowHandle::Xlib(XlibWindowHandle::new(0x2a));
+        assert_eq!(x11_window_id(&xlib), Some(0x2a));
+        let xcb = RawWindowHandle::Xcb(XcbWindowHandle::new(
+            std::num::NonZeroU32::new(0x2a).unwrap(),
+        ));
+        assert_eq!(x11_window_id(&xcb), Some(0x2a));
+        let wayland =
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(std::ptr::NonNull::dangling()));
+        assert_eq!(x11_window_id(&wayland), None);
     }
 
     #[test]
