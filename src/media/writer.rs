@@ -260,6 +260,115 @@ fn secs_ns(t: f64) -> u64 {
     (t * 1_000_000_000.0).round().max(0.0) as u64
 }
 
+/// Associate timestamps with frames, not output order: encoders may drop a
+/// frame or rewrite its PTS. ReferenceTimestampMeta is copied by GstVideoEncoder
+/// onto the corresponding output frame. There is deliberately no FIFO fallback.
+/// Store running time so an encoder's shifted segment (e.g. x264's 1000 h)
+/// can be respected when restoring timestamps before the parser sees them.
+fn stamp_encoder_slot(
+    buffer: &mut gst::BufferRef,
+    reference: &gst::Caps,
+    segment: Option<&gst::FormattedSegment<gst::ClockTime>>,
+) -> Result<()> {
+    let segment = segment.context("video encoder input has no TIME segment")?;
+    let pts = buffer.pts().context("video encoder input has no PTS")?;
+    let time = segment
+        .to_running_time(pts)
+        .context("video encoder input PTS is outside its segment")?;
+    gst::ReferenceTimestampMeta::add(buffer, reference, time, buffer.duration());
+    Ok(())
+}
+
+fn restore_encoder_slot(
+    buffer: &mut gst::BufferRef,
+    reference: &gst::Caps,
+    segment: Option<&gst::FormattedSegment<gst::ClockTime>>,
+) -> Result<()> {
+    // Other reference clocks (capture time, NTP, etc.) are not slot metadata.
+    let mut slots = buffer
+        .iter_meta::<gst::ReferenceTimestampMeta>()
+        .filter(|meta| meta.reference() == reference.as_ref());
+    let meta = slots
+        .next()
+        .context("video encoder output lost timestamp/x-rec-slot metadata")?;
+    let time = meta.timestamp();
+    let duration = meta.duration();
+    anyhow::ensure!(
+        slots.next().is_none(),
+        "ambiguous video encoder slot metadata"
+    );
+    let pts = segment
+        .context("video encoder output has no TIME segment")?
+        .position_from_running_time(time)
+        .context("video encoder slot is outside its output segment")?;
+    // All video encoders are configured without B-frames (ProRes is intra).
+    // Using the encoded PTS/DTS delta here would retain the very retimestamping
+    // we are correcting. With no reordering DTS is the restored PTS.
+    buffer.set_pts(pts);
+    buffer.set_dts(pts);
+    buffer.set_duration(duration);
+    Ok(())
+}
+
+/// Install on the encoder itself: downstream parsers need the corrected PTS.
+/// A missing/invalid association is fatal and counted even if another consumer
+/// has already taken the error message from the pipeline bus.
+fn install_encoder_timing(
+    encoder: &gst::Element,
+    enc_in: Arc<std::sync::atomic::AtomicU64>,
+    enc_out: Arc<std::sync::atomic::AtomicU64>,
+    errors: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    for input in [true, false] {
+        let pad = encoder
+            .static_pad(if input { "sink" } else { "src" })
+            .context("video encoder has no static sink/src pad")?;
+        let reference = gst::Caps::builder("timestamp/x-rec-slot").build();
+        let segment = std::sync::Mutex::new(None);
+        let encoder = encoder.downgrade();
+        let count = if input {
+            enc_in.clone()
+        } else {
+            enc_out.clone()
+        };
+        let errors = errors.clone();
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |_, info| {
+                let mut segment = segment.lock().unwrap();
+                if let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() {
+                    if let gst::EventView::Segment(event) = event.view() {
+                        *segment = event.segment().downcast_ref::<gst::ClockTime>().cloned();
+                    }
+                }
+                if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let result = if input {
+                        stamp_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
+                    } else {
+                        restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
+                    };
+                    if let Err(error) = result {
+                        if errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                            if let Some(encoder) = encoder.upgrade() {
+                                gst::element_error!(
+                                    encoder,
+                                    gst::StreamError::Failed,
+                                    ("{error:#}")
+                                );
+                            }
+                        }
+                        return gst::PadProbeReturn::Drop;
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        )
+        .context("installing video encoder timestamp probe")?;
+    }
+    Ok(())
+}
+
 /// Which track of the file an audio stream goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
@@ -303,6 +412,7 @@ struct Sink {
     /// Debug counters: buffers into and out of the video encoder.
     enc_in: Arc<std::sync::atomic::AtomicU64>,
     enc_out: Arc<std::sync::atomic::AtomicU64>,
+    timing_errors: Arc<std::sync::atomic::AtomicU64>,
     /// Track layout to apply when the file is finalised.
     layout: mp4::Layout,
     /// Bytes the video appsrc may hold (2 frames): the drop policy matches
@@ -1252,6 +1362,10 @@ impl Writer {
                 continue;
             }
             let Some(frame) = self.compose(slot_t) else {
+                if write {
+                    self.out_slot += 1;
+                    self.stats.video_drops += 1;
+                }
                 continue;
             };
             let out_slot = self.out_slot;
@@ -1488,13 +1602,6 @@ impl Writer {
             // Preview-only session.
             return Ok(self.stats.clone());
         };
-        if std::env::var_os("REC_DEBUG").is_some() {
-            eprintln!(
-                "rec: debug: encoder buffers in {} out {}",
-                sink.enc_in.load(std::sync::atomic::Ordering::Relaxed),
-                sink.enc_out.load(std::sync::atomic::Ordering::Relaxed)
-            );
-        }
         // A track that never got audio would make an empty track: qtmux only
         // writes a trak once it has a sample, so a short clip with a slow
         // source lost it silently. Give every requested track a moment of
@@ -1550,7 +1657,22 @@ impl Writer {
                 _ => {}
             }
         }
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!(
+                "rec: debug: encoder buffers after drain in {} out {}",
+                sink.enc_in.load(std::sync::atomic::Ordering::Relaxed),
+                sink.enc_out.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
         let _ = sink.pipeline.set_state(gst::State::Null);
+        let timing_errors = sink
+            .timing_errors
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if timing_errors != 0 {
+            bail!(
+                "video encoder timestamp association failed ({timing_errors} buffers); timestamp/x-rec-slot metadata or segment was missing/invalid"
+            );
+        }
         if let Err(e) = &result {
             // Keep the file: a fragmented recording is playable up to the last
             // fragment even when the muxer or an encoder failed.
@@ -2182,22 +2304,13 @@ fn open_sink(
     // a 1080p recording, the camera's size); the capsfilter pins the output.
     let enc_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let enc_out = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    if std::env::var_os("REC_DEBUG").is_some() {
-        if let Some(pad) = venc.static_pad("sink") {
-            let c = enc_in.clone();
-            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                gst::PadProbeReturn::Ok
-            });
-        }
-        if let Some(pad) = venc.static_pad("src") {
-            let c = enc_out.clone();
-            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                gst::PadProbeReturn::Ok
-            });
-        }
-    }
+    let timing_errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    install_encoder_timing(
+        &venc,
+        enc_in.clone(),
+        enc_out.clone(),
+        timing_errors.clone(),
+    )?;
     let video_caps = gst::Caps::builder("video/x-raw")
         .field("format", "BGRA")
         .field("width", spec.width as i32)
@@ -2400,6 +2513,7 @@ fn open_sink(
         encoder,
         enc_in,
         enc_out,
+        timing_errors,
         layout: mp4_layout,
         video_max_bytes,
     })
@@ -2408,6 +2522,225 @@ fn open_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_slot_metadata_maps_segments_and_preserves_duration() {
+        gst::init().unwrap();
+        let reference = gst::Caps::builder("timestamp/x-rec-slot").build();
+        let mut input = gst::FormattedSegment::<gst::ClockTime>::new();
+        input.set_start(gst::ClockTime::from_seconds(5));
+        input.set_base(gst::ClockTime::from_seconds(2));
+        let mut output = gst::FormattedSegment::<gst::ClockTime>::new();
+        output.set_start(gst::ClockTime::from_seconds(3_600_000));
+        output.set_base(gst::ClockTime::from_seconds(1));
+        let mut buffer = gst::Buffer::new();
+        let buffer = buffer.get_mut().unwrap();
+        buffer.set_pts(gst::ClockTime::from_seconds(6));
+        buffer.set_duration(gst::ClockTime::from_nseconds(33_333_333));
+        stamp_encoder_slot(buffer, &reference, Some(&input)).unwrap();
+        buffer.set_pts(gst::ClockTime::ZERO);
+        buffer.set_dts(gst::ClockTime::NONE);
+        buffer.set_duration(gst::ClockTime::NONE);
+        restore_encoder_slot(buffer, &reference, Some(&output)).unwrap();
+        assert_eq!(buffer.pts(), Some(gst::ClockTime::from_seconds(3_600_002)));
+        assert_eq!(buffer.dts(), buffer.pts());
+        assert_eq!(
+            buffer.duration(),
+            Some(gst::ClockTime::from_nseconds(33_333_333))
+        );
+    }
+
+    #[test]
+    fn encoder_slot_metadata_rejects_missing_wrong_and_duplicate_meta() {
+        gst::init().unwrap();
+        let reference = gst::Caps::builder("timestamp/x-rec-slot").build();
+        let other = gst::Caps::builder("timestamp/x-other-clock").build();
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        let mut buffer = gst::Buffer::new();
+        let buffer = buffer.get_mut().unwrap();
+        gst::ReferenceTimestampMeta::add(buffer, &other, gst::ClockTime::ZERO, None);
+        assert!(
+            restore_encoder_slot(buffer, &reference, Some(&segment))
+                .unwrap_err()
+                .to_string()
+                .contains("lost timestamp/x-rec-slot")
+        );
+        assert!(stamp_encoder_slot(buffer, &reference, Some(&segment)).is_err());
+        buffer.set_pts(gst::ClockTime::ZERO);
+        assert!(stamp_encoder_slot(buffer, &reference, None).is_err());
+        stamp_encoder_slot(buffer, &reference, Some(&segment)).unwrap();
+        assert!(restore_encoder_slot(buffer, &reference, None).is_err());
+        stamp_encoder_slot(buffer, &reference, Some(&segment)).unwrap();
+        assert!(
+            restore_encoder_slot(buffer, &reference, Some(&segment))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
+
+    /// Exercise the real pad probes and streaming threads, not just helpers.
+    /// identity models an encoder rewriting timestamps and losing one frame;
+    /// software encoders also exercise GstVideoEncoder's metadata copying.
+    fn run_encoder_slot_pipeline(name: &str, lose_meta: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let prores = name.contains("prores");
+        let source = gstreamer_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .caps(
+                &gst::Caps::builder("video/x-raw")
+                    .field("format", if prores { "I422_10LE" } else { "I420" })
+                    .field("width", 64i32)
+                    .field("height", 64i32)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build();
+        let encoder = configured_encoder(name, 500_000, Some(30), false).unwrap();
+        let sink = gstreamer_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([source.upcast_ref(), &encoder, sink.upcast_ref()])
+            .unwrap();
+        gst::Element::link_many([source.upcast_ref(), &encoder, sink.upcast_ref()]).unwrap();
+        let count_in = Arc::new(AtomicU64::new(0));
+        let count_out = Arc::new(AtomicU64::new(0));
+        let errors = Arc::new(AtomicU64::new(0));
+        if name == "identity" {
+            // Runs ahead of the restoration probe on src, after sink stamping.
+            let index = AtomicU64::new(0);
+            encoder.static_pad("src").unwrap().add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_, info| {
+                    if let Some(gst::PadProbeData::Event(event)) = info.data.as_mut() {
+                        if let gst::EventView::Segment(segment_event) = event.view() {
+                            let mut segment = segment_event
+                                .segment()
+                                .downcast_ref::<gst::ClockTime>()
+                                .unwrap()
+                                .clone();
+                            segment.set_start(gst::ClockTime::from_seconds(3_600_000));
+                            segment.set_position(gst::ClockTime::from_seconds(3_600_000));
+                            *event = gst::event::Segment::new(&segment);
+                        }
+                    }
+                    if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+                        let i = index.fetch_add(1, Ordering::Relaxed);
+                        if i == 1 && !lose_meta {
+                            return gst::PadProbeReturn::Drop;
+                        }
+                        if lose_meta {
+                            let mut replacement = gst::Buffer::with_size(1).unwrap();
+                            replacement.make_mut().set_pts(gst::ClockTime::ZERO);
+                            *buffer = replacement;
+                        } else {
+                            buffer.make_mut().set_pts(gst::ClockTime::from_seconds(i));
+                            buffer.make_mut().set_dts(gst::ClockTime::NONE);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        install_encoder_timing(
+            &encoder,
+            count_in.clone(),
+            count_out.clone(),
+            errors.clone(),
+        )
+        .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        // Deliberate grid gaps, as with appsrc/encoder losses. Never restore by
+        // written-sample index, nor shift the association after a lost frame.
+        let slots = [0, 1, 4, 8, 9, 12];
+        for slot in slots {
+            let mut buffer =
+                gst::Buffer::with_size(if prores { 64 * 64 * 4 } else { 64 * 64 * 3 / 2 }).unwrap();
+            let b = buffer.get_mut().unwrap();
+            b.map_writable().unwrap().as_mut_slice().fill(128);
+            b.set_pts(gst::ClockTime::from_nseconds(slot_ns(slot, 30)));
+            b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30)));
+            source.push_buffer(buffer).unwrap();
+        }
+        source.end_of_stream().unwrap();
+        let mut times = Vec::new();
+        while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(10)) {
+            let buffer = sample.buffer().unwrap();
+            let segment = sample
+                .segment()
+                .unwrap()
+                .downcast_ref::<gst::ClockTime>()
+                .unwrap();
+            times.push(
+                segment
+                    .to_running_time(buffer.pts().unwrap())
+                    .unwrap()
+                    .nseconds(),
+            );
+            assert_eq!(buffer.dts(), buffer.pts(), "{name}");
+            assert_eq!(
+                buffer.duration(),
+                Some(gst::ClockTime::from_nseconds(slot_ns(1, 30)))
+            );
+        }
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Error, gst::MessageType::Eos],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        let message = message.expect("pipeline must EOS or report missing metadata");
+        assert_eq!(count_in.load(Ordering::Relaxed), 6);
+        if lose_meta {
+            assert!(matches!(message.view(), gst::MessageView::Error(_)));
+            if let gst::MessageView::Error(error) = message.view() {
+                assert!(
+                    error
+                        .error()
+                        .to_string()
+                        .contains("lost timestamp/x-rec-slot")
+                );
+            }
+            assert!(times.is_empty());
+            assert_eq!(errors.load(Ordering::Relaxed), 6);
+            assert_eq!(count_out.load(Ordering::Relaxed), 6);
+        } else {
+            if let gst::MessageView::Error(error) = message.view() {
+                panic!("{name}: {} {:?}", error.error(), error.debug());
+            }
+            assert_eq!(errors.load(Ordering::Relaxed), 0, "{name}");
+            let expected: Vec<_> = slots
+                .into_iter()
+                .filter(|s| name != "identity" || *s != 1)
+                .map(|s| slot_ns(s, 30))
+                .collect();
+            assert_eq!(times, expected, "{name}");
+            assert_eq!(count_out.load(Ordering::Relaxed), times.len() as u64);
+        }
+    }
+
+    #[test]
+    fn encoder_slot_identity_retimestamp_and_lost_frame() {
+        run_encoder_slot_pipeline("identity", false);
+    }
+
+    #[test]
+    fn encoder_slot_missing_metadata_posts_error_and_counts() {
+        run_encoder_slot_pipeline("identity", true);
+    }
+
+    #[test]
+    fn encoder_slot_software_encoders_copy_metadata() {
+        for name in [
+            "x264enc",
+            "x265enc",
+            "openh264enc",
+            "avenc_prores_aw",
+            "avenc_prores_ks",
+        ] {
+            run_encoder_slot_pipeline(name, false);
+        }
+    }
 
     #[test]
     fn queue_cap_never_shows_future_frames() {

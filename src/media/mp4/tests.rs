@@ -215,12 +215,19 @@ fn trun(samples: &[S], data_offset: Option<i32>) -> Vec<u8> {
 
 /// A `moof` whose truns point at the mdat that follows it.
 fn moof_at(moof_offset: u64, trafs: &[TrafSpec]) -> Vec<u8> {
+    moof_at_times(moof_offset, trafs, &vec![Some(0); trafs.len()])
+}
+
+fn moof_at_times(moof_offset: u64, trafs: &[TrafSpec], times: &[Option<u64>]) -> Vec<u8> {
     // Two passes: the size decides the data offsets relative to the moof.
-    fn build(trafs: &[TrafSpec], size: u64) -> Vec<u8> {
+    fn build(trafs: &[TrafSpec], times: &[Option<u64>], size: u64) -> Vec<u8> {
         let mut body = full_flags(b"mfhd", 0, 0, &1u32.to_be_bytes());
-        for t in trafs {
+        for (t, time) in trafs.iter().zip(times) {
             let mut traf = tfhd(t.track_id, t.defaults);
-            traf.extend_from_slice(&tfdt(0));
+            if let Some(time) = time {
+                // Version 1 exercises the full 64-bit decode-time parser.
+                traf.extend_from_slice(&full_flags(b"tfdt", 1, 0, &time.to_be_bytes()));
+            }
             let off = t.data_offset.then_some((size + 8) as i32);
             traf.extend_from_slice(&trun(t.samples, off));
             let mut traf_box = vec![];
@@ -231,9 +238,9 @@ fn moof_at(moof_offset: u64, trafs: &[TrafSpec]) -> Vec<u8> {
         push_box(&mut out, b"moof", &body);
         out
     }
-    let first = build(trafs, 0);
+    let first = build(trafs, times, 0);
     let _ = moof_offset;
-    build(trafs, first.len() as u64)
+    build(trafs, times, first.len() as u64)
 }
 
 fn mdat(data: &[u8]) -> Vec<u8> {
@@ -572,7 +579,11 @@ fn fragmented_fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
             data_offset: false,
         },
     ];
-    let moof2 = moof_at(out.len() as u64, &trafs2);
+    let moof2 = moof_at_times(
+        out.len() as u64,
+        &trafs2,
+        &[Some(200), Some(2048), Some(2048), Some(0)],
+    );
     let mut data2: Vec<u8> = (20..32).collect();
     data2.extend(70..79);
     data2.extend(90..100);
@@ -996,6 +1007,382 @@ fn a_mid_take_gap_is_kept_and_the_tail_still_reaches_the_end() {
     assert_eq!(samples[100].duration, 300, "the mid-take gap stays");
     assert_eq!(samples.last().unwrap().duration, 900);
     assert_eq!(media_duration(&samples), 60_000);
+}
+
+/// Build a single-track movie with independently timed fragments. Payload
+/// bytes identify packets so the assertions can check sample order as well as
+/// timing after rewriting the tables.
+fn timeline_fixture(
+    handler: [u8; 4],
+    timescale: u32,
+    fragments: &[(&[S], Option<u64>)],
+) -> Vec<u8> {
+    let tracks = [TrackFixture {
+        id: 1,
+        handler,
+        timescale,
+        duration: 0,
+        flags: 0x7,
+        tables: empty_tables(),
+    }];
+    let mut bytes = [ftyp(), init_moov(1000, &tracks)].concat();
+    let mut packet = 1u8;
+    for (samples, time) in fragments {
+        let moof = moof_at_times(
+            bytes.len() as u64,
+            &[TrafSpec {
+                track_id: 1,
+                defaults: None,
+                samples,
+                data_offset: true,
+            }],
+            &[*time],
+        );
+        bytes.extend_from_slice(&moof);
+        let mut payload = vec![];
+        for sample in *samples {
+            payload.extend(std::iter::repeat_n(packet, sample.1 as usize));
+            packet += 1;
+        }
+        bytes.extend_from_slice(&mdat(&payload));
+    }
+    bytes
+}
+
+/// Inspect the *serialized* regular sample tables, independently of
+/// build_tables: each tuple is (DTS, PTS, duration). This catches a correct
+/// aggregate duration that nevertheless shifts packets within the take.
+fn regular_packet_times(path: &Path) -> Vec<(i64, i64, u32)> {
+    fn descendant<'a>(buf: &'a [u8], kinds: &[[u8; 4]]) -> &'a [u8] {
+        let Some((kind, rest)) = kinds.split_first() else {
+            return buf;
+        };
+        let kids = children(buf, 8, buf.len()).unwrap();
+        descendant(slice(buf, find(&kids, kind).unwrap()), rest)
+    }
+    let (mut file, boxes, _) = scan(path).unwrap();
+    let moov = boxes.iter().rfind(|b| b.kind == MOOV).unwrap();
+    let moov = read_at(&mut file, moov.start, moov.size).unwrap();
+    let stbl = descendant(&moov, &[*b"trak", *b"mdia", *b"minf", *b"stbl"]);
+    let kids = children(stbl, 8, stbl.len()).unwrap();
+    let stts = slice(stbl, find(&kids, b"stts").unwrap());
+    let mut durations = vec![];
+    for i in 0..be32(stts, 12).unwrap() as usize {
+        let count = be32(stts, 16 + i * 8).unwrap();
+        let delta = be32(stts, 20 + i * 8).unwrap();
+        durations.extend(std::iter::repeat_n(delta, count as usize));
+    }
+    let mut offsets = vec![];
+    if let Some(ctts) = find(&kids, b"ctts") {
+        let ctts = slice(stbl, ctts);
+        for i in 0..be32(ctts, 12).unwrap() as usize {
+            let count = be32(ctts, 16 + i * 8).unwrap();
+            let offset = be32(ctts, 20 + i * 8).unwrap();
+            let offset = if ctts[8] == 1 {
+                offset as i32 as i64
+            } else {
+                offset as i64
+            };
+            offsets.extend(std::iter::repeat_n(offset, count as usize));
+        }
+    } else {
+        offsets.resize(durations.len(), 0);
+    }
+    assert_eq!(offsets.len(), durations.len());
+    let mut dts = 0;
+    durations
+        .into_iter()
+        .zip(offsets)
+        .map(|(duration, cts)| {
+            let packet = (dts, dts + cts, duration);
+            dts += duration as i64;
+            packet
+        })
+        .collect()
+}
+
+#[test]
+fn finalization_retains_long_video_holds_fragment_gaps_and_packet_pts() {
+    let first = [
+        (100, 1, opt_flags(true), 0),
+        // A legitimate three-second mid-take hold, not corrupt audio.
+        (18_100, 1, opt_flags(false), 20),
+        (100, 1, opt_flags(false), -10),
+    ];
+    let second = [(100, 1, opt_flags(true), 30), (100, 1, opt_flags(false), 0)];
+    let bytes = timeline_fixture(
+        *b"vide",
+        6000,
+        &[
+            (&first, Some(0)),
+            // The trun ended at 18300: a further 300-unit boundary gap.
+            (&second, Some(18_600)),
+        ],
+    );
+    let path = write_temp("video-packet-timeline", &bytes);
+    let before = read(&path).unwrap();
+    assert_eq!(before.tracks[0].duration, 18_800);
+    assert_eq!(before.tracks[0].samples, 5);
+    assert_eq!(before.tracks[0].nominal_fps, Some(60.0));
+    finalize(
+        &path,
+        &Layout::default(),
+        CrashAt::None,
+        None,
+        Some(20_000.0 / 6000.0),
+    )
+    .unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, 100),
+            (100, 120, 18_100),
+            (18_200, 18_190, 400),
+            (18_600, 18_630, 100),
+            (18_700, 18_700, 1300),
+        ]
+    );
+    let after = read(&path).unwrap();
+    assert_eq!(after.tracks[0].duration, 20_000);
+    assert_eq!(after.duration, 3333);
+    assert_eq!(after.tracks[0].samples, 5);
+    assert_eq!(after.tracks[0].bytes, 5);
+    // No media is moved or replaced when its timing is changed.
+    let finalized = std::fs::read(&path).unwrap();
+    let (_, boxes, _) = scan(&path).unwrap();
+    for b in boxes.iter().filter(|b| &b.kind == b"mdat") {
+        let range = b.body_start() as usize..(b.start + b.size) as usize;
+        assert_eq!(&finalized[range.clone()], &bytes[range]);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_boundary_gap_is_not_added_twice_when_the_trun_already_covers_it() {
+    let first = [(100, 1, 0, 0), (12_000, 1, 0, 0)];
+    let second = [(100, 1, 0, 0), (100, 1, 0, 0)];
+    let bytes = timeline_fixture(
+        *b"vide",
+        6000,
+        &[(&first, Some(0)), (&second, Some(12_100))],
+    );
+    let path = write_temp("boundary-already-covered", &bytes);
+    assert_eq!(read(&path).unwrap().tracks[0].duration, 12_300);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, 100),
+            (100, 100, 12_000),
+            (12_100, 12_100, 100),
+            (12_200, 12_200, 100),
+        ]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn missing_tfdt_continues_video_after_an_explicit_64_bit_origin() {
+    let samples = [(100, 1, 0, 0), (100, 1, 0, 0)];
+    let origin = (1u64 << 32) + 100;
+    let bytes = timeline_fixture(
+        *b"vide",
+        6000,
+        &[
+            (&samples, Some(origin)),
+            (&samples, None),
+            (&samples, Some(origin + 700)),
+        ],
+    );
+    let path = write_temp("missing-tfdt", &bytes);
+    let info = read(&path).unwrap();
+    assert_eq!(info.tracks[0].first_pts, origin as f64 / 6000.0);
+    assert_eq!(info.tracks[0].duration, 900);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, 100),
+            (100, 100, 100),
+            (200, 200, 100),
+            (300, 300, 400),
+            (700, 700, 100),
+            (800, 800, 100),
+        ]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn separate_trafs_for_one_track_keep_their_decode_time_boundaries() {
+    let samples = [(100, 1, 0, 0), (100, 1, 0, 0)];
+    let tracks = [TrackFixture {
+        id: 1,
+        handler: *b"vide",
+        timescale: 6000,
+        duration: 0,
+        flags: 0x7,
+        tables: empty_tables(),
+    }];
+    let mut bytes = [ftyp(), init_moov(1000, &tracks)].concat();
+    let moof = moof_at_times(
+        bytes.len() as u64,
+        &[
+            TrafSpec {
+                track_id: 1,
+                defaults: None,
+                samples: &samples,
+                data_offset: true,
+            },
+            TrafSpec {
+                track_id: 1,
+                defaults: None,
+                samples: &samples,
+                data_offset: false,
+            },
+        ],
+        &[Some(0), Some(500)],
+    );
+    bytes.extend_from_slice(&moof);
+    bytes.extend_from_slice(&mdat(&[1, 2, 3, 4]));
+    let path = write_temp("same-track-trafs", &bytes);
+    assert_eq!(read(&path).unwrap().tracks[0].duration, 700);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, 100),
+            (100, 100, 400),
+            (500, 500, 100),
+            (600, 600, 100),
+        ]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn zero_video_duration_does_not_trigger_audio_uniformization() {
+    let samples = [(100, 1, 0, 10), (0, 1, 0, -10), (100, 1, 0, 20)];
+    let bytes = timeline_fixture(*b"vide", 6000, &[(&samples, Some(0))]);
+    let path = write_temp("video-zero-duration", &bytes);
+    assert_eq!(read(&path).unwrap().tracks[0].duration, 200);
+    finalize(
+        &path,
+        &Layout::default(),
+        CrashAt::None,
+        None,
+        Some(150.0 / 6000.0),
+    )
+    .unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![(0, 10, 100), (100, 90, 0), (100, 120, 100),]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn overlapping_video_fragments_probe_but_cannot_be_finalized_losslessly() {
+    let samples = [(100, 1, 0, 0), (100, 1, 0, 0)];
+    let bytes = timeline_fixture(
+        *b"vide",
+        6000,
+        &[(&samples, Some(0)), (&samples, Some(100))],
+    );
+    let path = write_temp("overlapping-tfdt", &bytes);
+    let info = read(&path).unwrap();
+    assert!(info.fragmented);
+    assert_eq!(info.tracks[0].duration, 300);
+    assert_eq!(info.tracks[0].samples, 4);
+    assert_eq!(info.tracks[0].bytes, 4);
+    assert_eq!(info.tracks[0].first_pts, 0.0);
+    assert_eq!(info.tracks[0].nominal_fps, Some(60.0));
+    assert!(
+        finalize(&path, &Layout::default(), CrashAt::None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("overlapping")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn fragmented_probe_accepts_one_tick_server_timestamp_rounding_overlap() {
+    // MediaMTX's WHIP/RTMP recordings can round tfdt one tick below the
+    // preceding trun's end (e.g. 14999 versus 15000 at 90 kHz).
+    let samples = [(3000, 1, 0, 0); 5];
+    let bytes = timeline_fixture(
+        *b"vide",
+        90_000,
+        &[(&samples, Some(0)), (&samples, Some(14_999))],
+    );
+    let path = write_temp("probe-server-rounding", &bytes);
+    let info = read(&path).unwrap();
+    assert_eq!(info.tracks[0].duration, 29_999);
+    assert_eq!(info.tracks[0].samples, 10);
+    assert_eq!(info.tracks[0].bytes, 10);
+    assert_eq!(info.tracks[0].nominal_fps, Some(30.0));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn fragmented_probe_uses_decode_extent_and_continues_the_previous_fragment() {
+    let long = [(1000, 1, 0, 0)];
+    let short = [(100, 1, 0, 0)];
+    let origin = (1u64 << 32) + 6000;
+    let bytes = timeline_fixture(
+        *b"vide",
+        6000,
+        &[
+            (&long, Some(origin)),
+            (&short, Some(origin - 100)),
+            // Continue at origin, not at the maximum end (origin + 1000).
+            (&short, None),
+        ],
+    );
+    let path = write_temp("probe-backwards-fragments", &bytes);
+    let info = read(&path).unwrap();
+    assert_eq!(info.tracks[0].duration, 1100);
+    assert_eq!(info.tracks[0].first_pts, (origin - 100) as f64 / 6000.0);
+    assert_eq!(info.tracks[0].samples, 3);
+    assert_eq!(info.tracks[0].bytes, 3);
+    assert_eq!(info.tracks[0].nominal_fps, Some(60.0));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn audio_repair_still_applies_when_reading_and_finalizing_fragments() {
+    let samples = [
+        (1024, 1, 0, 0),
+        (0, 1, 0, -3991),
+        (4_294_963_305, 1, 0, -3991),
+        (1024, 1, 0, 0),
+    ];
+    let bytes = timeline_fixture(*b"soun", 48_000, &[(&samples, Some(0))]);
+    let path = write_temp("audio-duration-repair", &bytes);
+    assert_eq!(read(&path).unwrap().tracks[0].duration, 4096);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, 1024),
+            (1024, 1024, 1024),
+            (2048, 2048, 1024),
+            (3072, 3072, 1024),
+        ]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn an_end_inside_the_last_sample_does_not_shorten_its_existing_hold() {
+    let mut samples = vec![video_sample(100), video_sample(1200)];
+    extend_last_sample(&mut samples, 500);
+    assert_eq!(samples[1].duration, 1200);
+    assert_eq!(media_duration(&samples), 1300);
 }
 
 #[test]
