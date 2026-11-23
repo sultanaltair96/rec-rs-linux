@@ -1283,8 +1283,12 @@ pub fn finalize(
         .filter(|b| b.kind == MOOF || b.kind == *b"mfra")
         .copied()
         .collect();
+    // A crash in the middle leaves the first fragments (the first video one
+    // among them) and the init moov, so the file still plays up to there;
+    // flipping from the front could remove every video fragment.
     if crash_at == CrashAt::MidFlip {
-        flips.truncate(flips.len() / 2);
+        let keep = flips.len() / 2;
+        flips.drain(..keep);
     }
     for b in &flips {
         f.seek(SeekFrom::Start(b.start + 4))?;
