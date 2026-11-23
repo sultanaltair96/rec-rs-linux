@@ -22,7 +22,9 @@
 mod control;
 mod install;
 mod linux_desktop;
+mod lock;
 mod preview;
+mod preview_gpu;
 mod session;
 mod theme;
 mod tray;
@@ -44,6 +46,7 @@ use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::compose::{PipSpec, Scene};
@@ -83,6 +86,9 @@ pub enum Cmd {
 }
 
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
+/// A camera or microphone was plugged in or removed (1B's watchers, which run
+/// on their own threads): reload in the tick (G9).
+static DEVICES_CHANGED: AtomicBool = AtomicBool::new(false);
 static PROXY: OnceLock<Mutex<EventLoopProxy<()>>> = OnceLock::new();
 
 /// Wake the event loop (from any thread).
@@ -185,6 +191,10 @@ pub struct State {
     pub settings: Settings,
     pub recording: Option<Session>,
     pub preview: Option<Session>,
+    /// A running camera between sessions (preview -> recording -> preview),
+    /// handed over so the device never restarts dark (phase 1E, upstream's
+    /// `spare_cam`): its exposure stays settled and the LED stays on.
+    spare_cam: Option<crate::record::Camera>,
     /// Settings the running preview session was started with.
     preview_settings: Option<Settings>,
     pub finishing: bool,
@@ -196,8 +206,9 @@ pub struct State {
     pub cameras: Vec<Device>,
     pub mics: Vec<Device>,
     pub hotkey_ok: bool,
-    /// The preview frame as an egui texture.
-    pub preview_tex: Option<egui::TextureId>,
+    /// The newest composited frame, drawn by `preview_gpu` (G10): the GPU
+    /// converts and scales it, so the app never touches its pixels.
+    pub preview_frame: Option<Arc<crate::media_types::VideoFrame>>,
     /// Its size in pixels.
     pub preview_px: [u32; 2],
     pub preview_aspect: f32,
@@ -243,6 +254,7 @@ impl State {
             settings,
             recording: None,
             preview: None,
+            spare_cam: None,
             preview_settings: None,
             finishing: false,
             last_file: None,
@@ -253,7 +265,7 @@ impl State {
             cameras: vec![],
             mics: vec![],
             hotkey_ok: true,
-            preview_tex: None,
+            preview_frame: None,
             preview_px: [0, 0],
             preview_aspect: 16.0 / 9.0,
             preview_target: (0, 0),
@@ -378,6 +390,64 @@ impl State {
 /// A finalized recording: (file, outcome).
 type Finished = (PathBuf, std::result::Result<Stats, String>);
 
+/// What the hotplug poll watches: the microphone and camera lists (ids and
+/// names). Display and window lists talk to the portal and are refreshed by
+/// the ↻ button instead (G9).
+pub(crate) fn device_fingerprint(
+    cameras: &[crate::media_types::CameraInfo],
+    mics: &[crate::media_types::MicInfo],
+) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(cameras.len() + mics.len());
+    v.extend(cameras.iter().map(|c| format!("cam:{}:{}", c.id, c.name)));
+    v.extend(mics.iter().map(|m| format!("mic:{}:{}", m.id, m.name)));
+    v
+}
+
+/// The X11 window id behind a winit handle, if it has one (Wayland windows have
+/// no X11 id: their capture goes through the portal).
+pub(crate) fn x11_window_id(handle: &RawWindowHandle) -> Option<u32> {
+    match handle {
+        RawWindowHandle::Xlib(h) => Some(h.window as u32),
+        RawWindowHandle::Xcb(h) => Some(h.window.get()),
+        _ => None,
+    }
+}
+
+/// Whether the capture backend can paint Rec's own windows out by itself
+/// (`capture::screen::set_excluded_windows`, X11). Elsewhere (the portal) the
+/// only exclusion is hiding them.
+pub(crate) fn exclusion_is_done_by_capture(
+    backend: Result<crate::capture::screen::Backend>,
+) -> bool {
+    matches!(backend, Ok(crate::capture::screen::Backend::X11))
+}
+
+/// Whether the main window must be hidden for a recording (G3): a display or
+/// region capture that cannot exclude Rec's own window would film the preview;
+/// a single-window capture cannot contain it, the user can turn the behaviour
+/// off, and on X11 the capture paints our windows out (no hide needed).
+pub(crate) fn hides_window_for_recording(
+    settings: &Settings,
+    main_visible: bool,
+    capture_excludes_ours: bool,
+) -> bool {
+    settings.hide_window_when_recording
+        && settings.window.is_none()
+        && main_visible
+        && !capture_excludes_ours
+}
+
+/// Whether the mic a running preview opened is no longer the one the saved
+/// selection resolves to (G9; upstream's `devices_changed` restarts the preview
+/// for this). `in_use` is the running session's selection: `Some(None)` = the
+/// default mic, `None` = no preview/mic was running, which also means a
+/// restart when the settings now want one.
+pub(crate) fn mic_needs_restart(in_use: Option<&Option<String>>, want: Option<&str>) -> bool {
+    let current = in_use.and_then(|i| i.as_deref()).map(str::to_string);
+    let want = want.map(str::to_string);
+    current != want
+}
+
 fn load_devices(st: &mut State) {
     st.displays = crate::capture::screen::displays()
         .map(|ds| {
@@ -420,6 +490,23 @@ struct App {
     /// Quit is in progress: the windows are gone and the loop is ending, so no
     /// event may touch them.
     quitting: bool,
+    /// The main window was hidden for the running recording (G3): a capture
+    /// that cannot exclude Rec's window would film it. Restored on stop.
+    hidden_for_recording: bool,
+    /// The screen is locked (G8): nothing is drawn and no preview frames are
+    /// converted until it is unlocked.
+    screen_locked: bool,
+    /// The main window is covered or minimized (winit's occlusion event, which
+    /// Wayland often does not send).
+    main_occluded: bool,
+    /// The lock watcher (G8), if a bus answered.
+    lock: Option<lock::LockWatcher>,
+    /// The device lists as last seen, to ignore a watch event that changes
+    /// nothing (G9).
+    device_fingerprint: Vec<String>,
+    /// 1B's hotplug watchers (G9); they stop when dropped.
+    _camera_watch: Option<crate::capture::camera::DeviceWatch>,
+    _audio_watch: Option<crate::capture::audio::DeviceWatch>,
     st: State,
     tray: Option<ksni::blocking::Handle<tray::Tray>>,
     /// The tray starts on a thread: registering the status item talks to D-Bus,
@@ -427,7 +514,6 @@ struct App {
     tray_rx: Option<Receiver<Option<ksni::blocking::Handle<tray::Tray>>>>,
     tap: preview::Tap,
     tap_sink: FrameSink,
-    preview_texture: Option<egui::TextureHandle>,
     last_tick: Instant,
     last_meter: Instant,
     control_rx: Receiver<Control>,
@@ -454,11 +540,24 @@ impl App {
         st.settings.window = window;
         theme::set_accent(theme::accent_from_env());
         load_devices(&mut st);
+        let device_fingerprint = device_fingerprint(
+            &crate::capture::camera::cameras().unwrap_or_default(),
+            &crate::capture::audio::microphones().unwrap_or_default(),
+        );
         st.hotkey_ok = crate::hotkey::backend() != crate::hotkey::Backend::None;
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let (accent_tx, accent_rx) = std::sync::mpsc::channel();
         spawn_accent_fetch(accent_tx);
         let (tap, tap_sink) = preview::Tap::new(Arc::new(wake));
+        let lock = lock::LockWatcher::start(Arc::new(wake));
+        // G9: 1B's watchers call back on their own thread; wake the loop and
+        // reload in the tick. An unavailable backend simply has no watch.
+        let changed = || {
+            DEVICES_CHANGED.store(true, Ordering::SeqCst);
+            wake();
+        };
+        let camera_watch = crate::capture::camera::watch_devices(changed).ok();
+        let audio_watch = crate::capture::audio::watch_devices(changed).ok();
         if settings {
             push(Cmd::ShowSettings);
         }
@@ -468,12 +567,18 @@ impl App {
             settings_win: None,
             main_visible: true,
             quitting: false,
+            hidden_for_recording: false,
+            screen_locked: false,
+            main_occluded: false,
+            device_fingerprint,
             st,
             tray: None,
             tray_rx: None,
+            lock,
+            _camera_watch: camera_watch,
+            _audio_watch: audio_watch,
             tap,
             tap_sink,
-            preview_texture: None,
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             control_rx,
@@ -585,8 +690,12 @@ impl App {
             color_space: Default::default(),
         };
         surface.configure(&g.device, &config);
-        let renderer =
+        let mut renderer =
             egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
+        // G10: the preview's pipelines and textures live with the window.
+        renderer
+            .callback_resources
+            .insert(preview_gpu::PreviewPainter::new(&g.device, format));
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let egui = egui_winit::State::new(
@@ -636,7 +745,7 @@ impl App {
             w.window.request_redraw();
         }
         self.main_visible = true;
-        self.tap.set_wanted(true);
+        self.update_tap_wanted();
         self.sync_preview();
     }
 
@@ -646,9 +755,8 @@ impl App {
         }
         self.main_visible = false;
         // Nothing is drawn while the window is hidden: the tap drops frames.
-        self.tap.set_wanted(false);
-        self.st.preview_tex = None;
-        self.preview_texture = None;
+        self.update_tap_wanted();
+        self.st.preview_frame = None;
         self.sync_preview();
     }
 
@@ -834,13 +942,23 @@ impl App {
         let stale = self.st.preview_settings.as_ref().map(Settings::capture_key)
             != Some(self.st.settings.capture_key());
         if self.st.preview.is_some() && (!want || stale) {
-            if let Some(s) = self.st.preview.take() {
+            if let Some(mut s) = self.st.preview.take() {
+                // Keep the camera for the next session (a recording, or the
+                // restarted preview): re-opening it would restart its
+                // exposure and its LED.
+                if want {
+                    self.st.spare_cam = s.take_camera();
+                }
                 let _ = s.finish();
             }
             self.st.preview_settings = None;
         }
         if want && self.st.preview.is_none() && self.st.error.is_none() {
-            let r = self.options(None).and_then(|o| Session::start(&o));
+            self.exclude_own_windows();
+            let cam = self.st.spare_cam.take();
+            let r = self
+                .options(None)
+                .and_then(|o| Session::start_with_camera(&o, cam));
             match r {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
@@ -870,17 +988,23 @@ impl App {
     }
 
     fn start_recording(&mut self) {
-        // One capture session at a time: the recording feeds the preview.
-        if let Some(s) = self.st.preview.take() {
+        // One capture session at a time: the recording feeds the preview and
+        // takes over its camera, already exposed for the room.
+        let mut cam = self.st.spare_cam.take();
+        if let Some(mut s) = self.st.preview.take() {
+            cam = cam.or_else(|| s.take_camera());
             let _ = s.finish();
         }
         self.st.preview_settings = None;
         self.st.error = None;
         let file = self.st.settings.new_output_file();
+        // The capture reads the exclusion list when it opens, so the recording
+        // (which replaces the preview's capture) gets the current windows.
+        self.exclude_own_windows();
         let r = std::fs::create_dir_all(&self.st.settings.output_dir)
             .map_err(anyhow::Error::from)
             .and_then(|_| self.options(Some(&file)))
-            .and_then(|o| Session::start(&o));
+            .and_then(|o| Session::start_with_camera(&o, cam));
         match r {
             Ok(sess) => {
                 let _ = std::fs::write(
@@ -895,19 +1019,115 @@ impl App {
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
+                // G3: a display (or region) capture includes Rec's own window
+                // unless it is hidden; a single-window capture cannot.
+                if hides_window_for_recording(
+                    &self.st.settings,
+                    self.main_visible,
+                    Self::capture_excludes_ours(),
+                ) {
+                    self.hide_window_for_recording();
+                }
             }
             Err(e) => {
                 eprintln!("rec: could not start recording: {e:#}");
                 self.st.error = Some(format!("Could not start recording: {e:#}"));
+                self.restore_after_recording();
                 self.sync_preview();
             }
         }
     }
 
+    /// Rec's own top-level X11 window ids, for
+    /// `capture::screen::set_excluded_windows` (G3): the capture paints their
+    /// visible parts out of every frame on X11. Empty on Wayland, where the ids
+    /// do not exist and the portal cannot exclude windows either way.
+    fn own_window_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for w in [self.main.as_ref(), self.settings_win.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(handle) = w.window.window_handle()
+                && let Some(id) = x11_window_id(&handle.as_raw())
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Hand our window ids to the capture that is about to start (G3). The
+    /// capture reads the list once, when it opens.
+    fn exclude_own_windows(&self) {
+        let ids = self.own_window_ids();
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!("rec: debug: excluding own windows {ids:?}");
+        }
+        crate::capture::screen::set_excluded_windows(ids);
+    }
+
+    /// Whether the capture excludes our windows itself (X11) rather than the app
+    /// having to hide them (portal).
+    fn capture_excludes_ours() -> bool {
+        exclusion_is_done_by_capture(crate::capture::screen::backend())
+    }
+
+    /// After a device was plugged in or removed (G9): refresh the lists, and
+    /// restart the preview when the saved mic now resolves to another device
+    /// (upstream's `devices_changed`).
+    fn devices_changed(&mut self) {
+        let cameras = crate::capture::camera::cameras().unwrap_or_default();
+        let mics = crate::capture::audio::microphones().unwrap_or_default();
+        let fingerprint = device_fingerprint(&cameras, &mics);
+        if fingerprint == self.device_fingerprint {
+            return;
+        }
+        self.device_fingerprint = fingerprint;
+        load_devices(&mut self.st);
+        if self.st.recording.is_none()
+            && self.st.preview.is_some()
+            && self.st.settings.mic_enabled
+            && let Some(sel) = self.st.settings.mic.as_deref()
+            && let Ok(pick) =
+                crate::capture::audio::pick_mic(sel, self.st.settings.mic_name.as_deref())
+            && mic_needs_restart(self.st.mic_in_use.as_ref(), pick.id.as_deref())
+        {
+            self.st.preview_settings = None;
+        }
+    }
+
+    /// Hide the main window for the running recording, and say so (G3).
+    fn hide_window_for_recording(&mut self) {
+        self.hide_main();
+        self.hidden_for_recording = true;
+        let message = "Rec's window is hidden while recording, because a screen capture would \
+                       film it. Open it from the tray.";
+        self.st.notice = Some((message.into(), Instant::now()));
+        // The window that would show the notice is the one being hidden.
+        linux_desktop::notify("Rec", message);
+        // On X11 this is not reached: the capture paints our windows out
+        // (`set_excluded_windows`); hiding is the portal's only exclusion.
+    }
+
+    /// Bring the window back after a recording that hid it (G3).
+    fn restore_after_recording(&mut self) {
+        if self.hidden_for_recording {
+            self.hidden_for_recording = false;
+            if let Some(w) = &self.main {
+                w.window.set_visible(true);
+            }
+            self.main_visible = true;
+            self.update_tap_wanted();
+        }
+    }
+
     fn stop_recording(&mut self) {
-        let Some(sess) = self.st.recording.take() else {
+        let Some(mut sess) = self.st.recording.take() else {
             return;
         };
+        // The camera goes back to the preview once the file is finished.
+        self.st.spare_cam = sess.take_camera();
         let file = sess.output.clone().unwrap_or_default();
         self.st.finishing = true;
         let done = self.finished.clone();
@@ -1067,10 +1287,11 @@ impl App {
         let done = self.finished.lock().unwrap().take();
         if let Some((file, r)) = done {
             self.st.finishing = false;
+            self.restore_after_recording();
             match r {
                 Ok(_) => {
                     self.st.last_file = Some(file.clone());
-                    self.tap.set_wanted(self.main_visible);
+                    self.update_tap_wanted();
                     self.st.notice = Some((
                         format!(
                             "Saved {}",
@@ -1105,6 +1326,10 @@ impl App {
         if self.st.refresh_devices {
             self.st.refresh_devices = false;
             load_devices(&mut self.st);
+        }
+        // G9: a device was plugged in or removed.
+        if DEVICES_CHANGED.swap(false, Ordering::SeqCst) {
+            self.devices_changed();
         }
         for e in crate::hotkey::poll() {
             match e {
@@ -1141,6 +1366,20 @@ impl App {
                     .flatten()
                 {
                     theme::apply(&w.ctx);
+                }
+            }
+        }
+        // G8: the screen lock stops the preview (the recording keeps going).
+        let locked = self.lock.as_ref().is_some_and(|l| l.locked());
+        if locked != self.screen_locked {
+            self.screen_locked = locked;
+            self.update_tap_wanted();
+            if !locked {
+                for w in [self.main.as_mut(), self.settings_win.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    w.window.request_redraw();
                 }
             }
         }
@@ -1207,7 +1446,7 @@ impl App {
     }
 
     fn redraw(&mut self, which: WindowId) {
-        if self.quitting {
+        if self.quitting || self.screen_locked {
             return;
         }
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == which);
@@ -1221,25 +1460,24 @@ impl App {
                 self.st.preview_target.0.max(2),
                 self.st.preview_target.1.max(2),
             );
-            if let Some(frame) = self.tap.take()
-                && let Some((img, px)) = self.tap.image(&frame)
-                && px[0] > 0
-                && px[1] > 0
-            {
-                self.st.preview_aspect = px[0] as f32 / px[1] as f32;
-                self.st.preview_px = px;
-                let options = egui::TextureOptions::LINEAR;
-                match &mut self.preview_texture {
-                    Some(h) => h.set(img, options),
-                    None => {
-                        let ctx = &self.main.as_ref().unwrap().ctx;
-                        self.preview_texture = Some(ctx.load_texture("preview", img, options));
-                    }
-                }
-                self.st.preview_tex = self.preview_texture.as_ref().map(|h| h.id());
+            if let Some(frame) = self.tap.take() {
+                // Drawn from the GPU in `ui::preview`; the size the UI shows it
+                // at is the low-power target (half resolution), the texture
+                // stays the frame's (the GPU scales without a CPU copy).
+                let (pw, ph) = preview::target_size(
+                    frame.width,
+                    frame.height,
+                    self.st.preview_target,
+                    self.st.settings.preview_low_power,
+                );
+                self.st.preview_aspect = frame.width as f32 / frame.height as f32;
+                self.st.preview_px = [pw as u32, ph as u32];
+                let pts = frame.pts;
+                let (fw, fh) = (frame.width, frame.height);
+                self.st.preview_frame = Some(Arc::new(frame));
                 self.st.frames_shown += 1;
                 if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
-                    eprintln!("rec: debug: preview frame {}x{}", px[0], px[1]);
+                    eprintln!("rec: debug: preview frame {fw}x{fh} at {pts:.3}s");
                 }
             }
         }
@@ -1400,6 +1638,7 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.main
             && self.main_visible
             && !w.occluded
+            && !self.screen_locked
         {
             w.window.request_redraw();
         }
@@ -1440,7 +1679,8 @@ impl ApplicationHandler for App {
                     win.window.request_redraw();
                 }
                 if is_main {
-                    self.tap.set_wanted(self.main_visible && !o);
+                    self.main_occluded = o;
+                    self.update_tap_wanted();
                 }
             }
             WindowEvent::ThemeChanged(_) => {
@@ -1483,7 +1723,7 @@ impl ApplicationHandler for App {
             .flatten()
         {
             let visible = w.window.is_visible().unwrap_or(true) && !w.occluded;
-            if live && visible {
+            if live && visible && !self.screen_locked {
                 // Timer, meters: ~15 fps; preview frames wake us on arrival.
                 w.window.request_redraw();
             }
@@ -1501,11 +1741,20 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// The preview wants frames while the window is visible, not covered and
+    /// the screen is not locked (G8; upstream draws nothing while locked).
+    fn update_tap_wanted(&mut self) {
+        self.tap.set_wanted(lock::preview_wanted(
+            self.main_visible,
+            self.main_occluded,
+            self.screen_locked,
+        ));
+    }
+
     /// Destroy the windows (their surfaces, renderers and egui contexts) while
     /// the event loop is still running: a Wayland surface must not outlive it.
     fn close_windows(&mut self) {
-        self.preview_texture = None;
-        self.st.preview_tex = None;
+        self.st.preview_frame = None;
         self.st.preview_px = [0, 0];
         self.settings_win = None;
         self.main = None;
@@ -1646,6 +1895,87 @@ mod tests {
         assert!(st.has_stream_key(url));
         st.delete_stream_key(url);
         assert!(!st.has_stream_key(url));
+    }
+
+    #[test]
+    fn the_window_is_hidden_only_where_the_capture_cannot_exclude_it() {
+        // G3: on the portal a display or region capture would film Rec's own
+        // window (hide it); on X11 the capture paints it out (do not hide). A
+        // single-window capture cannot contain it, and the setting can turn the
+        // hide off.
+        use crate::capture::screen::Backend;
+        let mut settings = Settings::default();
+        assert!(settings.hide_window_when_recording, "on by default");
+        assert!(hides_window_for_recording(&settings, true, false), "portal");
+        assert!(
+            !hides_window_for_recording(&settings, true, true),
+            "X11 excludes our windows itself"
+        );
+        assert!(
+            !hides_window_for_recording(&settings, false, false),
+            "already hidden"
+        );
+        settings.window = Some(42);
+        assert!(
+            !hides_window_for_recording(&settings, true, false),
+            "a window capture cannot contain our window"
+        );
+        settings.window = None;
+        settings.hide_window_when_recording = false;
+        assert!(!hides_window_for_recording(&settings, true, false));
+
+        // The backend decides which path is taken.
+        assert!(exclusion_is_done_by_capture(Ok(Backend::X11)));
+        assert!(!exclusion_is_done_by_capture(Ok(Backend::Portal)));
+        assert!(!exclusion_is_done_by_capture(Err(anyhow::anyhow!(
+            "no session"
+        ))));
+    }
+
+    #[test]
+    fn own_window_ids_come_from_x11_handles_only() {
+        // G3: the ids the app hands to `set_excluded_windows` are the X11 ones;
+        // a Wayland window has none (its capture cannot exclude anything).
+        use winit::raw_window_handle::{WaylandWindowHandle, XcbWindowHandle, XlibWindowHandle};
+        let xlib = RawWindowHandle::Xlib(XlibWindowHandle::new(0x2a));
+        assert_eq!(x11_window_id(&xlib), Some(0x2a));
+        let xcb = RawWindowHandle::Xcb(XcbWindowHandle::new(
+            std::num::NonZeroU32::new(0x2a).unwrap(),
+        ));
+        assert_eq!(x11_window_id(&xcb), Some(0x2a));
+        let wayland =
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(std::ptr::NonNull::dangling()));
+        assert_eq!(x11_window_id(&wayland), None);
+    }
+
+    #[test]
+    fn hotplug_notices_a_changed_mic_and_device_list() {
+        // G9: a plugged/unplugged device changes the fingerprint, and a preview
+        // whose mic now resolves to another device restarts.
+        use crate::media_types::{CameraInfo, MicInfo};
+        let mic = |id: &str| MicInfo {
+            id: id.into(),
+            name: format!("Mic {id}"),
+            rate: Some(48_000),
+        };
+        let cam = |id: &str| CameraInfo {
+            id: id.into(),
+            name: format!("Cam {id}"),
+        };
+        let a = device_fingerprint(&[cam("c1")], &[mic("m1")]);
+        assert_eq!(a, ["cam:c1:Cam c1", "mic:m1:Mic m1"]);
+        assert_eq!(a, device_fingerprint(&[cam("c1")], &[mic("m1")]), "stable");
+        assert_ne!(a, device_fingerprint(&[cam("c1"), cam("c2")], &[mic("m1")]));
+        assert_ne!(a, device_fingerprint(&[cam("c1")], &[mic("m1"), mic("m2")]));
+
+        assert!(!mic_needs_restart(Some(&Some("m1".into())), Some("m1")));
+        assert!(mic_needs_restart(Some(&Some("m1".into())), Some("m2")));
+        assert!(mic_needs_restart(Some(&Some("m1".into())), None));
+        assert!(
+            mic_needs_restart(None, Some("m1")),
+            "the running session has no mic but the settings want one"
+        );
+        assert!(!mic_needs_restart(None, None), "nothing to change");
     }
 
     #[test]
