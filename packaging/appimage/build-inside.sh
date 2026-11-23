@@ -18,8 +18,22 @@ export DEBIAN_FRONTEND=noninteractive
 export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 echo "== packages"
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+# Bound each request: a stalled mirror otherwise holds the build for many
+# minutes (Ubuntu's security mirror is a common culprit), and retry quickly.
+APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+# A mirror outage (archive.ubuntu.com is unreachable from some networks) would
+# otherwise stall the build for as long as the network keeps trickling. The
+# build script passes APT_MIRROR through when a caller sets it; the default
+# sources stay untouched.
+if [ -n "${APT_MIRROR:-}" ]; then
+    sed -i "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g; s|http://security.ubuntu.com/ubuntu|$APT_MIRROR|g" \
+        /etc/apt/sources.list.d/ubuntu.sources
+    echo "  using mirror $APT_MIRROR"
+fi
+# shellcheck disable=SC2086 # $APT_OPTS is an option list
+apt-get $APT_OPTS update -qq
+# shellcheck disable=SC2086
+apt-get $APT_OPTS install -y -qq --no-install-recommends \
     build-essential pkg-config git curl ca-certificates file wget xz-utils \
     libclang-dev clang \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -53,6 +67,9 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/m
 
 install -Dm755 /root/target/release/rec-rs "$APPDIR/usr/bin/rec-rs"
 ln -sf rec-rs "$APPDIR/usr/bin/rec"
+# gst-inspect is a 50 KB diagnostic that answers "is vah264enc here?" on a real
+# GPU host; the AppImage has no other way to enumerate elements.
+install -Dm755 "$(command -v gst-inspect-1.0)" "$APPDIR/usr/bin/gst-inspect-1.0"
 install -Dm644 packaging/desktop/io.github.sultanaltair96.Rec.metainfo.xml \
     "$APPDIR/usr/share/metainfo/io.github.sultanaltair96.Rec.metainfo.xml"
 # The AppImage desktop file is named after the binary, and its icon too, so
@@ -107,6 +124,15 @@ for el in $ELEMENTS; do
     file=$(gst-inspect-1.0 "$el" 2>/dev/null | sed -n 's/^  Filename *//p' | head -1)
     [ -n "$file" ] && [ -f "$file" ] && cp -n "$file" "$PLUGINS/" || true
 done
+# The VA-API plugin registers its encoders only when a VA display opens, so on
+# this GPU-less build host `gst-inspect-1.0 vah264enc` finds nothing and the
+# element-driven collection above would miss the whole plugin. Copy it by file:
+# on a host with /dev/dri the plugin then registers vah264enc/vah265enc, which
+# the writer prefers over x264enc/x265enc.
+for f in /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstva.so; do
+    [ -f "$f" ] && cp -n "$f" "$PLUGINS/" || true
+done
+
 # Core plugins that are not named after an element but are needed:
 # coreelements (queue/tee/filesink/capsfilter are there), playback, typefind.
 for f in /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstcoreelements.so \
@@ -206,6 +232,24 @@ for pass in 1 2 3 4 5; do
     done
     echo "  pass $pass: $added libraries"
     [ "$added" -eq 0 ] && break
+done
+
+# libva and the base libraries a GPU driver links must come from the host when
+# it has them: Fedora 44's radeonsi_drv_video.so exports only
+# __vaDriverInit_1_24, which the build container's libva 2.20 cannot load, and
+# the driver is linked against the host's libstdc++/libelf/libz/libzstd/
+# libexpat. They stay in the bundle as a fallback for hosts that lack them;
+# AppRun adds this directory to LD_LIBRARY_PATH only then.
+echo "== host-first libraries (fallback copies)"
+mkdir -p "$APPDIR/usr/lib/fallback"
+for soname in libva.so.2 libva-drm.so.2 libva-x11.so.2 \
+              libstdc++.so.6 libelf.so.1 libz.so.1 libzstd.so.1 libexpat.so.1; do
+    for f in "$APPDIR/usr/lib/$soname"*; do
+        if [ -e "$f" ]; then
+            mv "$f" "$APPDIR/usr/lib/fallback/"
+            echo "  fallback $soname"
+        fi
+    done
 done
 
 # GStreamer's out-of-process plugin scanner; its location moved between

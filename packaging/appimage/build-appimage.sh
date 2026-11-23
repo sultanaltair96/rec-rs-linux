@@ -66,5 +66,6 @@ exec docker run --rm --init -i --name "$NAME" \
     -v "$VOLUME:/root" \
     -w "$REPO" \
     -e REPO="$REPO" -e OUT=/out -e JOBS="$JOBS" -e VERSION="$VERSION" \
+    -e APT_MIRROR="${APT_MIRROR:-}" \
     -e CARGO_BUILD_JOBS="$JOBS" \
     "$IMAGE" sh "$REPO/packaging/appimage/build-inside.sh"

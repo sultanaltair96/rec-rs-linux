@@ -22,12 +22,14 @@ MEM=${PKG_MEMORY:-4g}
 IMAGES=${APPIMAGE_TEST_IMAGES:-"fedora:43 debian:13"}
 LOG=$OUT/test-appimage
 
-APPIMAGE=$(ls "$OUT"/Rec-*-x86_64.AppImage 2>/dev/null | head -1) || true
+# The newest build: an older Rec-* from a previous round may still be here.
+APPIMAGE=$(ls -t "$OUT"/Rec-*-x86_64.AppImage 2>/dev/null | head -1) || true
 [ -n "${APPIMAGE:-}" ] || {
     echo "test-appimage.sh: no $OUT/Rec-*-x86_64.AppImage; run packaging/appimage/build-appimage.sh first" >&2
     exit 1
 }
 IMAGE_NAME=$(basename "$APPIMAGE")
+echo "test-appimage.sh: testing $IMAGE_NAME ($(stat -c %s "$APPIMAGE") bytes)"
 
 if [ -z "${DOCKER_CONFIG:-}" ] && [ -f "${HOME:-/nonexistent}/.docker/config.json" ] &&
    grep -q '"credsStore"[[:space:]]*:[[:space:]]*"desktop' "${HOME}/.docker/config.json" 2>/dev/null &&

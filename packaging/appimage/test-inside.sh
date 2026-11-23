@@ -15,6 +15,9 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 pass=0
 fail=0
 skip=0
+# The writer prints which encoder it chose ("rec: debug: encoder x264enc") only
+# with REC_DEBUG, so every record run below runs with it on.
+export REC_DEBUG=1
 ok() { echo "PASS  $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL  $1"; fail=$((fail + 1)); }
 skipping() { echo "SKIP  $1 ($2)"; skip=$((skip + 1)); }
@@ -32,7 +35,7 @@ if "$APPIMAGE" --version; then ok "AppImage starts"; else bad "AppImage starts";
 
 echo "== record: h264, test pattern"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 3 -o /tmp/x.mp4 >/tmp/h264.log 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' /tmp/h264.log | head -1
+    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/h264.log | head -1
     ok "record h264"
 else
     cat /tmp/h264.log
@@ -51,7 +54,7 @@ fi
 echo "== record: hevc"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 2 --codec hevc \
         -o /tmp/hevc.mp4 >/tmp/hevc.log 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' /tmp/hevc.log | head -1
+    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/hevc.log | head -1
     ok "record hevc"
     if "$APPIMAGE" probe /tmp/hevc.mp4 >/tmp/hevc.probe 2>&1; then ok "probe hevc"; else cat /tmp/hevc.probe; bad "probe hevc"; fi
 else
@@ -62,8 +65,8 @@ fi
 echo "== record: prores"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 2 --codec prores \
         -o /tmp/prores.mov >/tmp/prores.log 2>&1; then
-    grep -o 'rec: encoder [a-z0-9_]*' /tmp/prores.log | head -1
-    ok "record prores ($(grep -o 'rec: encoder [a-z0-9_]*' /tmp/prores.log | head -1 | sed 's/rec: encoder //'))"
+    grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/prores.log | head -1
+    ok "record prores ($(grep -o 'rec: .*encoder [a-z0-9_]*' /tmp/prores.log | head -1 | sed 's/.*encoder //'))"
 else
     cat /tmp/prores.log
     bad "record prores"
@@ -107,10 +110,54 @@ else
     skipping "the app starts with no subcommand" "no xvfb-run in the test container"
 fi
 
-echo "== live elements in the bundle (elements -> plugin file)"
-if [ ! -d /tmp/squashfs-root ]; then
-    ( cd /tmp && env -u APPIMAGE_EXTRACT_AND_RUN "$APPIMAGE" --appimage-extract >/dev/null 2>&1 ) || true
+# The bundle is inspected several times below (VA plugin, elements, libraries),
+# so unpack it once.
+( cd /tmp && rm -rf squashfs-root && env -u APPIMAGE_EXTRACT_AND_RUN "$APPIMAGE" --appimage-extract >/dev/null 2>&1 ) || true
+
+# Run a binary from the extracted bundle with AppRun's environment, so the
+# checks below see exactly what the AppImage sees when it starts.
+bundle_run() {
+    env -u APPIMAGE_EXTRACT_AND_RUN \
+        LD_LIBRARY_PATH=/tmp/squashfs-root/usr/lib \
+        GST_PLUGIN_SYSTEM_PATH_1_0=/tmp/squashfs-root/usr/lib/gstreamer-1.0 \
+        GST_PLUGIN_SCANNER_1_0=/tmp/squashfs-root/usr/libexec/gstreamer-1.0/gst-plugin-scanner \
+        LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:-/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri}" \
+        "$@"
+}
+
+echo "== VA-API plugin: bundled, and present as an element with a GPU"
+# The va plugin's elements only register when a VA display opens, so the build
+# host cannot find them with gst-inspect; it is bundled by file instead. That
+# part is checked everywhere; the element itself needs a render node.
+if [ -f /tmp/squashfs-root/usr/lib/gstreamer-1.0/libgstva.so ]; then
+    ok "libgstva.so is bundled"
+else
+    bad "libgstva.so is bundled"
 fi
+if [ -e /dev/dri/renderD128 ]; then
+    # Through AppRun, not the extracted helper: this is what a user's process
+    # sees, including the host-first libva decision and LIBVA_DRIVERS_PATH.
+    if REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" va >/tmp/va-plugin.log 2>&1 &&
+       REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" vah264enc >/dev/null 2>&1; then
+        ok "vah264enc registers through AppRun on this GPU ($(REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" vah264enc 2>/dev/null | sed -n 's/^  Long-name *//p' | head -1))"
+    else
+        tail -12 /tmp/va-plugin.log
+        bad "vah264enc registers through AppRun on this GPU"
+    fi
+else
+    # No GPU here: the plugin still has to load, which proves libva resolved
+    # (the bundled fallback copy, since these containers carry none).
+    if REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" va >/tmp/va-plugin.log 2>&1; then
+        ok "the va plugin loads without a DRI node (libva resolved)"
+    else
+        tail -8 /tmp/va-plugin.log
+        bad "the va plugin loads without a DRI node (libva resolved)"
+    fi
+    skipping "vah264enc registers through AppRun on this GPU" "no /dev/dri/renderD128 in this container"
+fi
+
+echo "== live elements in the bundle (elements -> plugin file)"
+
 # The AppImage carries no gst-inspect, so the live path's elements are checked
 # through the plugin files that provide them. The streaming test below then uses
 # them for real, which is the stronger proof.
@@ -192,14 +239,10 @@ else
 fi
 
 echo "== the bundled plugin set"
-cd /tmp
-rm -rf squashfs-root
-unset APPIMAGE_EXTRACT_AND_RUN
-"$APPIMAGE" --appimage-extract >/dev/null 2>&1
-echo "  plugins: $(ls squashfs-root/usr/lib/gstreamer-1.0/*.so 2>/dev/null | wc -l)"
-ls squashfs-root/usr/lib/gstreamer-1.0/ | sed 's/^/    /' | head -40
+echo "  plugins: $(ls /tmp/squashfs-root/usr/lib/gstreamer-1.0/*.so 2>/dev/null | wc -l)"
+ls /tmp/squashfs-root/usr/lib/gstreamer-1.0/ | sed 's/^/    /' | head -40
 echo "== libraries still coming from the host (must be the documented set)"
-ldd squashfs-root/usr/bin/rec-rs 2>/dev/null | grep -v "/tmp/squashfs-root" | sed 's/^/    /' | head -20
+ldd /tmp/squashfs-root/usr/bin/rec-rs 2>/dev/null | grep -v "/tmp/squashfs-root" | sed 's/^/    /' | head -20
 echo "== update information"
 "$APPIMAGE" --appimage-updateinformation 2>/dev/null || echo "  (runtime has no --appimage-updateinformation)"
 
