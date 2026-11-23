@@ -1,0 +1,188 @@
+# Flatpak manifest for Rec (rec-rs-linux).
+#
+#   packaging/flatpak/build-flatpak.sh          # builds rec.flatpak in a container
+#   packaging/flatpak/test-flatpak.sh           # installs and exercises it
+#
+# Runtime: the newest stable GNOME runtime on Flathub (49, on the freedesktop
+# 25.08 base) plus the rust-stable SDK extension for the offline cargo build.
+#
+# Codecs: the runtime's GStreamer 1.26 already has appsrc/appsink, the muxers,
+# the PipeWire source, VA-API and gst-libav (avenc_aac, avenc_prores_ks,
+# avdec_h264/h265). It has no x264enc and no HEVC encoder, so:
+#
+#   * H.264 comes from `x264enc`, supplied by the Flathub-sanctioned
+#     `org.freedesktop.Platform.codecs-extra` extension. The runtime declares
+#     the extension point itself (lib/x86_64-linux-gnu/codecs-extra) with
+#     `add-ld-path = lib`, so declaring nothing in this manifest mounts it for
+#     the app and puts its plugins on GST_PLUGIN_SYSTEM_PATH. Evidence is in
+#     packaging/README.md.
+#   * HEVC has no element anywhere on Flathub (codecs-extra ships libx265 for
+#     HEIF decoding only; gst-libav has no avenc_libx265 there), so x265 and
+#     gst-plugins-bad's `x265enc` are built here. They are GPL, built as
+#     separate modules, and the app itself stays MIT OR Apache-2.0.
+#
+# Licensing note for the Flathub submission: x265 is GPL-2.0-or-later, with a
+# commercial option. It is distributed here as a separate library and its
+# licence is installed under share/licenses/io.github.sultanaltair96.Rec/x265.
+
+app-id: io.github.sultanaltair96.Rec
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # bindgen (through pipewire-sys / glib-sys) needs libclang; the base SDK has
+  # none, the LLVM extension is the supported place to get it.
+  - org.freedesktop.Sdk.Extension.llvm21
+
+command: rec-rs
+
+# finish-args: the minimum this recorder needs. Every line is justified; the
+# sandbox is not widened for cameras or the whole home directory.
+finish-args:
+  # The app is a winit/wgpu window: a Wayland surface, or X11 when the session
+  # is X11 (the ScreenCast portal works on both).
+  - --socket=wayland
+  - --socket=fallback-x11
+  # wl_shm/MIT-SHM: winit shares its window buffers with the compositor.
+  - --share=ipc
+  # /dev/dri: wgpu needs a render node for the Vulkan/GL compositor; without
+  # one the recorder still works and composites on the CPU.
+  - --device=dri
+  # System audio (the default sink's monitor) and the microphone, through
+  # PipeWire's PulseAudio compatibility, which flatpak exposes as this socket.
+  - --socket=pulseaudio
+  # PipeWire itself: the ScreenCast portal hands over a stream over D-Bus, and
+  # phase 1B opens the sink monitor and microphone nodes directly.
+  - --filesystem=xdg-run/pipewire-0
+  # Live streaming (RTMP/WHIP) and checking GitHub Releases for updates.
+  - --share=network
+  # The default recording folder is $XDG_VIDEOS_DIR (~/Videos), created on the
+  # first recording. Recordings elsewhere need an explicit `--filesystem` from
+  # the user or `-o` inside this folder.
+  - --filesystem=xdg-videos:create
+  # Stream keys live in the Secret Service, never in settings.json.
+  - --talk-name=org.freedesktop.secrets
+  # The tray icon is a StatusNotifierItem (ksni); without the watcher it would
+  # silently disappear on GNOME-with-extension and KDE.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Cameras deliberately use the Camera portal, so --device=all is NOT granted.
+  # A V4L2 camera opened directly (phase 1B's fallback) needs
+  #   flatpak override --user --device=all io.github.sultanaltair96.Rec
+  # and that trade-off is written down in packaging/README.md.
+
+cleanup:
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/man
+  - '*.a'
+  - '*.la'
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_NET_OFFLINE: 'true'
+    # bindgen dlopens libclang from here instead of searching $PATH, and the
+    # extension's clang builtin headers (stdbool.h, stdint.h, ...) are not on
+    # its default search path.
+    LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
+    BINDGEN_EXTRA_CLANG_ARGS: -I/usr/lib/sdk/llvm21/lib/clang/21/include
+
+modules:
+  # HEVC encoder library. 4.1 is the current release; assembly is on (nasm is
+  # in the SDK), which is what makes x265 usable for screen content at 1080p.
+  - name: x265
+    buildsystem: cmake-ninja
+    subdir: source
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_SHARED=ON
+      - -DENABLE_CLI=OFF
+      - -DENABLE_ASSEMBLY=ON
+      - -DENABLE_HDR10_PLUS=OFF
+      - -DENABLE_LIBNUMA=OFF
+      - -DEXPORT_C_API=ON
+      - -DHIGH_BIT_DEPTH=OFF
+      - -DENABLE_PIC=ON
+    post-install:
+      - install -Dm644 ../COPYING -t /app/share/licenses/io.github.sultanaltair96.Rec/x265
+    sources:
+      - type: archive
+        url: https://download.videolan.org/pub/videolan/x265/x265_4.1.tar.gz
+        sha256: a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29
+      # x265 4.1 still forces two compatibility policies to OLD and declares
+      # cmake_minimum_required(2.8.8), which CMake 4 in the SDK rejects. The
+      # patch raises both to the modern behaviour; nothing else changes.
+      - type: patch
+        path: patches/x265-cmake4.patch
+    cleanup:
+      - /bin
+
+  # Only the x265 plugin is built: everything else this app needs is already
+  # in the runtime. The version matches the runtime's GStreamer exactly
+  # (1.26.11) so the plugin loads into its core without an ABI mismatch.
+  - name: gst-plugins-bad
+    buildsystem: meson
+    config-opts:
+      - -Dauto_features=disabled
+      - -Dgpl=enabled
+      - -Dx265=enabled
+      - -Dintrospection=disabled
+      - -Ddoc=disabled
+      - -Dtests=disabled
+      - -Dexamples=disabled
+    post-install:
+      # flatpak-builder builds meson modules in a _flatpak_build subdir; accept
+      # either location so the licence lands in both layouts.
+      - if [ -f COPYING ]; then install -Dm644 COPYING -t /app/share/licenses/io.github.sultanaltair96.Rec/gst-plugins-bad; else install -Dm644 ../COPYING -t /app/share/licenses/io.github.sultanaltair96.Rec/gst-plugins-bad; fi
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.26.11.tar.xz
+        sha256: 110fb82795f0e569b1e27b12ab9699d35c7762e1ff4db95335d6ac8d1442af3d
+    cleanup:
+      - /include
+      - /lib/girepository-1.0
+      - /share/gir-1.0
+
+  - name: rec-rs
+    buildsystem: simple
+    build-options:
+      env:
+        # The generated cargo-sources.json drops `config` + `vendor/` here, so
+        # this is the CARGO_HOME cargo reads its source replacement from.
+        CARGO_HOME: /run/build/rec-rs/cargo
+    build-commands:
+      # flatpak-cargo-generator writes the source-replacement as `config`;
+      # cargo 1.9x warns that only `config.toml` is supported going forward.
+      - if [ -f cargo/config ]; then mv cargo/config cargo/config.toml; fi
+      - cargo build --release --offline --locked
+      - install -Dm755 target/release/rec-rs /app/bin/rec-rs
+      - ln -s rec-rs /app/bin/rec
+      - install -Dm644 packaging/desktop/io.github.sultanaltair96.Rec.desktop -t /app/share/applications
+      - install -Dm644 packaging/desktop/io.github.sultanaltair96.Rec.metainfo.xml -t /app/share/metainfo
+      - |
+        for size in 16 24 32 48 64 128 256 512; do
+          install -Dm644 "packaging/desktop/icons/hicolor/${size}x${size}/apps/io.github.sultanaltair96.Rec.png" \
+            "/app/share/icons/hicolor/${size}x${size}/apps/io.github.sultanaltair96.Rec.png"
+        done
+      - install -Dm644 LICENSE-MIT LICENSE-APACHE -t /app/share/licenses/io.github.sultanaltair96.Rec
+    sources:
+      - cargo-sources.json
+      # Local builds use the checkout as it is. The Flathub submission replaces
+      # this source with the release tag (see packaging/README.md):
+      #   - type: git
+      #     url: https://github.com/sultanaltair96/rec-rs-linux
+      #     tag: v0.1.0
+      #     commit: <sha>
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .github
+          - reference
+          - dev
+          - docs
+          - scripts
+          - tests

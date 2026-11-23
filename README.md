@@ -57,6 +57,43 @@ rec-rs stop         # SIGINT: finalizes, prints the file
 rec-rs save-replay  # SIGRTMIN+1 (the replay buffer is phase 1D)
 ```
 
+## Packaging
+
+Two installable packages are built from this repository by scripts in `packaging/`. Both run the
+same binary: with no subcommand it starts the app, and every command (`record`, `probe`, `devices`,
+`pause`, ...) behaves exactly as it does from a terminal.
+
+**Flatpak** — `io.github.sultanaltair96.Rec` on `org.gnome.Platform` 49, with H.264 through the
+Flathub-signed `codecs-extra` extension and HEVC through the `x265` + `gst-plugins-bad` module the
+manifest builds:
+
+```sh
+packaging/flatpak/build-flatpak.sh            # in a container; writes $REC_PKG_OUT/rec.flatpak
+flatpak install --user "$REC_PKG_OUT/rec.flatpak"
+flatpak run io.github.sultanaltair96.Rec record --test-pattern -t 3 -o ~/Videos/x.mp4
+flatpak run --command=rec-rs io.github.sultanaltair96.Rec probe ~/Videos/x.mp4
+```
+
+**AppImage** — carries its own GStreamer (x264, x265, AAC, Opus and ProRes encoders plus the
+muxers and the decoders `probe` uses), built on Ubuntu 22.04 so it starts on every current
+distribution:
+
+```sh
+packaging/appimage/build-appimage.sh          # in a container; writes $REC_PKG_OUT/Rec-<version>-x86_64.AppImage
+"$REC_PKG_OUT/Rec-<version>-x86_64.AppImage" record --test-pattern -t 3 -o /tmp/x.mp4
+"$REC_PKG_OUT/Rec-<version>-x86_64.AppImage" probe /tmp/x.mp4
+```
+
+Both need Docker on the build host and nothing else: every build and every check runs in a
+container. `REC_PKG_OUT` defaults to `~/.cache/rec-rs-linux-packaging`, never the repository. The
+codec decision per package, the sandbox permissions, what comes from the host, the desktop
+integration files (with their upstream provenance) and the checks that need a real desktop are in
+[`packaging/README.md`](packaging/README.md).
+
+Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) when a `v*`
+tag is pushed; it attaches `rec.flatpak`, `Rec-<version>-x86_64.AppImage` and the matching
+`.zsync` to the GitHub Release.
+
 ## Development
 
 See [`AGENTS.md`](AGENTS.md) for the ownership map (which phase owns which directory), the module
