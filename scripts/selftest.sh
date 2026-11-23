@@ -788,21 +788,29 @@ INNER
         else
             timeout "$TIMEOUT" "$d/run.sh" >"$d/session.log" 2>&1 || true
         fi
-        frames=0
+        # What this case proves: the CLI recording started next to the idle
+        # app, produced a finalised, playable file with at least a second of
+        # video, `rec-rs stop` crossed the recorder socket (a foreign pid in the
+        # pidfile makes the signal path impossible) and the app survived. A
+        # frame count proves none of that and is load-sensitive (G20b).
+        duration=0
         [ -f "$d/out/cli.mov" ] &&
-            frames=$(ffprobe -v error -select_streams v -count_frames \
-                -show_entries stream=nb_read_frames -of csv=p=0 "$d/out/cli.mov" 2>/dev/null || echo 0)
-        if [ -f "$d/out/cli.mov" ] && [ "$frames" -ge 60 ] &&
+            duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \
+                "$d/out/cli.mov" 2>/dev/null || echo 0)
+        if [ -f "$d/out/cli.mov" ] &&
+           awk -v t="$duration" 'BEGIN { exit !(t >= 1.0) }' &&
            "$REC" probe "$d/out/cli.mov" >"$d/probe.txt" 2>&1 &&
+           ffmpeg -v error -i "$d/out/cli.mov" -f null - 2>>"$d/probe.txt" &&
            [ "$(cat "$d/stop.out" 2>/dev/null)" = "$d/out/cli.mov" ] &&
+           grep -qx "stop rc=0" "$d/stop.rc" 2>/dev/null &&
            grep -qx refused "$d/blocked" 2>/dev/null &&
            grep -qx alive "$d/app.state" 2>/dev/null &&
            grep -q "already running" "$d/second.log" 2>/dev/null &&
            grep -q "app exit=0" "$d/exit" 2>/dev/null; then
-            echo "PASS  app-cli-control  (idle app + CLI recording $frames frames, stop over the socket with a foreign pid, second recorder refused, app survived)"
+            echo "PASS  app-cli-control  (idle app + CLI recording ${duration}s, finalised and playable, stop over the socket with a foreign pid, second recorder refused, app survived)"
             pass=$((pass+1))
         else
-            echo "FAIL  app-cli-control  (cli '$d/out/cli.mov' $frames frames, blocked '$(cat "$d/blocked" 2>/dev/null)', app '$(cat "$d/app.state" 2>/dev/null)'; see $d/app.log, $d/cli.log, $d/blocked.log, $d/session.log)"
+            echo "FAIL  app-cli-control  (cli '$d/out/cli.mov' ${duration}s, blocked '$(cat "$d/blocked" 2>/dev/null)', app '$(cat "$d/app.state" 2>/dev/null)', stop '$(cat "$d/stop.rc" 2>/dev/null)'; see $d/app.log, $d/cli.log, $d/blocked.log, $d/session.log)"
             fail=$((fail+1))
         fi
     fi
