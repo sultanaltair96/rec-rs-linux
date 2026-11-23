@@ -126,6 +126,20 @@ set --
 for f in "$PLUGINS"/*.so; do
     set -- "$@" --library "$f"
 done
+
+# Libraries the app loads with dlopen, so they are not DT_NEEDED of anything
+# and linuxdeploy cannot discover them: winit's X11 backend (x11-dl) opens the
+# Xlib set by soname, xkbcommon-dl opens libxkbcommon, and the Wayland client
+# stack is opened by smithay-client-toolkit. Without them the GUI exits with
+# "Failed to load one of xlib's shared libraries".
+for name in libX11.so.6 libX11-xcb.so.1 libXcursor.so.1 libXrandr.so.2 \
+            libXi.so.6 libXinerama.so.1 libXxf86vm.so.1 libXfixes.so.3 \
+            libxkbcommon.so.0 libxkbcommon-x11.so.0 \
+            libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1; do
+    lib=$(ls /usr/lib/x86_64-linux-gnu/"$name" 2>/dev/null | head -1)
+    [ -n "$lib" ] && set -- "$@" --library "$lib"
+done
+
 "$TOOLS/linuxdeploy" --appdir "$APPDIR" \
     --executable "$APPDIR/usr/bin/rec-rs" \
     --desktop-file "$APPDIR/usr/share/applications/rec-rs.desktop" \

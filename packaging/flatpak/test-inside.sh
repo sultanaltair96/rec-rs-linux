@@ -104,16 +104,27 @@ else
     bad "record prores"
 fi
 
-echo "== GUI entry point (no subcommand)"
-if flatpak run "$APP" >"$OUT/gui.log" 2>&1; then
-    bad "no subcommand should fail before phase 1E"
-else
-    if grep -q 'graphical app is not implemented yet (phase 1E)' "$OUT/gui.log"; then
-        ok "no subcommand starts rec-rs and reports the app phase"
+echo "== GUI: no subcommand opens the window (Xvfb, software rendering)"
+# The container has no desktop, so an Xvfb display stands in for one and the
+# runtime's Mesa renders with llvmpipe. A window that is still up after 8 s is
+# the proof that the app started; the fake display then gets a SIGTERM, which
+# the app treats as quit (and would finalize a recording).
+XVFB_RUN=$(command -v xvfb-run || echo /usr/sbin/xvfb-run)
+if [ -x "$XVFB_RUN" ]; then
+    start=$(date +%s)
+    rc=0
+    "$XVFB_RUN" -a timeout -s TERM 8 flatpak run "$APP" >"$OUT/gui.log" 2>&1 || rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" -eq 124 ] && [ "$elapsed" -ge 7 ] && ! grep -q 'panicked' "$OUT/gui.log"; then
+        ok "the app runs with no subcommand and keeps its window for 8 s"
     else
-        cat "$OUT/gui.log"
-        bad "no subcommand behaviour"
+        echo "  exit $rc after ${elapsed}s"
+        tail -20 "$OUT/gui.log"
+        bad "the app starts with no subcommand"
     fi
+    head -5 "$OUT/gui.log" | sed 's/^/  /'
+else
+    skipping "the app starts with no subcommand" "no xvfb-run in the test container"
 fi
 
 echo "== settings live in the sandbox's XDG config dir"

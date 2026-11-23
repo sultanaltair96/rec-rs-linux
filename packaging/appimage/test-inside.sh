@@ -73,6 +73,28 @@ else
     ok "all plugins load"
 fi
 
+echo "== GUI: no subcommand opens the window (Xvfb, software rendering)"
+# There is no desktop here, so an Xvfb display stands in for one and the host's
+# Mesa (llvmpipe/lavapipe) renders into the window wgpu picks. The app staying
+# up for 8 s is the proof that the GUI started from the AppImage.
+XVFB_RUN=$(command -v xvfb-run || echo /usr/sbin/xvfb-run)
+if [ -x "$XVFB_RUN" ]; then
+    start=$(date +%s)
+    rc=0
+    "$XVFB_RUN" -a timeout -s TERM 8 "$APPIMAGE" >/tmp/gui.log 2>&1 || rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$rc" -eq 124 ] && [ "$elapsed" -ge 7 ] && ! grep -q 'panicked' /tmp/gui.log; then
+        ok "the app runs with no subcommand and keeps its window for 8 s"
+    else
+        echo "  exit $rc after ${elapsed}s"
+        tail -20 /tmp/gui.log
+        bad "the app starts with no subcommand"
+    fi
+    head -5 /tmp/gui.log | sed 's/^/  /'
+else
+    echo "SKIP  the app starts with no subcommand (no xvfb-run)"
+fi
+
 echo "== the bundled plugin set"
 cd /tmp
 rm -rf squashfs-root

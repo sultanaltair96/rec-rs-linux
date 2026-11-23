@@ -47,10 +47,10 @@ for image in $IMAGES; do
     echo "================ $image"
     case "$image" in
         fedora:*)
-            setup='dnf -y -q install util-linux pipewire-libs >/dev/null 2>&1'
+            setup='dnf -y -q install util-linux pipewire-libs xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers libglvnd-egl libglvnd-glx >/dev/null 2>&1'
             ;;
         debian:*)
-            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd >/dev/null'
+            setup='apt-get update -qq && apt-get install -y -qq --no-install-recommends libpipewire-0.3-0 util-linux passwd xvfb xauth libgl1-mesa-dri mesa-vulkan-drivers libglx-mesa0 libegl1 >/dev/null'
             ;;
         *)
             setup='true'

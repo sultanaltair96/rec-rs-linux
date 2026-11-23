@@ -58,7 +58,7 @@ exec docker run --rm --init -i --name "$NAME" \
     -v "$VOLUME:/var/lib/flatpak" \
     -w "$REPO" \
     "$IMAGE" \
-    sh -c "set -e; dnf -y -q install flatpak util-linux >/dev/null 2>&1; \
+    sh -c "set -e; dnf -y -q install flatpak util-linux xorg-x11-server-Xvfb mesa-dri-drivers mesa-vulkan-drivers >/dev/null 2>&1; \
            useradd -m tester; \
            su - tester -c 'mkdir -p ~/.config ~/Videos && \
                printf \"XDG_VIDEOS_DIR=\\\"\$HOME/Videos\\\"\\n\" > ~/.config/user-dirs.dirs'; \
