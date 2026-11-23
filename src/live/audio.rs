@@ -13,13 +13,13 @@
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app as gstreamer_app;
+use gstreamer_app;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 
-pub use crate::media_types::AudioCodec;
 use crate::media_types::AudioChunk;
+pub use crate::media_types::AudioCodec;
 
 /// Sample rate of the live encode, like upstream's `RATE`.
 pub const RATE: u32 = 48_000;
@@ -37,6 +37,9 @@ pub const AAC_ASC: [u8; 2] = [0x11, 0x90];
 pub struct AudioPacket {
     pub codec: AudioCodec,
     pub pts: f64,
+    /// Frames in the packet (the codec's fixed geometry: 1024 for AAC, 960 for
+    /// a 20 ms Opus packet).
+    #[allow(dead_code)]
     pub frames: u32,
     pub data: Arc<[u8]>,
     /// The encoder's codec configuration (AAC AudioSpecificConfig), empty for
@@ -115,13 +118,15 @@ pub struct AudioEncoder {
     pipeline: gst::Pipeline,
     bus: gst::Bus,
     appsrc: gstreamer_app::AppSrc,
+    /// The codec this encoder produces (the packet geometry the tests assert
+    /// on; each output subscribes to one of them).
+    #[allow(dead_code)]
     pub codec: AudioCodec,
     /// The element that was picked, for logs.
     pub encoder: String,
     /// Input samples pushed since `base`, in frames: packets are counted from
     /// it, so a gap in the timeline does not shift the ones that follow.
     frames: u64,
-    cookie: Vec<u8>,
     dropped: u64,
 }
 
@@ -213,7 +218,6 @@ impl AudioEncoder {
                 gstreamer_app::AppSinkCallbacks::builder()
                     .new_sample({
                         let on_packet = on_packet.clone();
-                        let codec = codec;
                         let priming = if codec == AudioCodec::Aac {
                             primitive_samples(&encoder_name) as f64 / RATE as f64
                         } else {
@@ -231,12 +235,8 @@ impl AudioEncoder {
                     .build(),
             )
             .build();
-        let mut elements: Vec<gst::Element> = vec![
-            appsrc.clone().upcast(),
-            convert,
-            resample,
-            encoder,
-        ];
+        let mut elements: Vec<gst::Element> =
+            vec![appsrc.clone().upcast(), convert, resample, encoder];
         // aacparse normalises the framing (raw, one packet per buffer) and puts
         // the AudioSpecificConfig on the caps.
         if let (AudioCodec::Aac, Some(parse)) = (codec, parse) {
@@ -258,18 +258,8 @@ impl AudioEncoder {
             codec,
             encoder: encoder_name,
             frames: 0,
-            cookie: if codec == AudioCodec::Aac {
-                AAC_ASC.to_vec()
-            } else {
-                Vec::new()
-            },
             dropped: 0,
         })
-    }
-
-    /// The current codec configuration (AAC AudioSpecificConfig).
-    pub fn cookie(&self) -> &[u8] {
-        &self.cookie
     }
 
     pub fn dropped(&self) -> u64 {
@@ -314,17 +304,16 @@ impl AudioEncoder {
         self.push(t, &chunk)
     }
 
-    /// The number of input frames pushed so far.
-    pub fn frames_pushed(&self) -> u64 {
-        self.frames
-    }
-
     /// Take the first pipeline error, if one arrived.
     pub fn error(&self) -> Option<String> {
         while let Some(msg) = self.bus.pop() {
             use gst::MessageView;
             if let MessageView::Error(err) = msg.view() {
-                return Some(format!("live audio encoder ({}): {}", self.encoder, err.error()));
+                return Some(format!(
+                    "live audio encoder ({}): {}",
+                    self.encoder,
+                    err.error()
+                ));
             }
         }
         None
@@ -417,10 +406,7 @@ impl AacDecoder {
             .field("framed", true)
             .field("rate", RATE as i32)
             .field("channels", 2i32)
-            .field(
-                "codec_data",
-                gst::Buffer::from_slice(cookie.to_vec()),
-            )
+            .field("codec_data", gst::Buffer::from_slice(cookie.to_vec()))
             .build();
         let appsrc = gstreamer_app::AppSrc::builder()
             .name("replay-aac")
@@ -496,7 +482,9 @@ impl AacDecoder {
     /// by [`decode_all`](AacDecoder::decode_all)).
     pub fn push(&mut self, t: f64, data: &[u8]) -> Result<()> {
         let mut buf = gst::Buffer::from_slice(data.to_vec());
-        buf.get_mut().unwrap().set_pts(crate::live::video::host_time(t));
+        buf.get_mut()
+            .unwrap()
+            .set_pts(crate::live::video::host_time(t));
         self.appsrc
             .push_buffer(buf)
             .map_err(|_| anyhow!("the AAC decoder refused a packet"))?;
@@ -512,7 +500,9 @@ impl AacDecoder {
         let mut out = vec![];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if let Some(sample) = self.appsink.try_pull_sample(gst::ClockTime::from_mseconds(500))
+            if let Some(sample) = self
+                .appsink
+                .try_pull_sample(gst::ClockTime::from_mseconds(500))
             {
                 push_decoded(&mut out, &sample);
                 continue;
@@ -561,25 +551,6 @@ impl Drop for AacDecoder {
     }
 }
 
-/// An ADTS header (7 bytes, no CRC) for a raw AAC-LC frame: 48 kHz, stereo.
-/// RTMP carries raw frames and the replay writer decodes ADTS, so this is the
-/// bridge between the two.
-pub fn adts_header(frame_len: usize) -> [u8; 7] {
-    let profile = 1u8; // AAC-LC (object type 2, ADTS profile is 2-1)
-    let freq_index = 3u8; // 48 kHz
-    let channels = 2u8;
-    let len = (frame_len + 7) as u16;
-    [
-        0xFF,
-        0xF1, // MPEG-4, no CRC
-        (profile << 6) | (freq_index << 2) | (channels >> 2),
-        ((channels & 0x3) << 6) | ((len >> 11) & 0x3) as u8,
-        (len >> 3) as u8,
-        (((len & 0x7) as u8) << 5) | 0x1F,
-        0xFC,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,12 +578,9 @@ mod tests {
         let _ = t0;
         let got: Arc<Mutex<Vec<AudioPacket>>> = Arc::default();
         let g = got.clone();
-        let mut enc = AudioEncoder::new(
-            codec,
-            bitrate,
-            Arc::new(move |p| g.lock().unwrap().push(p)),
-        )
-        .unwrap();
+        let mut enc =
+            AudioEncoder::new(codec, bitrate, Arc::new(move |p| g.lock().unwrap().push(p)))
+                .unwrap();
         for (t, n) in chunks {
             let samples: Vec<f32> = tone(*n).into_iter().flatten().collect();
             let chunk = AudioChunk::stereo(*t, RATE, samples);
@@ -643,13 +611,21 @@ mod tests {
     #[test]
     fn aac_packets_with_timestamps() {
         init();
-        let pk = collect(AudioCodec::Aac, 160_000, 100.0, &[(100.0, 48_000), (101.0, 48_000)]);
+        let pk = collect(
+            AudioCodec::Aac,
+            160_000,
+            100.0,
+            &[(100.0, 48_000), (101.0, 48_000)],
+        );
         assert!(pk.len() >= 90, "about 93 packets for 2 s, got {}", pk.len());
         assert!(
             pk.iter().all(|p| !p.data.is_empty() && p.data.len() < 2048),
             "raw AAC frames"
         );
-        assert!(!pk[0].cookie.is_empty(), "AudioSpecificConfig from the caps");
+        assert!(
+            !pk[0].cookie.is_empty(),
+            "AudioSpecificConfig from the caps"
+        );
         // Consecutive packets are 1024 frames apart.
         let d = pk[10].pts - pk[9].pts;
         assert!((d - 1024.0 / 48000.0).abs() < 1e-6, "delta {d}");
@@ -738,29 +714,23 @@ mod tests {
             }
             index += buf.samples.len();
         }
-        assert_eq!(onsets.len(), clicks.len(), "both clicks decoded: {onsets:?}");
+        assert_eq!(
+            onsets.len(),
+            clicks.len(),
+            "both clicks decoded: {onsets:?}"
+        );
         let delay = onsets[0] as i64 - clicks[0] as i64;
         let second = onsets[1] as i64 - clicks[1] as i64;
-        assert_eq!(delay, second, "a constant delay, no drift: {delay} vs {second}");
+        assert_eq!(
+            delay, second,
+            "a constant delay, no drift: {delay} vs {second}"
+        );
         // The delay is the AAC priming (a few 1024-sample frames); a clip's
         // writer removes it.
         assert!(
             (0..4 * 1024).contains(&delay),
             "the round-trip delay is the codec's priming: {delay} samples"
         );
-    }
-
-    #[test]
-    fn adts_headers_frame_the_payload() {
-        let h = adts_header(300);
-        assert_eq!(h[0], 0xFF);
-        assert_eq!(h[1] & 0xF0, 0xF0, "sync word");
-        assert_eq!((h[1] >> 3) & 1, 0, "no CRC");
-        assert_eq!(h[2] >> 6, 1, "AAC-LC profile");
-        assert_eq!((h[2] >> 2) & 0xf, 3, "48 kHz");
-        let len = (((h[3] & 0x3) as usize) << 11) | ((h[4] as usize) << 3) | ((h[5] as usize) >> 5);
-        assert_eq!(len, 307, "header + payload length");
-        assert_eq!(((h[2] & 0x1) << 2) | (h[3] >> 6), 2, "stereo");
     }
 
     #[test]

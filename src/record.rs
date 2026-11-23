@@ -626,8 +626,7 @@ pub fn run(o: Options) -> Result<Stats> {
                         .parent()
                         .map(PathBuf::from)
                         .unwrap_or_else(crate::util::videos_dir);
-                    match l.save_replay_async(dir.join(crate::util::timestamped("replay", "mp4")))
-                    {
+                    match l.save_replay_async(dir.join(crate::util::timestamped("replay", "mp4"))) {
                         Ok(h) => saves.push(h),
                         Err(e) => eprint!("\r\x1b[2Krec: replay: {e:#}\n"),
                     }

@@ -100,7 +100,12 @@ impl WhipOutput {
             Condvar::new(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
-        let (sh, st, url, key) = (shared.clone(), stop.clone(), url.to_string(), key.to_string());
+        let (sh, st, url, key) = (
+            shared.clone(),
+            stop.clone(),
+            url.to_string(),
+            key.to_string(),
+        );
         let thread = std::thread::Builder::new()
             .name("whip".into())
             .spawn(move || run(url, key, sh, st))?;
@@ -110,11 +115,6 @@ impl WhipOutput {
             stop,
             thread: Some(thread),
         })
-    }
-
-    /// The WHIP host this output publishes to.
-    pub fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -136,7 +136,11 @@ impl Output for WhipOutput {
                     s.skip_to_key = false;
                 }
                 // Congestion: drop queued video and restart from a keyframe.
-                if !p.keyframe && s.queue.front().is_some_and(|m| p.pts - m.pts() > MAX_QUEUE_SECS) {
+                if !p.keyframe
+                    && s.queue
+                        .front()
+                        .is_some_and(|m| p.pts - m.pts() > MAX_QUEUE_SECS)
+                {
                     let before = s.queue.len();
                     s.queue.retain(|m| matches!(m, Media::Audio { .. }));
                     s.dropped += (before - s.queue.len()) as u64 + 1;
@@ -149,7 +153,9 @@ impl Output for WhipOutput {
                     // Not negotiated: the encoder is switching to H.264.
                     return;
                 }
-                if p.keyframe && matches!(p.kind, PacketKind::Video(c) if (c == crate::media_types::VideoCodec::Hevc) == f.hevc) {
+                if p.keyframe
+                    && matches!(p.kind, PacketKind::Video(c) if (c == crate::media_types::VideoCodec::Hevc) == f.hevc)
+                {
                     for ps in &f.param_sets {
                         annexb.extend_from_slice(&[0, 0, 0, 1]);
                         annexb.extend_from_slice(ps);
@@ -389,7 +395,8 @@ impl Session {
         let (offer, pending) = change.apply().ok_or_else(|| anyhow!("no SDP offer"))?;
         let offer: SdpOffer = offer;
         let (answer, resource) = post_offer(url, key, &offer.to_sdp_string())?;
-        let answer = SdpAnswer::from_sdp_string(&answer).map_err(|e| anyhow!("WHIP answer: {e}"))?;
+        let answer =
+            SdpAnswer::from_sdp_string(&answer).map_err(|e| anyhow!("WHIP answer: {e}"))?;
         rtc.sdp_api()
             .accept_answer(pending, answer)
             .map_err(|e| anyhow!("WHIP answer: {e}"))?;
@@ -475,7 +482,10 @@ fn pick_pt(rtc: &mut Rtc, mid: Mid, codec: Codec) -> Result<Pt> {
     let w = rtc
         .writer(mid)
         .ok_or_else(|| anyhow!("WHIP server rejected the {codec:?} track"))?;
-    let mut params: Vec<_> = w.payload_params().filter(|p| p.spec().codec == codec).collect();
+    let mut params: Vec<_> = w
+        .payload_params()
+        .filter(|p| p.spec().codec == codec)
+        .collect();
     params.sort_by_key(|p| p.spec().format.packetization_mode != Some(1));
     params
         .first()
@@ -600,7 +610,8 @@ fn take_due(
         },
     };
     loop {
-        let Some(i) = (0..q.len().min(64)).min_by(|&x, &y| q[x].pts().total_cmp(&q[y].pts())) else {
+        let Some(i) = (0..q.len().min(64)).min_by(|&x, &y| q[x].pts().total_cmp(&q[y].pts()))
+        else {
             return (None, None);
         };
         let pts = q[i].pts();
@@ -706,7 +717,11 @@ fn stream(
                         str0m::media::Frequency::NINETY_KHZ,
                     );
                     sess.written += annexb.len() as u64;
-                    let pt = if hevc { sess.video.2 } else { Some(sess.video.1) };
+                    let pt = if hevc {
+                        sess.video.2
+                    } else {
+                        Some(sess.video.1)
+                    };
                     if let (Some(pt), Some(w)) = (pt, sess.rtc.writer(sess.video.0)) {
                         w.write(pt, wallclock, rtp, annexb)?;
                     }
@@ -764,7 +779,10 @@ mod tests {
         assert_eq!((u.host.as_str(), u.port), ("::1", 8889));
         assert!(parse_http_url("rtmp://x/y").is_err());
         assert_eq!(
-            resource_url(&parse_http_url("http://h:1/live/whip").unwrap(), "/live/whip/abc"),
+            resource_url(
+                &parse_http_url("http://h:1/live/whip").unwrap(),
+                "/live/whip/abc"
+            ),
             "http://h:1/live/whip/abc"
         );
         assert_eq!(
@@ -850,7 +868,9 @@ mod tests {
             item.is_none() && anchor.is_some(),
             "anchored, first frame due after the margin"
         );
-        let (m, _, rtp) = take_due(&mut q, &mut anchor, due.unwrap()).0.expect("starts");
+        let (m, _, rtp) = take_due(&mut q, &mut anchor, due.unwrap())
+            .0
+            .expect("starts");
         assert!(matches!(m, Media::Video { .. }) && (rtp - 5.0).abs() < 1e-9);
     }
 }

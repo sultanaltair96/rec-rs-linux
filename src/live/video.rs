@@ -24,7 +24,7 @@
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app as gstreamer_app;
+use gstreamer_app;
 use gstreamer_video as gst_video;
 use std::sync::Arc;
 
@@ -149,9 +149,7 @@ pub(crate) fn make_encoder(cfg: &VideoConfig) -> Result<gst::Element> {
         } else {
             cfg.bitrate.max(1000)
         };
-        for prop in ["bitrate"] {
-            set(&el, prop, bitrate);
-        }
+        set(&el, "bitrate", bitrate);
         for prop in ["key-int-max", "gop-size", "keyframe-period"] {
             if el.find_property(prop).is_some() {
                 let frames = (cfg.keyframe_secs * cfg.fps as f64).round().max(1.0) as u64;
@@ -188,10 +186,7 @@ pub(crate) fn make_encoder(cfg: &VideoConfig) -> Result<gst::Element> {
                 set(
                     &el,
                     "option-string",
-                    format!(
-                        "vbv-maxrate={kbps}:vbv-bufsize={}",
-                        (kbps / 2).max(1)
-                    ),
+                    format!("vbv-maxrate={kbps}:vbv-bufsize={}", (kbps / 2).max(1)),
                 );
             }
             "openh264enc" => {
@@ -244,10 +239,7 @@ pub(crate) fn frame_buffer(frame: &VideoFrame, caps: &gst::Caps) -> Option<gst::
             if i >= info.offset().len() || plane.stride == 0 {
                 break;
             }
-            let rows = frame
-                .format
-                .plane_rows(i, frame.height)
-                .min(plane.rows());
+            let rows = frame.format.plane_rows(i, frame.height).min(plane.rows());
             let row_bytes = frame.format.min_stride(i, frame.width);
             let dst_offset = info.offset()[i];
             let dst_stride = info.stride()[i].max(row_bytes as i32) as usize;
@@ -607,7 +599,10 @@ impl VideoEncoder {
                 .field("format", input_format(frame.format))
                 .field("width", frame.width as i32)
                 .field("height", frame.height as i32)
-                .field("framerate", gst::Fraction::new(self.cfg.fps.max(1) as i32, 1))
+                .field(
+                    "framerate",
+                    gst::Fraction::new(self.cfg.fps.max(1) as i32, 1),
+                )
                 .build();
             self.appsrc.set_caps(Some(&caps));
             let bytes = frame.byte_len().max(1) as u64;
@@ -664,7 +659,6 @@ impl VideoEncoder {
         }
         None
     }
-
 }
 
 impl Drop for VideoEncoder {
@@ -674,12 +668,7 @@ impl Drop for VideoEncoder {
 }
 
 /// Turn one appsink sample into a [`VideoPacket`] for the hub.
-fn on_sample(
-    sample: &gst::Sample,
-    hevc: bool,
-    shift: &PtsShift,
-    on_packet: &OnPacket,
-) {
+fn on_sample(sample: &gst::Sample, hevc: bool, shift: &PtsShift, on_packet: &OnPacket) {
     let Some(buffer) = sample.buffer() else {
         return;
     };
@@ -761,7 +750,10 @@ mod tests {
         init();
         for hevc in [false, true] {
             if !has_encoder(hevc) {
-                eprintln!("skipping: no live {} encoder installed", if hevc { "HEVC" } else { "H.264" });
+                eprintln!(
+                    "skipping: no live {} encoder installed",
+                    if hevc { "HEVC" } else { "H.264" }
+                );
                 continue;
             }
             let got: Arc<Mutex<Vec<VideoPacket>>> = Arc::default();
@@ -775,11 +767,8 @@ mod tests {
                 cbr: true,
                 hevc,
             };
-            let mut enc = VideoEncoder::new(
-                cfg,
-                Arc::new(move |p| g.lock().unwrap().push(p)),
-            )
-            .unwrap();
+            let mut enc =
+                VideoEncoder::new(cfg, Arc::new(move |p| g.lock().unwrap().push(p))).unwrap();
             let frame = i420_frame(10.0, 640, 360, 0x40);
             for i in 0..5 {
                 assert!(enc.encode(&frame, 10.0 + i as f64 / 30.0));
@@ -825,9 +814,7 @@ mod tests {
         };
         let mut enc = VideoEncoder::new(
             cfg,
-            Arc::new(move |p| {
-                g.lock().unwrap().push((p.pts, p.key, p.data.len()))
-            }),
+            Arc::new(move |p| g.lock().unwrap().push((p.pts, p.key, p.data.len()))),
         )
         .unwrap();
         // Source frames are 1280x720: the pipeline scales them.
@@ -849,7 +836,10 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(keys.first(), Some(&0), "starts with a keyframe");
-        assert!(keys.len() >= 3, "a keyframe at least every second: {keys:?}");
+        assert!(
+            keys.len() >= 3,
+            "a keyframe at least every second: {keys:?}"
+        );
         let first = got[0].0;
         assert!(
             (first - 1000.0).abs() < 0.05,
@@ -905,7 +895,9 @@ mod tests {
         let fps: u32 = std::env::var("REC_ENC_FPS").map_or(60, |v| v.parse().unwrap());
         let (w, h) = (3840usize, 2160usize);
         let mut ff = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-i", &src, "-f", "rawvideo", "-pix_fmt", "bgra", "-"])
+            .args([
+                "-v", "error", "-i", &src, "-f", "rawvideo", "-pix_fmt", "bgra", "-",
+            ])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
@@ -924,11 +916,9 @@ mod tests {
         let mut enc = VideoEncoder::new(
             cfg,
             Arc::new(move |p| {
-                p2.lock().unwrap().push((
-                    p.key,
-                    avcc_to_annexb(&p.data),
-                    p.param_sets.clone(),
-                ));
+                p2.lock()
+                    .unwrap()
+                    .push((p.key, avcc_to_annexb(&p.data), p.param_sets.clone()));
             }),
         )
         .unwrap();
@@ -946,6 +936,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         drop(enc);
+        let _ = ff.wait();
         let mut f = std::fs::File::create(&out).unwrap();
         for (key, data, sets) in packets.lock().unwrap().iter() {
             if *key {

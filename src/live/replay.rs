@@ -15,14 +15,14 @@
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app as gstreamer_app;
+use gstreamer_app;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::audio::{self, AacDecoder, AAC_FRAME};
 use super::Formats;
+use super::audio::{self, AAC_FRAME, AacDecoder};
 use crate::media_types::EncodedPacket;
 
 /// What the ring needs to know about a packet.
@@ -77,7 +77,11 @@ impl<V: Timed + Clone, A: Timed + Clone> Ring<V, A> {
     pub fn push_audio(&mut self, a: A) {
         // Keep a little audio before the first keyframe: the saved clip feeds
         // it to the decoder as warm-up before the clip's first sample.
-        if self.video.front().is_none_or(|v| a.pts() < v.pts() - AUDIO_LEAD) {
+        if self
+            .video
+            .front()
+            .is_none_or(|v| a.pts() < v.pts() - AUDIO_LEAD)
+        {
             return;
         }
         self.bytes += a.size();
@@ -122,11 +126,6 @@ impl<V: Timed + Clone, A: Timed + Clone> Ring<V, A> {
             (Some(a), Some(b)) => b.pts() - a.pts(),
             _ => 0.0,
         }
-    }
-
-    /// Packets held, for diagnostics.
-    pub fn len(&self) -> (usize, usize) {
-        (self.video.len(), self.audio.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -192,11 +191,7 @@ pub fn write_mp4(
     }
     // The clip is as long as its video: audio that arrives after the last
     // frame (the tap can be a little ahead) is cut, as upstream does.
-    let last_v = video_packets
-        .iter()
-        .map(|p| p.pts)
-        .fold(t0, f64::max)
-        - t0;
+    let last_v = video_packets.iter().map(|p| p.pts).fold(t0, f64::max) - t0;
     let pcm = decode_audio(audio_packets, formats, t0, last_v + 0.05)?;
     mux_mp4(&abs, video_packets, t0, &pcm, formats)
         .with_context(|| format!("writing the replay to {}", abs.display()))?;
@@ -221,6 +216,14 @@ fn decode_audio(
         dec.push(p.pts, &p.data)?;
     }
     let decoded = dec.decode_all()?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "rec: debug: replay audio: {} packets, decoder {} (offset {} samples)",
+            packets.len(),
+            dec.decoder,
+            dec.offset
+        );
+    }
     // Never longer than the picture: the last PCM the muxer gets ends with it.
     let limit = (max_secs.max(0.0) * rate).round() as usize;
     let mut out: Vec<[f32; 2]> = Vec::with_capacity(limit.min(1 << 20));
@@ -255,7 +258,10 @@ fn mux_mp4(
     let video_caps = gst::Caps::builder(if hevc { "video/x-h265" } else { "video/x-h264" })
         .field("stream-format", if hevc { "hvc1" } else { "avc" })
         .field("alignment", "au")
-        .field("codec_data", gst::Buffer::from_slice(formats.record.clone()))
+        .field(
+            "codec_data",
+            gst::Buffer::from_slice(formats.record.clone()),
+        )
         .build();
     let vsrc = gstreamer_app::AppSrc::builder()
         .name("replay-video")
@@ -311,8 +317,7 @@ fn mux_mp4(
         // Measured on the written clip with `scripts/synccheck.py` (10 s of the
         // test pattern, 720p30): priming alone +27.0 ms, priming + 1 frame
         // +5.7 ms, +2 frames -15.6 ms.
-        let drop_frames =
-            audio::primitive_samples(enc.name().as_str()) / AAC_FRAME as u64 + 1;
+        let drop_frames = audio::primitive_samples(enc.name().as_str()) / AAC_FRAME as u64 + 1;
         let aparse = gst::ElementFactory::make("aacparse").build()?;
         let q = gst::ElementFactory::make("queue").build()?;
         priming = Some((aparse.clone(), drop_frames));
@@ -504,7 +509,6 @@ mod tests {
         // Memory stays bounded (about 11 s held, not 60).
         assert!(r.held() < 11.1);
         assert!(r.bytes() < 12 * (30 * 1000 + 47 * 100));
-        assert_eq!(r.len().0, v.len() + (r.len().0 - v.len()));
     }
 
     #[test]
@@ -538,8 +542,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let err = write_mp4(&dir.join("x.mp4"), &[], &[], &Formats::default()).unwrap_err();
         assert_eq!(err.to_string(), "the replay buffer is empty");
-        let err = write_mp4(&dir.join("x.mp4"), &[packet(0.0, true)], &[], &Formats::default())
-            .unwrap_err();
+        let err = write_mp4(
+            &dir.join("x.mp4"),
+            &[packet(0.0, true)],
+            &[],
+            &Formats::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no video configuration"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

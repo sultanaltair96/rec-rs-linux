@@ -44,10 +44,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
-use crate::media_types::{AudioChunk, AudioCodec, EncodedPacket, PacketKind, VideoCodec, VideoFrame};
-
-/// The phase that implements the outputs.
-pub const PHASE: &str = "1D";
+use crate::media_types::{
+    AudioChunk, AudioCodec, EncodedPacket, PacketKind, VideoCodec, VideoFrame,
+};
 
 /// The services with a built-in ingest URL, in the order the app lists them.
 pub const SERVICES: [(&str, &str, &str); 3] = [
@@ -406,7 +405,9 @@ impl Live {
         self.update_active();
     }
 
-    /// The replay window, if one was set.
+    /// The replay window, if one was set (the app shows it and its settings
+    /// start from it).
+    #[allow(dead_code)]
     pub fn replay_secs(&self) -> Option<f64> {
         self.shared
             .hub
@@ -549,10 +550,9 @@ impl Live {
                     for (id, _) in added {
                         self.remove_output(id);
                     }
-                    return Err(e.context(format!(
-                        "Could not go live on {}",
-                        destination_name(url)
-                    )));
+                    return Err(
+                        e.context(format!("Could not go live on {}", destination_name(url)))
+                    );
                 }
             }
         }
@@ -669,21 +669,27 @@ struct Encoders {
     generation: u64,
 }
 
+/// What a fresh set of encoders is built for.
+struct EncoderSpec<'a> {
+    cfg: &'a LiveConfig,
+    hevc: bool,
+    wants_opus: bool,
+    size: (usize, usize),
+    fps: u32,
+    generation: u64,
+}
+
 impl Encoders {
-    fn new(
-        cfg: &LiveConfig,
-        hevc: bool,
-        owns_session: bool,
-        wants_opus: bool,
-        size: (usize, usize),
-        fps: u32,
-        generation: u64,
-        hub: &Arc<Mutex<Hub>>,
-        stats: &Arc<Stats>,
-    ) -> Result<Encoders> {
-        let _ = owns_session;
-        let (video_hub, audio_hub, opus_hub) =
-            (hub.clone(), hub.clone(), hub.clone());
+    fn new(spec: EncoderSpec<'_>, hub: &Arc<Mutex<Hub>>, stats: &Arc<Stats>) -> Result<Encoders> {
+        let EncoderSpec {
+            cfg,
+            hevc,
+            wants_opus,
+            size,
+            fps,
+            generation,
+        } = spec;
+        let (video_hub, audio_hub, opus_hub) = (hub.clone(), hub.clone(), hub.clone());
         let video_stats = stats.clone();
         let aac_stats = stats.clone();
         let opus_stats = stats.clone();
@@ -724,15 +730,11 @@ impl Encoders {
                 hub.dispatch(packet);
             }),
         )?;
-        let aac = audio::AudioEncoder::new(
-            AudioCodec::Aac,
-            cfg.audio_bitrate,
-            {
-                let hub = audio_hub.clone();
-                let stats = aac_stats.clone();
-                Arc::new(move |p| dispatch_audio(&hub, &stats, p, false))
-            },
-        )?;
+        let aac = audio::AudioEncoder::new(AudioCodec::Aac, cfg.audio_bitrate, {
+            let hub = audio_hub.clone();
+            let stats = aac_stats.clone();
+            Arc::new(move |p| dispatch_audio(&hub, &stats, p, false))
+        })?;
         let opus = if wants_opus {
             Some(audio::AudioEncoder::new(
                 AudioCodec::Opus,
@@ -796,9 +798,7 @@ impl Encoders {
     }
 
     fn dropped(&self) -> u64 {
-        self.video.dropped()
-            + self.aac.dropped()
-            + self.opus.as_ref().map_or(0, |o| o.dropped())
+        self.video.dropped() + self.aac.dropped() + self.opus.as_ref().map_or(0, |o| o.dropped())
     }
 }
 
@@ -926,9 +926,7 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         }
         if hevc && !video::main10_capable() && !notes.contains(&"main10") {
             notes.push("main10");
-            eprintln!(
-                "rec: live encode: HEVC Main (an 8-bit encoder; Main10 needs a 10-bit one)"
-            );
+            eprintln!("rec: live encode: HEVC Main (an 8-bit encoder; Main10 needs a 10-bit one)");
         }
 
         // The first frame of a run fixes the encode size.
@@ -940,36 +938,48 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         let rebuild_video = match &enc {
             None => true,
             Some(e) => {
-                e.hevc != hevc
-                    || e.fps != fps
-                    || e.generation != generation
-                    || e.size != size
+                e.hevc != hevc || e.fps != fps || e.generation != generation || e.size != size
             }
         };
         if rebuild_video && first.is_some() && Instant::now() >= retry_after {
             match Encoders::new(
-                &cfg,
-                hevc,
-                true,
-                wants_opus,
-                size,
-                fps,
-                generation,
+                EncoderSpec {
+                    cfg: &cfg,
+                    hevc,
+                    wants_opus,
+                    size,
+                    fps,
+                    generation,
+                },
                 &shared.hub,
                 &shared.stats,
             ) {
                 Ok(mut fresh) => {
                     // Keep the mix's position: the new encoder starts at the
                     // current audio time, with a keyframe.
-                    let was = enc.take();
                     fresh.video.force_keyframe();
-                    if let Some(old) = &was {
-                        let _ = old;
-                    }
                     enc = Some(fresh);
-                    // A clip holds one set of parameter sets.
-                    shared.hub.lock().unwrap().replay.as_mut().map(|r| r.clear());
-                    shared.hub.lock().unwrap().formats = Formats::default();
+                    // A clip holds one set of parameter sets, and the outputs
+                    // need the new stream's configuration.
+                    {
+                        let mut hub = shared.hub.lock().unwrap();
+                        hub.formats = Formats::default();
+                        if let Some(r) = hub.replay.as_mut() {
+                            r.clear();
+                        }
+                    }
+                    if std::env::var_os("REC_DEBUG").is_some()
+                        && let Some(e) = &enc
+                    {
+                        eprintln!(
+                            "rec: debug: live encoders {} {}x{} -> {} + {}",
+                            if hevc { "HEVC" } else { "H.264" },
+                            size.0,
+                            size.1,
+                            e.video.encoder,
+                            e.aac.encoder
+                        );
+                    }
                 }
                 Err(e) => {
                     report(&shared, format!("{e:#}"));
@@ -1058,10 +1068,10 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
 
         // Packets and encoded bytes are counted by the appsink callbacks; this
         // is what the tap had to drop.
-        shared
-            .stats
-            .dropped
-            .store(e.dropped() + shared.tap.dropped().0 + shared.tap.dropped().1, Ordering::Relaxed);
+        shared.stats.dropped.store(
+            e.dropped() + shared.tap.dropped().0 + shared.tap.dropped().1,
+            Ordering::Relaxed,
+        );
         for error in e.errors() {
             report(&shared, error);
         }
@@ -1206,9 +1216,13 @@ pub fn resolve_destination(dest: &str) -> Result<(String, String)> {
     match key {
         Some(k) => Ok((url, k)),
         None if url.starts_with("http") => Ok((url, String::new())),
-        None => bail!(
-            "no stream key for {url}: run `rec-rs stream-key {dest}` or set REC_STREAM_KEY"
+        None if !keyring::available() => bail!(
+            "no stream key for {url}: no Secret Service is running (start gnome-keyring-daemon), \
+             so run `rec-rs stream-key {dest}` in a session that has one, or set REC_STREAM_KEY"
         ),
+        None => {
+            bail!("no stream key for {url}: run `rec-rs stream-key {dest}` or set REC_STREAM_KEY")
+        }
     }
 }
 
@@ -1410,10 +1424,7 @@ mod tests {
 
     impl Output for Collect {
         fn packet(&mut self, p: &EncodedPacket, _f: &Formats) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((p.kind.is_video(), p.pts));
+            self.0.lock().unwrap().push((p.kind.is_video(), p.pts));
         }
         fn status(&self) -> OutputStatus {
             OutputStatus::default()
@@ -1457,7 +1468,10 @@ mod tests {
             "rtmp://c/live".to_string(),
         ];
         let e = live.add_outputs(&urls, start).unwrap_err();
-        assert_eq!(format!("{e:#}"), "Could not go live on YouTube: no stream key");
+        assert_eq!(
+            format!("{e:#}"),
+            "Could not go live on YouTube: no stream key"
+        );
         assert_eq!(
             *tried.lock().unwrap(),
             ["rtmp://a/live", "rtmps://a.rtmps.youtube.com:443/live2"]
@@ -1516,20 +1530,14 @@ mod tests {
         let mut video: Vec<f64> = got.iter().filter(|p| p.0).map(|p| p.1).collect();
         video.sort_by(f64::total_cmp);
         assert!(video.len() > 110, "{} frames", video.len());
-        let worst = video
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .fold(0.0, f64::max);
+        let worst = video.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
         // The new session's frames are on another phase of the frame grid: at
         // most one and a half frame intervals apart.
         assert!(worst <= 1.5 / 30.0 + 1e-3, "video gap {worst}");
         let mut audio: Vec<f64> = got.iter().filter(|p| !p.0).map(|p| p.1).collect();
         audio.sort_by(f64::total_cmp);
         assert!(audio.len() > 100, "{} audio packets", audio.len());
-        let worst = audio
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .fold(0.0, f64::max);
+        let worst = audio.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
         assert!(worst < 1024.0 / 48000.0 + 0.01, "audio gap {worst}");
         drop(got);
         live.stop_all();

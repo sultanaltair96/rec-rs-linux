@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::audio::{AudioCodec, AAC_ASC};
+use super::audio::{AAC_ASC, AudioCodec};
 use super::{Formats, Output, OutputStatus};
 use crate::media_types::{EncodedPacket, PacketKind};
 
@@ -293,9 +293,8 @@ impl ChunkReader {
             self.data.drain(..used);
             if let Some(m) = msg {
                 if m.typ == 1 && m.payload.len() >= 4 {
-                    self.chunk_size =
-                        (u32::from_be_bytes(m.payload[..4].try_into().unwrap()) & 0x7fff_ffff)
-                            as usize;
+                    self.chunk_size = (u32::from_be_bytes(m.payload[..4].try_into().unwrap())
+                        & 0x7fff_ffff) as usize;
                 }
                 out.push(m);
             }
@@ -644,8 +643,7 @@ impl Conn {
                 if m.typ == 20 {
                     let v = amf_all(&m.payload);
                     let name = v.first().and_then(Amf::str).unwrap_or("");
-                    if name == "_error"
-                        || (name == "onStatus" && status_level(&v) == Some("error"))
+                    if name == "_error" || (name == "onStatus" && status_level(&v) == Some("error"))
                     {
                         bail!("{what} refused: {}", status_text(&v));
                     }
@@ -688,11 +686,7 @@ impl Conn {
         let r = self.wait_command("connect", |v| {
             v.first().and_then(Amf::str) == Some("_result") && v.get(1) == Some(&Amf::Number(1.0))
         })?;
-        // A server that lists its enhanced-RTMP codecs without HEVC can't take
-        // it; one that lists none may (YouTube does).
-        self.hevc_ok = !r.iter().any(|a| {
-            matches!(a.get("fourCcList"), Some(Amf::Array(l)) if !l.iter().any(|c| matches!(c.str(), Some("hvc1" | "*"))))
-        });
+        self.hevc_ok = hevc_allowed(&r);
         self.cmd(
             0,
             &[
@@ -778,6 +772,15 @@ impl Conn {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Whether a server's `connect` result allows enhanced-RTMP HEVC: a server that
+/// lists its codecs without `hvc1` (or `*`) cannot take it; one that lists none
+/// may (YouTube does).
+pub fn hevc_allowed(connect_result: &[Amf]) -> bool {
+    !connect_result.iter().any(|a| {
+        matches!(a.get("fourCcList"), Some(Amf::Array(l)) if !l.iter().any(|c| matches!(c.str(), Some("hvc1" | "*"))))
+    })
 }
 
 fn status_obj(v: &[Amf]) -> Option<&Amf> {
@@ -880,11 +883,6 @@ impl RtmpOutput {
             t0: None,
         })
     }
-
-    /// The URL host this output publishes to.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
 }
 
 fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc<AtomicBool>) {
@@ -942,9 +940,7 @@ fn run(u: RtmpUrl, key: String, shared: Arc<(Mutex<Shared>, Condvar)>, stop: Arc
                         s.width_height,
                     )
                 };
-                if !headers_sent
-                    && let Some((hevc, record)) = &formats
-                {
+                if !headers_sent && let Some((hevc, record)) = &formats {
                     let meta = command(&[
                         Amf::Str("@setDataFrame".into()),
                         Amf::Str("onMetaData".into()),
@@ -1204,8 +1200,36 @@ mod tests {
             msgs.extend(r.feed(part));
         }
         assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[1], Message { typ: 9, sid: 1, payload });
+        assert_eq!(
+            msgs[1],
+            Message {
+                typ: 9,
+                sid: 1,
+                payload
+            }
+        );
         assert_eq!(msgs[2].payload, b"ext");
+    }
+
+    /// Enhanced RTMP is negotiable per server: a codec list without `hvc1`
+    /// refuses HEVC, one that lists nothing may take it.
+    #[test]
+    fn hevc_negotiation() {
+        let with_hvc1 = obj(&[(
+            "fourCcList",
+            Amf::Array(vec![Amf::Str("hvc1".into()), Amf::Str("avc1".into())]),
+        )]);
+        assert!(hevc_allowed(&[
+            Amf::Str("_result".into()),
+            Amf::Number(1.0),
+            with_hvc1
+        ]));
+        let wildcard = obj(&[("fourCcList", Amf::Array(vec![Amf::Str("*".into())]))]);
+        assert!(hevc_allowed(&[wildcard]));
+        let h264_only = obj(&[("fourCcList", Amf::Array(vec![Amf::Str("avc1".into())]))]);
+        assert!(!hevc_allowed(&[h264_only]));
+        let quiet = obj(&[("fpad", Amf::Bool(false))]);
+        assert!(hevc_allowed(&[Amf::Str("_result".into()), quiet]));
     }
 
     #[test]

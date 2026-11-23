@@ -73,7 +73,9 @@ impl Store for SecretService {
         })?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(anyhow!("the Secret Service refused to delete the key ({e})")),
+            Err(e) => Err(anyhow!(
+                "the Secret Service refused to delete the key ({e})"
+            )),
         }
     }
 }
@@ -81,6 +83,7 @@ impl Store for SecretService {
 /// In-memory backend: the adapter's tests, and nothing else (a key in memory is
 /// still not a key on disk).
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct Memory(Mutex<HashMap<String, String>>);
 
 impl Store for Memory {
@@ -92,7 +95,10 @@ impl Store for Memory {
         if key.is_empty() {
             return Err(anyhow!("the stream key is empty"));
         }
-        self.0.lock().unwrap().insert(account.to_string(), key.to_string());
+        self.0
+            .lock()
+            .unwrap()
+            .insert(account.to_string(), key.to_string());
         Ok(())
     }
 

@@ -11,16 +11,14 @@
 //! `rec-rs save-replay` works against it like against a recording.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 
-use super::{
-    shared_preset, start_output, Live, LiveConfig, OutputStatus, Platform,
-};
+use super::{Live, LiveConfig, OutputStatus, Platform, shared_preset, start_output};
 use crate::media_types::{self, AudioSink, AudioSource, FrameSink, VideoSource};
 use crate::synth::{Pattern, Synth};
 
@@ -159,7 +157,11 @@ pub fn run(a: HarnessArgs) -> Result<()> {
     let replay_dir = a
         .output_dir
         .clone()
-        .or_else(|| a.save_replay.as_ref().and_then(|p| p.parent().map(PathBuf::from)))
+        .or_else(|| {
+            a.save_replay
+                .as_ref()
+                .and_then(|p| p.parent().map(PathBuf::from))
+        })
         .unwrap_or_else(crate::util::videos_dir);
     let _ = std::fs::write(
         &pidfile,
@@ -241,7 +243,11 @@ pub fn run(a: HarnessArgs) -> Result<()> {
                     s.dropped_frames
                 );
             }
-            eprint!("\r\x1b[2K  {:02.0}s{}  ", started.elapsed().as_secs_f64(), line);
+            eprint!(
+                "\r\x1b[2K  {:02.0}s{}  ",
+                started.elapsed().as_secs_f64(),
+                line
+            );
         }
     }
     if !a.quiet {
