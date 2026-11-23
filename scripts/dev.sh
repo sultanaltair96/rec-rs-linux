@@ -102,6 +102,52 @@ for name in $(env | sed -n 's/^\(REC_[A-Za-z0-9_]*\)=.*/\1/p'); do
     eval "value=\${$name}"
     envs="$envs -e $name=$value"
 done
+# Cargo/rust tuning from the host, via `-e NAME` (Docker copies the value from
+# this process's environment, so flags with spaces survive intact). The paths
+# that must stay the container's own are excluded, and so are registry
+# credentials: never forward a token into a container.
+for name in $(env | sed -n 's/^\(CARGO_[A-Za-z0-9_]*\|RUST[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case "$name" in
+        CARGO_HOME | RUSTUP_HOME | CARGO_TARGET_DIR | CARGO_REGISTRIES_* | *_TOKEN | *_SECRET | \
+        RUSTC | RUSTDOC | RUST_SRC_PATH | *_WRAPPER)
+            # Paths that point at the host's toolchain or wrappers would not
+            # exist in the container; credentials must never enter it.
+            continue ;;
+    esac
+    envs="$envs -e $name"
+done
+
+# A plain `cargo build --release` runs one job per host CPU by default. Inside
+# the memory-capped container that many rustc processes (the wgpu/egui graph
+# alone is heavy) can exhaust the cgroup and get SIGKILLed. Unless the caller
+# set CARGO_BUILD_JOBS, default it from the container's own CPU count and
+# cgroup memory limit: min(nproc, memory / 1.5 GB), at least 1.
+bootstrap='
+if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    jobs=$(nproc 2>/dev/null || echo 1)
+    case "$jobs" in
+        "" | *[!0-9]*) jobs=1 ;;
+    esac
+    [ "$jobs" -lt 1 ] && jobs=1
+    mem=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
+    if [ -z "$mem" ] || [ "$mem" = max ]; then
+        mem=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)
+    fi
+    case "$mem" in
+        "" | max | *[!0-9]*) ;;
+        *)
+            per=$((mem / 1610612736))
+            [ "$per" -lt 1 ] && per=1
+            [ "$jobs" -gt "$per" ] && jobs=$per
+            ;;
+    esac
+    export CARGO_BUILD_JOBS="$jobs"
+fi
+if [ "$#" -eq 0 ]; then
+    exec bash
+fi
+exec "$@"
+'
 
 # A ceiling inside the container: a blocking command (gst-launch, a recorder
 # waiting for a device) then dies instead of holding the client until someone
@@ -148,5 +194,5 @@ docker run --rm --init $args \
     -e TERM="${TERM:-dumb}" \
     -e HOME=/home/dev \
     "$IMAGE" \
-    ${*:+"$@"} || status=$?
+    /bin/sh -c "$bootstrap" sh ${*:+"$@"} || status=$?
 exit "$status"
