@@ -54,7 +54,7 @@ case "${1:-}" in
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "screen-exclude no-sink"
-        echo "opt-in: long-finalize (10 min)"
+        echo "opt-in: long-finalize (10 min), mic-stress (20 runs, 8 burners)"
         echo "pattern-mic pattern-system-audio"
         echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay"
         exit 0 ;;
@@ -593,6 +593,67 @@ if wanted timeout-stop; then
         bad timeout-stop "rec-rs stop failed"
     fi
     wait "$pid" 2>/dev/null || true
+fi
+
+# G15(a): the microphone stem under CPU pressure. Eight burners, then twenty
+# 3 s recordings; every beep must be within 1 dB of the idle run and the mic
+# stem must stay aligned with the system stem within 5 ms, with no click (a
+# sample over 0.09 outside the beep windows). Opt-in: it takes a few minutes
+# and deliberately loads the host.
+if named mic-stress; then
+    D="$OUT/mic-stress"; mkdir -p "$D"
+    burners=""
+    for _ in 1 2 3 4 5 6 7 8; do yes >/dev/null & burners="$burners $!"; done
+    trap 'kill $burners 2>/dev/null || true' EXIT
+    sleep 1
+    export REC_SYNTH_MIC=1
+    "$REC" record -q --test-pattern --mic default --system-gain=-12 --mic-gain=-18 -t 3 -o "$D/ref.mov" >/dev/null 2>&1
+    n=0; fails=0
+    while [ "$n" -lt 20 ]; do
+        n=$((n+1))
+        f="$D/run$n.mov"
+        timeout "$TIMEOUT" "$REC" record -q --test-pattern --mic default --system-gain=-12 --mic-gain=-18 -t 3 -o "$f" >/dev/null 2>&1 || { fails=$((fails+1)); continue; }
+        out=$(python3 - "$D/ref.mov" "$f" <<'PY'
+import subprocess, struct, sys, math, statistics
+def track(path, idx):
+    raw = subprocess.run(["ffmpeg","-v","error","-i",path,"-map","0:a:%d"%idx,"-af","pan=mono|c0=c0","-ar","48000","-f","f32le","-"],capture_output=True).stdout
+    if len(raw) < 48000: return None
+    s = struct.unpack("<%df" % (len(raw)//4), raw); rate = 48000; on = []; last = -10**9
+    for i, v in enumerate(s):
+        if abs(v) > 0.02:
+            if i - last > rate // 5: on.append(i)
+            last = i
+    peaks = [max(abs(x) for x in s[o:o+int(0.04*rate)]) for o in on]
+    return on, peaks, s
+def info(path):
+    a = track(path, 1); b = track(path, 2)
+    if not a or not b or not a[0] or not b[0]: return None
+    ph = lambda t: statistics.median([(o/48000) % 1.0 for o in t[0]])
+    return (ph(b) - ph(a) + 0.5) % 1.0 - 0.5, statistics.median(b[1]), b[1], b[2], b[0]
+ref = info(sys.argv[1]); run = info(sys.argv[2])
+if not ref or not run: print("missing"); sys.exit()
+dms = (run[0] - ref[0]) * 1000.0
+bad = []
+if abs(dms) > 5: bad.append("stem %+.1fms" % dms)
+for p in run[2]:
+    db = 20*math.log10(p/ref[1])
+    if abs(db) > 1.0: bad.append("level %+.2fdB" % db)
+for i, v in enumerate(run[3]):
+    if abs(v) > 0.09 and not any(abs(i-o) < 2400 for o in run[4]): bad.append("click"); break
+print("; ".join(bad) if bad else "ok")
+PY
+)
+        case "$out" in ok) : ;; *) fails=$((fails+1)); echo "  run $n: $out" ;; esac
+    done
+    kill $burners 2>/dev/null || true
+    trap - EXIT
+    unset REC_SYNTH_MIC
+    if [ "$fails" = 0 ]; then
+        echo "PASS  mic-stress  (20 runs under 8 burners: every beep within 1 dB, stems within 5 ms, no clicks)"
+        pass=$((pass+1))
+    else
+        bad mic-stress "$fails/20 runs deviated"
+    fi
 fi
 
 # Ten minutes at a small size: measures the finalise with hundreds of
