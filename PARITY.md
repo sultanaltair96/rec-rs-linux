@@ -80,7 +80,7 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 | Camera device + overlay settings | Yes | V4L2 device selection + the same overlay model | 1B (device), 1C (overlay), 1E (UI) | partial | unit `overlay_settings_round_trip_through_the_cli`, `camera::v4l2::tests::device_matching`; real hardware under "Needs a real desktop" |
 | Live encode settings (size, bitrate, CBR, keyframe, audio bitrate), locked while streaming | Yes | Same model | 1D | todo | unit `settings::tests::live_encode_fits_every_enabled_destination` |
 | Settings persist in Application Support | `~/Library/Application Support/rec-rs/settings.json` | `$XDG_CONFIG_HOME/rec-rs/settings.json` | 0 | done | unit `settings::tests::settings_live_in_the_xdg_config_dir` |
-| Dock icon, app menu (Settings ⌘,, Hide ⌘H, Quit ⌘Q, Window menu) | Yes | Native window menu + `.desktop` actions | 1E/1F | todo | — |
+| Dock icon, app menu (Settings ⌘,, Hide ⌘H, Quit ⌘Q, Window menu) | Yes | Native window menu (1E) + `.desktop` actions `Start Recording` / `Settings` (1F); both packages install the same desktop file | 1E/1F | partial | `desktop-file-validate` clean; actions shipped in `packaging/desktop/io.github.sultanaltair96.Rec.desktop` and listed inside the built Flatpak (`test-flatpak.sh`) |
 | Closing the window keeps the app running and stops the preview | Yes | Tray-resident app | 1E | todo | — |
 | Quitting (Dock/menu/logout) finalizes a running recording | Yes | Same: finalize before exit | 1E | todo | — |
 | Menu bar item with red dot, elapsed time, full menu | NSStatusItem | StatusNotifierItem (`ksni`) with the same menu | 1E | todo | — |
@@ -172,8 +172,24 @@ version that does it).
 | Global hotkey | ⇧⌘R / ⇧⌘S | Portal/X11, Ctrl+Shift+R/S | 1E | todo | — |
 | Menu bar control | StatusItem | StatusNotifierItem | 1E | todo | — |
 | Headless CLI | Yes | Yes | 0 | done | this phase is CLI-first; selftest runs headless |
-| Small footprint | ~22 MB app | Rust + system GStreamer/PipeWire (Flatpak runtime) | 1F | todo | — |
+| Small footprint | ~22 MB app | Flatpak bundle 3.5 MB (GStreamer/PipeWire shared from the runtime); AppImage 98 MB (it bundles GStreamer and its ffmpeg stack) | 1F | done | `packaging/flatpak/build-flatpak.sh` and `packaging/appimage/build-appimage.sh` print the sizes |
 | Encoder input: IOSurface straight to VideoToolbox | Zero copy | dmabuf → VA-API where available, else CPU frames | 1C | todo | — |
+
+## Packaging, installation and updates (phase 1F)
+
+| Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
+|---|---|---|---|---|---|
+| Flatpak package | `.app`/`.dmg` | `io.github.sultanaltair96.Rec` on `org.gnome.Platform` 49; H.264 through the runtime's `codecs-extra` extension (`x264enc`), HEVC through an x265 4.1 + gst-plugins-bad 1.26.11 `x265enc` module built by the manifest, AAC/ProRes/Opus from the runtime; single-file `rec.flatpak` | 1F | done | `packaging/flatpak/build-flatpak.sh`; `packaging/flatpak/test-flatpak.sh` 9/9 (encoder lines `x264enc`, `x265enc`, `avenc_prores_ks`; `probe` decodes H.264 and HEVC inside the sandbox) |
+| AppImage package | — | Ubuntu 24.04 build (glibc 2.39 floor), bundled GStreamer 1.24 plugins collected element by element, x264/x265/AAC/ProRes/Opus, zsync update information | 1F | done | `packaging/appimage/build-appimage.sh`; `test-appimage.sh` on `fedora:43` and `debian:13` with no GStreamer installed |
+| App starts as the GUI and also exposes the CLI | `.app` with a bare binary inside | Both packages run `rec-rs`: no subcommand starts the app (1E), and `record`/`probe`/`devices`/... work headless. `flatpak run <id> ...` and `flatpak run --command=rec-rs <id> ...` both work | 1F | partial | Flatpak: record + probe through `flatpak run` (test-flatpak.sh); the window itself is phase 1E (the run prints the phase message, checked) |
+| Install into the applications menu | Drag `Rec.app` to /Applications | Desktop file, metainfo and hicolor icons (16–512 px) are installed by the Flatpak; the AppImage carries the same files at the image root and is integrated by AppImageLauncher/appimaged or the user's launcher | 1F | done | `desktop-file-validate` clean, `appstreamcli validate --no-net` successful (one expected pedantic note: the app id has a capital letter); metadata listed inside the built Flatpak |
+| Move to Applications (app translocation fix) | Moves itself into /Applications and clears quarantine | n-a: Flatpak installs into its own store and an AppImage runs from wherever the user puts it; neither runs from a read-only translocated path | 1F | n-a | — |
+| Updates | Sparkle appcast, daily check, Check for Updates… | Flatpak: `flatpak update` from the remote. AppImage: embedded `gh-releases-zsync|sultanaltair96|rec-rs-linux|latest|Rec-*x86_64.AppImage.zsync` plus the `.zsync` published next to it | 1F | partial | zsync written by `build-appimage.sh`, string returned by `--appimage-updateinformation` (printed by `test-appimage.sh`); the in-app menu item is phase 1E |
+| Release packaging | `release-macos.sh` (universal build, sign, notarize, dmg, appcast) | `.github/workflows/release.yml` on `v*` tags only: builds *and tests* both packages in the same containers as local builds, checks the tag against `Cargo.toml`, then creates the GitHub Release with `rec.flatpak`, `Rec-<version>-x86_64.AppImage` and the `.zsync` | 1F | done | `actionlint` clean; both build+test script pairs run locally with the same commands and the workflow calls exactly them (never triggered: no tag) |
+| Icons | `AppIcon.icns` | hicolor PNGs at 16/24/32/48/64/128/256/512 converted from upstream's `support/icon.png` (MIT OR Apache-2.0); no SVG because there is no vector source | 1F | done | icon files, installed by both packages; provenance in `packaging/README.md` |
+| AppStream metadata | — | `io.github.sultanaltair96.Rec.metainfo.xml`: description, features, OARS 1.1, `MIT OR Apache-2.0`, 0.1.0 release, binaries, screenshots | 1F | done | `appstreamcli validate --no-net`; screenshots are upstream's macOS captures until 1E (TODO in the file) |
+| Offline, reproducible package build | n/a (signed binaries) | Flatpak crates vendored from `Cargo.lock` (`cargo-sources.json`), regenerated by `packaging/update-sources.sh`; linuxdeploy and appimagetool pinned by release and sha256; both builds run in pinned containers | 1F | done | `packaging/update-sources.sh` regenerates 619 entries from the current `Cargo.lock`; the Flatpak builds with `CARGO_NET_OFFLINE=true` |
+| Camera inside the Flatpak | n/a | Camera portal (`capture::camera::portal`), so `--device=all` is not granted; direct V4L2 is an opt-in `flatpak override --device=all` trade-off documented in `packaging/README.md` | 1B/1F | partial | compiles and is tested without a portal on this host; the Flatpak portal path needs a real desktop (checklist in `packaging/README.md`) |
 
 ## Known gaps upstream documents
 
