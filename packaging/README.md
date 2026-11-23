@@ -167,11 +167,12 @@ the build cache between runs. The result is a single-file bundle.
 
 `test-flatpak.sh` installs that bundle system-wide in a **plain `fedora:43`
 container with only `flatpak`** (not the builder image), as a normal user, and
-checks 11 things: H.264 record to `~/Videos` through the CLI, the file appearing
+checks 12 things: H.264 record to `~/Videos` through the CLI, the file appearing
 on the host side of the Videos mount, `probe` inside the sandbox, the default
 output folder, HEVC, ProRes, the no-subcommand entry point, the settings path
-(writable, private to the app, visible in `~/.var/app`), and the installed
-desktop/metainfo/icon files. Result: **11/11 pass**, encoder names printed by the
+(writable, private to the app, visible in `~/.var/app`), the exported desktop actions
+(rewritten to `flatpak run ... gui --start-recording` / `--settings`), and the installed
+desktop/metainfo/icon files. Result: **12/12 pass**, encoder names printed by the
 recorder (`x264enc`, `x265enc`, `avenc_prores_ks`) and `probe` reporting
 `video h264 1920x1080 @ 60.000 fps` / HEVC.
 

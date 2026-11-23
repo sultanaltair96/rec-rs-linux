@@ -133,6 +133,16 @@ else
     bad "settings path"
 fi
 
+echo "== the exported desktop actions run through flatpak"
+exported="$(flatpak info --show-location "$APP")/export/share/applications/$APP.desktop"
+if grep -q 'flatpak run.*gui --start-recording' "$exported" &&
+   grep -q 'flatpak run.*gui --settings' "$exported"; then
+    ok "Start Recording and Settings actions are rewritten for flatpak run"
+else
+    cat "$exported"
+    bad "desktop actions"
+fi
+
 echo "== desktop integration inside the sandbox"
 if flatpak run --command=sh "$APP" -c \
         'ls /app/share/applications/io.github.sultanaltair96.Rec.desktop
