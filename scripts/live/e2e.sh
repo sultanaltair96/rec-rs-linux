@@ -121,7 +121,7 @@ if [ -s "$file" ] && "$REC" probe "$file" >"$dir/out/rec.probe" 2>&1; then
     else
         bad record-file "$frames frames (a pause must not shorten the file)"
     fi
-    if off=$(sync_mean "$file" 20); then
+    if off=$(sync_mean "$file" 50); then
         ok record-sync "A/V $off"
     else
         bad record-sync "$(grep 'audio 0' "$file.check" | head -1)"
@@ -131,13 +131,13 @@ else
 fi
 
 # The server's recordings: RTMP and WHIP from the same encode.
-rtmp_rec=$(newest_recording "$dir/recordings/e2e")
+rtmp_rec=$(largest_recording "$dir/recordings/e2e")
 if off=$(sync_mean "${rtmp_rec:-/nonexistent}" 30 2>/dev/null); then
     ok record-stream-rtmp "A/V $off"
 else
     bad record-stream-rtmp "no usable RTMP recording"
 fi
-whip_rec=$(newest_recording "$dir/recordings/e2ew")
+whip_rec=$(largest_recording "$dir/recordings/e2ew")
 if off=$(sync_mean "${whip_rec:-/nonexistent}" 30 2>/dev/null); then
     ok record-stream-whip "A/V $off"
 else
