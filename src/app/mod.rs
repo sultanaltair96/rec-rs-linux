@@ -24,6 +24,7 @@ mod install;
 mod linux_desktop;
 mod lock;
 mod preview;
+mod preview_gpu;
 mod session;
 mod theme;
 mod tray;
@@ -201,8 +202,9 @@ pub struct State {
     pub cameras: Vec<Device>,
     pub mics: Vec<Device>,
     pub hotkey_ok: bool,
-    /// The preview frame as an egui texture.
-    pub preview_tex: Option<egui::TextureId>,
+    /// The newest composited frame, drawn by `preview_gpu` (G10): the GPU
+    /// converts and scales it, so the app never touches its pixels.
+    pub preview_frame: Option<Arc<crate::media_types::VideoFrame>>,
     /// Its size in pixels.
     pub preview_px: [u32; 2],
     pub preview_aspect: f32,
@@ -259,7 +261,7 @@ impl State {
             cameras: vec![],
             mics: vec![],
             hotkey_ok: true,
-            preview_tex: None,
+            preview_frame: None,
             preview_px: [0, 0],
             preview_aspect: 16.0 / 9.0,
             preview_target: (0, 0),
@@ -480,7 +482,6 @@ struct App {
     tray_rx: Option<Receiver<Option<ksni::blocking::Handle<tray::Tray>>>>,
     tap: preview::Tap,
     tap_sink: FrameSink,
-    preview_texture: Option<egui::TextureHandle>,
     last_tick: Instant,
     last_meter: Instant,
     control_rx: Receiver<Control>,
@@ -537,7 +538,6 @@ impl App {
             lock,
             tap,
             tap_sink,
-            preview_texture: None,
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             control_rx,
@@ -649,8 +649,12 @@ impl App {
             color_space: Default::default(),
         };
         surface.configure(&g.device, &config);
-        let renderer =
+        let mut renderer =
             egui_wgpu::Renderer::new(&g.device, format, egui_wgpu::RendererOptions::default());
+        // G10: the preview's pipelines and textures live with the window.
+        renderer
+            .callback_resources
+            .insert(preview_gpu::PreviewPainter::new(&g.device, format));
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let egui = egui_winit::State::new(
@@ -711,8 +715,7 @@ impl App {
         self.main_visible = false;
         // Nothing is drawn while the window is hidden: the tap drops frames.
         self.update_tap_wanted();
-        self.st.preview_tex = None;
-        self.preview_texture = None;
+        self.st.preview_frame = None;
         self.sync_preview();
     }
 
@@ -1373,25 +1376,24 @@ impl App {
                 self.st.preview_target.0.max(2),
                 self.st.preview_target.1.max(2),
             );
-            if let Some(frame) = self.tap.take()
-                && let Some((img, px)) = self.tap.image(&frame)
-                && px[0] > 0
-                && px[1] > 0
-            {
-                self.st.preview_aspect = px[0] as f32 / px[1] as f32;
-                self.st.preview_px = px;
-                let options = egui::TextureOptions::LINEAR;
-                match &mut self.preview_texture {
-                    Some(h) => h.set(img, options),
-                    None => {
-                        let ctx = &self.main.as_ref().unwrap().ctx;
-                        self.preview_texture = Some(ctx.load_texture("preview", img, options));
-                    }
-                }
-                self.st.preview_tex = self.preview_texture.as_ref().map(|h| h.id());
+            if let Some(frame) = self.tap.take() {
+                // Drawn from the GPU in `ui::preview`; the size the UI shows it
+                // at is the low-power target (half resolution), the texture
+                // stays the frame's (the GPU scales without a CPU copy).
+                let (pw, ph) = preview::target_size(
+                    frame.width,
+                    frame.height,
+                    self.st.preview_target,
+                    self.st.settings.preview_low_power,
+                );
+                self.st.preview_aspect = frame.width as f32 / frame.height as f32;
+                self.st.preview_px = [pw as u32, ph as u32];
+                let pts = frame.pts;
+                let (fw, fh) = (frame.width, frame.height);
+                self.st.preview_frame = Some(Arc::new(frame));
                 self.st.frames_shown += 1;
                 if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
-                    eprintln!("rec: debug: preview frame {}x{}", px[0], px[1]);
+                    eprintln!("rec: debug: preview frame {fw}x{fh} at {pts:.3}s");
                 }
             }
         }
@@ -1668,8 +1670,7 @@ impl App {
     /// Destroy the windows (their surfaces, renderers and egui contexts) while
     /// the event loop is still running: a Wayland surface must not outlive it.
     fn close_windows(&mut self) {
-        self.preview_texture = None;
-        self.st.preview_tex = None;
+        self.st.preview_frame = None;
         self.st.preview_px = [0, 0];
         self.settings_win = None;
         self.main = None;
