@@ -1,0 +1,29 @@
+#!/bin/sh
+# AppRun for the Rec AppImage.
+#
+# The AppImage carries its own GStreamer (core + plugins) and all the libraries
+# those plugins need, so it must not mix with the host's GStreamer: a host
+# plugin built against another GStreamer would be loaded into the bundled core.
+# GST_PLUGIN_SYSTEM_PATH_1_0 is therefore narrowed to the bundle only, and the
+# registry lives in the AppImage's own cache directory so the host's
+# GStreamer registry never accumulates paths that vanish with the AppImage.
+#
+# What deliberately comes from the host: the C library, the graphics stack
+# (libGL/libEGL/Vulkan drivers, see packaging/README.md), D-Bus and
+# libpipewire (the client ABI must match the running PipeWire daemon).
+set -eu
+
+HERE=$(dirname "$(readlink -f "$0")")
+APPDIR=${APPDIR:-$HERE}
+export APPDIR
+
+export PATH="$APPDIR/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Only the bundled plugins (see the header).
+export GST_PLUGIN_SYSTEM_PATH_1_0="$APPDIR/usr/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-appimage/gst-registry-$(uname -m).bin"
+
+# The app (no subcommand) opens its window; every subcommand runs headless.
+exec "$APPDIR/usr/bin/rec-rs" "$@"
