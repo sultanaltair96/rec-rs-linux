@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for Rec (rec-rs-linux), the Linux port of rec-rs.
+
+  The screenshots point at the pinned upstream macOS screenshots because the
+  Linux window does not exist yet (phase 1E). TODO(packaging): replace them
+  with Linux screenshots under packaging/desktop/screenshots/ and remote URLs
+  once the app phase lands; see packaging/README.md.
+-->
+<component type="desktop-application">
+  <id>io.github.sultanaltair96.Rec</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Rec</name>
+  <summary>Record the screen, camera and audio</summary>
+
+  <developer id="io.github.sultanaltair96">
+    <name>rec-rs-linux contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      Rec is a fast, simple screen and camera recorder. It captures the screen,
+      system audio and microphone on a single clock, composites an optional
+      webcam overlay on the GPU, and writes a crash-safe movie with separate
+      audio tracks. It is a Linux port of the macOS app rec-rs, with the same
+      command line, settings and output format.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Full display, single window or region capture through the desktop portal (Wayland and X11)</li>
+      <li>System audio and microphone as separate tracks plus a mix track</li>
+      <li>Webcam overlay in the upstream shapes (circle, rounded, square, pill, squircle) with border, shadow and mirroring</li>
+      <li>H.264, HEVC and ProRes output with an exact constant frame rate and 2-second crash-safe fragments</li>
+      <li>Pause and resume without drift, per-source gain, and a CLI that controls the running recorder</li>
+      <li>Live streaming to RTMP and WHIP destinations, and a replay buffer</li>
+    </ul>
+    <p>
+      The app is in the tray, and every action is also a command: run
+      <code>rec-rs --help</code> or read the README for the headless recorder.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.sultanaltair96.Rec.desktop</launchable>
+  <url type="homepage">https://github.com/sultanaltair96/rec-rs-linux</url>
+  <url type="bugtracker">https://github.com/sultanaltair96/rec-rs-linux/issues</url>
+  <url type="vcs-browser">https://github.com/sultanaltair96/rec-rs-linux</url>
+  <url type="contribute">https://github.com/sultanaltair96/rec-rs-linux/blob/main/AGENTS.md</url>
+
+  <screenshots>
+    <!-- TODO(packaging): macOS screenshots of the upstream app until phase 1E
+         ships the Linux window; see the comment at the top of this file. -->
+    <screenshot type="default">
+      <caption>The recorder window with the live preview and the record controls</caption>
+      <image type="source" width="1600" height="1015">https://raw.githubusercontent.com/michaelshimeles/rec-rs/93dd4948cdc8919e8b444a5af0141cf7c3628e7c/docs/screenshots/main.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Webcam overlay in the rounded shape</caption>
+      <image type="source" width="1600" height="1015">https://raw.githubusercontent.com/michaelshimeles/rec-rs/93dd4948cdc8919e8b444a5af0141cf7c3628e7c/docs/screenshots/cam-circle.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Webcam overlay in the squircle shape</caption>
+      <image type="source" width="1600" height="1015">https://raw.githubusercontent.com/michaelshimeles/rec-rs/93dd4948cdc8919e8b444a5af0141cf7c3628e7c/docs/screenshots/cam-squircle.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings: output folder, container, codec and audio devices</caption>
+      <image type="source" width="520" height="820">https://raw.githubusercontent.com/michaelshimeles/rec-rs/93dd4948cdc8919e8b444a5af0141cf7c3628e7c/docs/screenshots/settings.png</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.1.0" date="2025-11-23" type="development">
+      <description>
+        <p>First Linux build: the command line, settings, pause timeline, mixer and overlay maths, the test-pattern source, the GStreamer H.264/HEVC/ProRes writer with AAC audio, the probe, and Flatpak and AppImage packaging.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Recorder</category>
+  </categories>
+
+  <provides>
+    <binary>rec-rs</binary>
+    <binary>rec</binary>
+  </provides>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+</component>

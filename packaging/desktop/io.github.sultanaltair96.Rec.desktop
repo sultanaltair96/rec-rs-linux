@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Name=Rec
+GenericName=Screen Recorder
+Comment=Record the screen, camera and audio
+Exec=rec-rs gui
+TryExec=rec-rs
+Icon=io.github.sultanaltair96.Rec
+Terminal=false
+Categories=AudioVideo;Recorder;
+Keywords=record;recorder;screen;capture;screencast;video;camera;mic;
+StartupNotify=true
+StartupWMClass=io.github.sultanaltair96.Rec
+Actions=StartRecording;Settings;
+
+[Desktop Action StartRecording]
+Name=Start Recording
+Exec=rec-rs gui --start-recording
+
+[Desktop Action Settings]
+Name=Settings
+Exec=rec-rs gui --settings
