@@ -1,31 +1,23 @@
 //! The seam between the app and the backends.
 //!
-//! The app is written against what `main` offers today: `record::Session`,
-//! `settings`, `live::Live`, `capture::*` and `compose`. Some things the app
-//! needs are still being built by other phase-1 workers, and this module is the
-//! one place that names them, so the UI can say *why* a control is disabled
-//! instead of silently doing nothing:
+//! The camera, the compositor and the writer are real now: `record::Session`
+//! offers `set_pip`, `set_scene`, `cam_aspect` and `camera_name`, and
+//! `Options::preview` carries the composited frame. What is still a stub is one
+//! phase only — the live encode (replay buffer, streams, stream keys, phase
+//! 1D) — and this module is the one place that names it, so the UI can say why
+//! a control is disabled instead of silently doing nothing.
 //!
-//! - camera overlay and scene switching at run time (*phase 1C*, the
-//!   compositor: `Session` has no `set_pip`/`set_scene`/`cam_aspect` yet),
-//! - camera device names (*phase 1B*),
-//! - the replay buffer, per-destination stream status and stream keys
-//!   (*phase 1D*, `live::Live`).
-//!
-//! Every function here is the smallest shape the UI needs; when the backend
-//! lands, its module implements the same call and this file shrinks. Nothing
-//! here duplicates a `media_types` type.
+//! Nothing here duplicates a `media_types` type.
 
 use anyhow::Result;
 
-use crate::compose::{PipSpec, Scene};
 use crate::live::{self, Live};
-use crate::record::{Options, Session};
+use crate::record::Options;
 
 /// What the running backends can do right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
-    /// The camera can be opened (phase 1B).
+    /// The camera can be opened and composited (1B and 1C).
     pub camera: bool,
     /// The overlay can move/restyle without restarting the session (1C).
     pub pip: bool,
@@ -37,16 +29,13 @@ pub struct Caps {
     pub stream: bool,
 }
 
-/// Today's abilities. Cameras and microphones are usable (phase 1B), but the
-/// *session* exposes neither a camera name nor a live overlay/scene switch
-/// yet: the writer wires the camera into its emission loop and exposes those
-/// in phase 1G, so until then the app's camera scene records the screen and
-/// the overlay controls say which phase owes them.
+/// Today's abilities: camera, compositor and live overlay/scene changes are
+/// in; the live encode (replay buffer, streams, stream keys) is still phase 1D.
 pub fn caps() -> Caps {
     Caps {
-        camera: false,
-        pip: false,
-        scene_switch: false,
+        camera: true,
+        pip: true,
+        scene_switch: true,
         replay: false,
         stream: false,
     }
@@ -55,50 +44,11 @@ pub fn caps() -> Caps {
 /// The phase that provides an app feature, for the UI's "not yet" hints.
 pub fn phase_note(feature: &str) -> String {
     match feature {
-        "camera" => {
-            "the writer wires the camera into the recording in phase 1G (the camera itself is phase 1B)"
-                .into()
-        }
-        // Spelled out so a rename in `gpu` cannot break the app's hints.
-        "pip" | "scene" => {
-            "the camera overlay and live scene switching need the compositor (phase 1C)".into()
-        }
         "replay" | "stream" | "keys" => format!(
             "replay and streaming are not implemented yet (phase {})",
             live::PHASE
         ),
         other => format!("{other} is not available in this build"),
-    }
-}
-
-/// The session features the app needs that `record::Session` does not expose
-/// yet. A backend that implements them replaces the default bodies.
-pub trait SessionExt {
-    /// Restyle or move the camera overlay live (previews, the file, live).
-    fn set_pip(&self, pip: PipSpec) -> Result<(), String>;
-    /// Switch scenes while recording.
-    fn set_scene(&self, scene: Scene) -> Result<(), String>;
-    /// The camera's aspect ratio, for drag hit-testing in the preview.
-    fn cam_aspect(&self) -> Option<f64>;
-    /// The camera the session opened, if any.
-    fn camera_name(&self) -> Option<String>;
-}
-
-impl SessionExt for Session {
-    fn set_pip(&self, _pip: PipSpec) -> Result<(), String> {
-        Err(phase_note("pip"))
-    }
-
-    fn set_scene(&self, _scene: Scene) -> Result<(), String> {
-        Err(phase_note("scene"))
-    }
-
-    fn cam_aspect(&self) -> Option<f64> {
-        None
-    }
-
-    fn camera_name(&self) -> Option<String> {
-        None
     }
 }
 
@@ -287,16 +237,15 @@ mod tests {
     }
 
     #[test]
-    fn session_ext_names_the_compositor() {
-        // Without a session there is nothing to hold; the trait is exercised
-        // through the default bodies, which the UI relies on for its hints.
-        let pip = PipSpec::default();
-        let note = phase_note("pip");
-        assert!(note.contains("compositor"), "{note}");
-        assert!(phase_note("camera").contains("phase 1G"));
+    fn caps_follow_the_backends() {
+        // Camera, compositor and live overlay/scene changes are in (1B/1C);
+        // the live encode is still phase 1D, and the UI says so.
+        let c = caps();
+        assert!(c.camera && c.pip && c.scene_switch);
+        assert!(!c.replay && !c.stream);
+        assert!(phase_note("replay").contains("phase 1D"));
         assert!(phase_note("stream").contains("phase 1D"));
-        assert_eq!(pip, PipSpec::default());
-        assert!(!caps().pip && !caps().camera && !caps().replay && !caps().stream);
+        assert!(phase_note("keys").contains("phase 1D"));
     }
 
     #[test]

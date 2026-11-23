@@ -52,15 +52,15 @@ Evidence names: `unit` tests are in the crate (`cargo test`), `selftest:` cases 
 
 | Feature | Upstream behaviour | Linux approach | Phase/owner | Status | Evidence |
 |---|---|---|---|---|---|
-| Live preview of what will be recorded | Rendered at preview size, composited | The session's newest frame (BGRA/RGBA/NV12/I420) becomes an egui texture at the preview's pixel size, sampled in one pass on the CPU; 1C's compositor `Renderer::texture()` on the shared wgpu device replaces that copy in phase 2, and the `record::Options::preview` tap moves to the composited frame in 1G/2 | 1E (1C for the composited frame) | partial | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` logs `preview frame 704x396` from the real window; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
+| Live preview of what will be recorded | Rendered at preview size, composited | `Options::preview` is the writer's **composited** frame (≤30/s): the app converts it (BGRA/RGBA or BT.709 NV12/I420) into an egui texture at the preview's pixel size in one pass; 1C's shared-device `Renderer::texture()` removes that CPU copy in phase 2 | 1E | done | unit `app::preview::tests::*` (size, BGRA, resample, NV12/BT.709, newest-only); selftest `gui` (screen + synthetic camera) logs `preview frame 704x396`; `app::ui_tests::the_composited_preview_moves_the_overlay_after_set_pip` (the camera is bottom-right, `set_pip` puts it top-left in the next preview frame); `app::ui_tests::dragging_the_overlay_snaps_to_a_corner`; a 4K frame costs 5.9 ms per preview frame (release, `preview_cost`); snapshot `tests/snapshots/main-window.png` |
 | Own windows excluded from capture | ScreenCaptureKit filter | Not possible through the portal: the compositor owns the stream and a portal client cannot name windows to exclude. On X11 the recorder is an ordinary client, so its own windows are captured like any other | 1A | n-a | documented in the phase 1A notes; the app cannot exclude its window either, so on X11 a visible Rec window is in the picture (hide it with Ctrl+W); the tray keeps the recording running |
 | Preview low-power mode (half res, 15 fps) | Setting | Same setting, honoured by the preview | 1E | todo | — |
 | Scene: Screen | Full display or window | Same, scaled to the output with Lanczos | 1C (composite), 1A (capture) | partial | unit `gpu::tests::a_screen_at_the_output_size_is_bit_exact`, `a_small_screen_is_not_upscaled`, `lanczos_matches_a_cpu_reference`; golden `screen`, `screen-4k-to-1080` |
 | Scene: Screen + Cam, drag anywhere, corner snap | Overlay placement | Same geometry, drawn by wgpu; the preview drag uses `compose::overlay_rect`/`snap_corner` and the session seam | 0 (geometry), 1C (GPU), 1E (drag) | done | unit `compose::tests::snapping`, `corners_and_free_positions`; `gpu::tests::renders_overlay_with_border_into_the_frame`, `placement_follows_the_geometry_for_corners_and_free_positions`, `mirroring_flips_the_camera`; goldens `screen-cam-rounded`, `screen-cam-pill`; drag: unit `app::ui_tests::main_window_shows_every_card` |
 | Overlay shapes (circle, rounded, square, pill, squircle), roundness, size, border, shadow, mirror | CoreImage | Same masks and shadows computed on the CPU, drawn by wgpu; every control is in the sidebar and the settings window | 0 (masks), 1C (GPU), 1E (controls) | done | unit `gpu::tests::every_shape_matches_the_mask_geometry`, `renders_overlay_with_border_into_the_frame`; goldens `screen-cam-rounded`, `screen-cam-circle`, `screen-cam-square-border`, `screen-cam-pill`, `screen-cam-squircle-shadow`; snapshot `main-window.png` (overlay card) |
-| Overlay changes live while recording, baked in, no extra encode | Yes | The compositor restyles from the next frame; the app sends the spec through the session seam (`set_pip`), which the writer exposes to the session in 1G | 1C (compositor), 1G/1E (session seam) | partial | `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; the seam is unit tested (`app::session::tests::session_ext_names_the_compositor`) |
+| Overlay changes live while recording, baked in, no extra encode | Yes | The compositor restyles from the next frame; the app sends the spec on every drag step and slider move (`Session::set_pip`), and the drag snaps on release | 1C (compositor), 1G (session), 1E (drag) | done | `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`; `app::ui_tests::the_composited_preview_moves_the_overlay_after_set_pip`, `dragging_the_overlay_snaps_to_a_corner` |
 | Scene: Camera full frame | AVCapture | V4L2 into a cover-fitted, mirrored full frame | 1B (source), 1C (composite) | partial | unit `gpu::tests::the_camera_scene_covers_the_frame`, `mirroring_flips_the_camera`; golden `cam` |
-| Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app only offers camera scenes while recording if the session started with the camera (the session seam is 1G) | 1C/1E/1G | partial | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`, `app::ui_tests::main_window_shows_every_card`; `State::can_switch_live` |
+| Switch scenes live if recording started with the camera | Yes | The compositor switches from the next frame; the app offers camera scenes while recording only when the session has a camera, sends `set_scene` and shows a notice when the writer refuses | 1C/1E/1G | done | unit `gpu::tests::scenes_and_camera_changes_apply_from_the_next_frame`, `app::ui_tests::main_window_shows_every_card`; `State::can_switch_live` |
 | Sources: display, window, camera, mic, system audio | Yes | PipeWire display/window, V4L2 or portal camera, PipeWire audio; the sidebar lists them and passes the choice through `settings` | 1A/1B (sources), 1E (UI) | done (sources), partial (the app's lists fill in live) | selftest `pattern-screen`, `pattern-mic`, `pattern-system-audio`; unit camera/audio suites, `app::ui_tests::main_window_shows_every_card` |
 | Record/Stop button and timer | Yes | App | 1E | todo | — |
 | Pause/Resume button | Yes | App (the session API exists) | 1E | todo | session API: selftest `pause-resume` |
@@ -443,24 +443,24 @@ Flatpak portal host. These are the exact checks to run on a real machine:
 ## Phase 1E summary
 
 Done (proved by tests or the self-test): the main window and settings window on egui 0.36/wgpu 30
-with the paper-rs look, the live preview path (the session's frames as an egui texture, low-power
-mode, nothing buffered while hidden), the mixer widgets (fader scale, drag/click/scroll/double
-click/typed dB, mute greying the meter), the settings window and its `settings.json` round trip,
-the app menu and its shortcuts, the tray model (menu, title, tooltip, ARGB icon), the single-instance
-socket, the pidfile/signal controls against the running app, quitting that finalizes a recording,
-"Check for Updates" against GitHub Releases, AppImage self-integration, and the headless self-test
-case that runs the real app.
+with the paper-rs look; the live preview of the **composited** frame (`Options::preview`, ≤30/s,
+one-pass CPU upload, low-power mode, nothing buffered while hidden); the camera overlay drag with
+corner snapping, applied live through `Session::set_pip` and visible in the next preview frame; live
+scene switching; the mixer widgets (fader scale, drag/click/scroll/double click/typed dB, mute
+greying the meter); the settings window and its `settings.json` round trip; the app menu and its
+shortcuts; the tray model (menu, title, tooltip, ARGB icon); the single-instance socket; the
+pidfile/signal controls against the running app; quitting that finalizes a recording; the composited
+preview selftest case; "Check for Updates" against GitHub Releases; AppImage self-integration; and
+the headless self-test case that runs the real app with a camera.
 
-Partial (a named part is missing, listed per row): the preview shows the captured frame rather than
-the composited one until 1G moves the `record::Options::preview` tap into the writer's emission loop
-(the compositor itself, and the shared-device texture the app will switch to, are 1C and done);
-overlay restyling and scene switching at run time wait for the session seam that 1G adds; the camera
-needs 1B; the replay buffer and streaming are 1D (the cards and their gating are here); "Reveal
-Last" selects the file only where FileManager1 exists; the tray and the global hotkeys are complete
-in code but their visibility and the portal dialog need a real desktop (manual list above).
+Partial (a named part is missing, listed per row): the replay buffer and streaming are 1D (the cards
+and their gating are here); "Reveal Last" selects the file only where FileManager1 exists; the tray
+and the global hotkeys are complete in code but their visibility and the portal dialog need a real
+desktop (manual list above).
 
 Known gaps: SNI hosts disagree about title text (the tooltip carries the state everywhere); the
-X11 fallback cannot be exercised under a Wayland-only session and vice versa; the update check
-opens the release page rather than replacing the binary (Flatpak and AppImage packaging own that,
-phase 1F). No audio filters and no configurable hotkeys, matching upstream.
-
+X11 hotkey fallback cannot be exercised under a Wayland-only session and vice versa; the update
+check opens the release page rather than replacing the binary (Flatpak and AppImage packaging own
+that, phase 1F); a visible Rec window is part of an X11 capture (the portal path cannot exclude it;
+Ctrl+W hides it while the recording continues). No audio filters and no configurable hotkeys,
+matching upstream.

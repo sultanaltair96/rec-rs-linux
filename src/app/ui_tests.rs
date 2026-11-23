@@ -596,3 +596,221 @@ fn snapshots_of_the_main_and_settings_windows() {
     results.extend_harness(&mut h);
     results.into_result().expect("snapshots match");
 }
+
+/// The overlay drag in the preview: the widget follows the pointer, snaps to a
+/// corner on release, and the settings (which the app sends to the session,
+/// and so into the next composited preview frame) end up on that corner.
+#[test]
+fn dragging_the_overlay_snaps_to_a_corner() {
+    let _gpu_guard = gpu();
+    let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 225.0));
+    struct Drag {
+        st: State,
+        area: egui::Rect,
+    }
+    let state = Drag {
+        st: full_state(crate::compose::Scene::ScreenCam),
+        area,
+    };
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(400.0, 225.0))
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .with_max_steps(60)
+        .wgpu_setup(wgpu_setup())
+        .build_ui_state(
+            |ui, s: &mut Drag| {
+                crate::app::ui::drag_overlay(ui, &mut s.st, s.area);
+            },
+            state,
+        );
+    h.run();
+
+    let centre_of_overlay = |s: &Drag| {
+        crate::app::ui::overlay_ui_rect(&s.st, &s.st.settings.pip_spec(), s.area).center()
+    };
+    let from = centre_of_overlay(h.state());
+    let to = egui::pos2(60.0, 50.0); // near the top-left corner
+    h.hover_at(from);
+    h.run();
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    h.run();
+    for i in 1..=8 {
+        let at = from + (to - from) * (i as f32 / 8.0);
+        h.hover_at(at);
+        h.run();
+    }
+    // While the button is down the overlay follows the pointer (a custom
+    // placement)…
+    assert!(
+        matches!(
+            h.state().st.settings.pip_place,
+            crate::compose::Place::At(_)
+        ),
+        "the overlay follows the drag: {:?}",
+        h.state().st.settings.pip_place
+    );
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    h.run();
+    // …and on release it snaps to the corner it was dropped near.
+    assert_eq!(
+        h.state().st.settings.pip_place,
+        crate::compose::Place::Corner(crate::compose::Corner::TopLeft),
+        "released near the top-left corner"
+    );
+}
+
+/// The preview now carries the *composited* frame (`Options::preview` is wired
+/// to the writer's emission loop). Moving the overlay — what the preview drag
+/// does — must show in the next preview frame. This runs the real session with
+/// the synthetic camera (solid red, white bar) and no file.
+#[test]
+fn the_composited_preview_moves_the_overlay_after_set_pip() {
+    use crate::compose::{Corner, PipSpec, Place};
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("REC_SYNTH_CAM");
+            std::env::remove_var("REC_SYNTH_CAM_SIZE");
+            std::env::remove_var("REC_SYNTH_CAM_FPS");
+        }
+    }
+
+    let _gpu_guard = gpu();
+    unsafe {
+        std::env::set_var("REC_SYNTH_CAM", "1");
+        std::env::set_var("REC_SYNTH_CAM_SIZE", "320x180");
+        std::env::set_var("REC_SYNTH_CAM_FPS", "30");
+    }
+    let settings = Settings {
+        scene: crate::compose::Scene::ScreenCam,
+        resolution: "720p".into(),
+        fps: 30,
+        mic_enabled: false,
+        system_audio: false,
+        ..Default::default()
+    };
+    let (mut tap, sink) = super::preview::Tap::new(std::sync::Arc::new(|| {}));
+    tap.set_wanted(true);
+    tap.set_target(1280, 720);
+    let started = super::session::options(&settings, None, None, Some(sink), true)
+        .and_then(|o| super::Session::start(&o));
+    let sess = match started {
+        Ok(s) => s,
+        Err(e) => {
+            // No adapter or no GStreamer element: skip rather than fail on a
+            // host that cannot run the compositor at all.
+            eprintln!("SKIP: could not start the session for the preview test: {e:#}");
+            clear_env();
+            return;
+        }
+    };
+
+    // Share of camera-red pixels inside a rect (the test pattern never has
+    // R > 160 with G and B below 100; the synthetic camera is solid red with a
+    // white bar).
+    let red_share = |frame: &crate::media_types::VideoFrame, rect: [f64; 4]| -> f64 {
+        let (w, h) = (frame.width, frame.height);
+        let Some((img, _)) = super::preview::image(frame, (w, h)) else {
+            return 0.0;
+        };
+        let mut total = 0;
+        let mut red = 0;
+        for iy in 1..8 {
+            for ix in 1..8 {
+                let x = (rect[0] + rect[2] * ix as f64 / 8.0) as usize;
+                let y = (rect[1] + rect[3] * iy as f64 / 8.0) as usize;
+                if x >= w || y >= h {
+                    continue;
+                }
+                total += 1;
+                let p = img.pixels[y * w + x];
+                if p.r() > 160 && p.g() < 100 && p.b() < 100 {
+                    red += 1;
+                }
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            red as f64 / total as f64
+        }
+    };
+
+    let pip = settings.pip_spec();
+    let bottom_right = {
+        // The camera's aspect arrives with its first frame; assume 16:9 until
+        // then (the synthetic camera is 320x180).
+        let aspect = sess.cam_aspect().unwrap_or(16.0 / 9.0);
+        crate::compose::overlay_rect(&pip, 1280.0, 720.0, aspect)
+    };
+    let top_left_pip = PipSpec {
+        place: Place::Corner(Corner::TopLeft),
+        ..pip.clone()
+    };
+    let top_left = {
+        let aspect = sess.cam_aspect().unwrap_or(16.0 / 9.0);
+        crate::compose::overlay_rect(&top_left_pip, 1280.0, 720.0, aspect)
+    };
+
+    // Frames start before the camera's first frame (a preview does not wait for
+    // the camera to settle), so keep taking them until the overlay shows.
+    let mut first = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(f) = tap.take()
+            && red_share(&f, bottom_right) > 0.6
+        {
+            first = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let Some(first) = first else {
+        let _ = sess.finish();
+        clear_env();
+        panic!("no preview frame with the camera overlay arrived");
+    };
+    assert!(
+        red_share(&first, top_left) < 0.2,
+        "the camera is not in the top-left corner by default"
+    );
+
+    // A drag in the preview sends exactly this; the next emitted (and
+    // previewed) frame must show it.
+    sess.set_pip(top_left_pip.clone());
+    let mut moved = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Some(f) = tap.take()
+            && f.pts > first.pts + 0.05
+            && red_share(&f, top_left) > 0.6
+        {
+            moved = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let Some(moved) = moved else {
+        let _ = sess.finish();
+        clear_env();
+        panic!("no preview frame with the overlay in the top-left corner");
+    };
+    assert!(
+        red_share(&moved, bottom_right) < 0.2,
+        "and it left the bottom-right corner"
+    );
+
+    let _ = sess.finish();
+    clear_env();
+}

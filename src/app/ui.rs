@@ -355,7 +355,11 @@ fn frame_size(st: &State) -> (f64, f64) {
     (3840.0, (3840.0 / st.preview_aspect.max(0.1) as f64).round())
 }
 
-fn overlay_ui_rect(st: &State, spec: &compose::PipSpec, preview: egui::Rect) -> egui::Rect {
+pub(super) fn overlay_ui_rect(
+    st: &State,
+    spec: &compose::PipSpec,
+    preview: egui::Rect,
+) -> egui::Rect {
     let (w, h) = frame_size(st);
     let [x, y, ow, oh] = compose::overlay_rect(spec, w, h, st.cam_aspect);
     let (sx, sy) = (preview.width() as f64 / w, preview.height() as f64 / h);
@@ -367,7 +371,7 @@ fn overlay_ui_rect(st: &State, spec: &compose::PipSpec, preview: egui::Rect) -> 
 
 /// Drag the camera overlay in the preview. It moves live (in the preview and
 /// the recording) and snaps to a corner when released near one.
-fn drag_overlay(ui: &mut Ui, st: &mut State, preview: egui::Rect) {
+pub(super) fn drag_overlay(ui: &mut Ui, st: &mut State, preview: egui::Rect) {
     const SNAP: f64 = 0.05;
     let spec = st.settings.pip_spec();
     let ov = overlay_ui_rect(st, &spec, preview);
@@ -930,11 +934,14 @@ fn sources(ui: &mut Ui, st: &mut State) {
         .collect();
     if w::segmented(ui, &mut s.scene, &scenes)
         && let Some(r) = &st.recording
+        && !r.set_scene(s.scene)
     {
-        match session::SessionExt::set_scene(r, s.scene) {
-            Ok(()) => {}
-            Err(e) => st.error = Some(e),
-        }
+        // The picker only offers scenes the session can draw; this is the
+        // belt-and-braces case (no camera frames yet).
+        st.notice = Some((
+            "This recording cannot switch to that scene live".into(),
+            std::time::Instant::now(),
+        ));
     }
 
     w::header(ui, Icon::Display, "Screen");

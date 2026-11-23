@@ -271,13 +271,19 @@ fn to_rgba(frame: &VideoFrame) -> Option<(usize, usize, Vec<u8>)> {
                 let yrow = &y_plane.data[y * y_plane.stride..][..w];
                 let chroma_row = y / 2;
                 for (x, luma) in yrow.iter().enumerate().take(w) {
-                    let cw = chroma_row * u_plane.stride + (x / 2);
+                    // NV12: U and V are interleaved, two bytes per pixel pair
+                    // (so the byte offset is (x/2)*2, not (x/2)*stride).
+                    // I420: one plane each, half width.
                     let (u, v) = match frame.format {
-                        PixelFormat::Nv12 => (u_plane.data[cw * 2], u_plane.data[cw * 2 + 1]),
+                        PixelFormat::Nv12 => {
+                            let at = chroma_row * u_plane.stride + (x / 2) * 2;
+                            (u_plane.data[at], u_plane.data[at + 1])
+                        }
                         _ => {
-                            let v_row = chroma_row * v_plane.stride + (x / 2).min(chroma_w - 1);
-                            let u_row = chroma_row * u_plane.stride + (x / 2).min(chroma_w - 1);
-                            (u_plane.data[u_row], v_plane.data[v_row])
+                            let cx = (x / 2).min(chroma_w - 1);
+                            let u_at = chroma_row * u_plane.stride + cx;
+                            let v_at = chroma_row * v_plane.stride + cx;
+                            (u_plane.data[u_at], v_plane.data[v_at])
                         }
                     };
                     let (r, g, b) = yuv_to_rgb(*luma, u, v);
@@ -380,18 +386,27 @@ mod tests {
         assert_eq!(yuv_to_rgb(235, 128, 128), (255, 255, 255));
         let (r, g, b) = yuv_to_rgb(80, 90, 240);
         assert!(r > 200 && g < 80 && b < 80, "{r} {g} {b}");
-        // NV12: a black frame with neutral grey chroma is black.
-        let y = Plane::new(vec![16u8; 4 * 2], 4);
-        let uv = Plane::new(vec![128u8; 4], 4);
+        // NV12: a black frame with neutral grey chroma is black, and the
+        // interleaved U/V bytes land on the right pixel pairs (a stride-width
+        // mistake made the old code read past the plane on real frames).
+        let y = Plane::new(vec![16u8; 8 * 2], 8);
+        // Row 0: U=128,V=128 for pixels 0-1, U=90,V=240 for pixels 2-3,
+        // U=240,V=90 for pixels 4-5, U=128,V=128 for pixels 6-7 (1 row per 2
+        // luma rows).
+        let uv = Plane::new(vec![128, 128, 90, 240, 240, 90, 128, 128], 8);
         let f = VideoFrame {
             pts: 1.0,
-            width: 4,
+            width: 8,
             height: 2,
             format: PixelFormat::Nv12,
             planes: vec![y, uv],
         };
-        let (img, _) = image(&f, (4, 2)).expect("image");
-        assert!(img.pixels.iter().all(|p| *p == egui::Color32::BLACK));
+        let (img, _) = image(&f, (8, 2)).expect("image");
+        assert_eq!(img.pixels[0], egui::Color32::BLACK, "neutral chroma");
+        let red = img.pixels[2];
+        assert!(red.r() > 150 && red.g() < 80 && red.b() < 80, "{red:?}");
+        let blue = img.pixels[4];
+        assert!(blue.b() > 200 && blue.g() < 80 && blue.r() < 80, "{blue:?}");
     }
 
     #[test]

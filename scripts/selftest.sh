@@ -716,7 +716,10 @@ if wanted gui; then
     else
         d="$OUT/gui"
         rm -rf "$d"; mkdir -p "$d/rt" "$d/out"; chmod 700 "$d/rt"
-        printf '{"output_dir": "%s", "resolution": "1080p", "fps": 30, "mic_enabled": false, "system_audio": true}\n' \
+        # Screen + Cam with the synthetic camera: the app's preview then shows the
+        # composited overlay, which is what the writer hands the app (not the raw
+        # capture).
+        printf '{"output_dir": "%s", "resolution": "1080p", "fps": 30, "mic_enabled": false, "system_audio": true, "scene": "screen-cam"}\n' \
             "$d/out" >"$d/settings.json"
         # One session script: sway and the app must die together, whatever the
         # case does.
@@ -730,6 +733,7 @@ i=0
 while [ ! -S "\$XDG_RUNTIME_DIR/wayland-1" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
 [ -S "\$XDG_RUNTIME_DIR/wayland-1" ] || { kill \$sway_pid; exit 10; }
 export WAYLAND_DISPLAY=wayland-1 REC_DEBUG=1
+export REC_SYNTH_CAM=1 REC_SYNTH_CAM_SIZE=320x180 REC_SYNTH_CAM_FPS=30
 "$REC" gui --test-pattern --start-recording >"$d/app.log" 2>&1 &
 app=\$!
 sleep 7

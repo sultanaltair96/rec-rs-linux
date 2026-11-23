@@ -55,7 +55,7 @@ use crate::record::{self, Session};
 use crate::settings::Settings;
 
 use self::control::{Claim, Control};
-use self::session::{SessionExt, StreamStatus};
+use self::session::StreamStatus;
 
 /// Things that happen to the app from menus, the tray, hotkeys, signals and
 /// buttons; all handled on the main thread.
@@ -210,8 +210,6 @@ pub struct State {
     pub refresh_devices: bool,
     /// Overlay last sent to the running session.
     pip_applied: Option<PipSpec>,
-    /// A one-time note about the overlay not being live yet.
-    pip_note: bool,
     /// Audio levels last sent to the running session.
     volumes_applied: Option<[Volume; 2]>,
     /// Camera aspect ratio from the running session (for drag hit-testing).
@@ -263,7 +261,6 @@ impl State {
             cmds: vec![],
             refresh_devices: false,
             pip_applied: None,
-            pip_note: false,
             volumes_applied: None,
             cam_aspect: 16.0 / 9.0,
             live: Arc::new(Live::new()),
@@ -347,16 +344,11 @@ impl State {
             return;
         }
         self.pip_applied = Some(spec.clone());
-        if !self.settings.scene.uses_cam() {
-            return;
-        }
-        if let Err(e) = sess.set_pip(spec)
-            && !self.pip_note
-        {
-            // Once, not on every slider step.
-            self.pip_note = true;
-            self.notice = Some((e, Instant::now()));
-        }
+        // Baked into the next emitted frame, which is also the next preview
+        // frame, so a drag moves the overlay while the button is down. Sent
+        // even in the screen-only scene: the writer keeps it for the moment the
+        // camera scene is switched on.
+        sess.set_pip(spec);
     }
 
     /// Send the fader levels to the running session if they changed: the
@@ -853,6 +845,9 @@ impl App {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
                     self.st.volumes_applied = Some(self.st.settings.volumes());
+                    if let Some(a) = s.cam_aspect() {
+                        self.st.cam_aspect = a;
+                    }
                     self.st.preview = Some(s);
                 }
                 Err(e) => {
@@ -894,6 +889,9 @@ impl App {
                 );
                 self.st.pip_applied = Some(self.st.settings.pip_spec());
                 self.st.volumes_applied = Some(self.st.settings.volumes());
+                if let Some(a) = sess.cam_aspect() {
+                    self.st.cam_aspect = a;
+                }
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
