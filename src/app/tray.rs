@@ -16,6 +16,7 @@
 //! replaced by ksni's StatusNotifierItem.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, ToolTip, Tray as KsniTray};
@@ -189,9 +190,19 @@ fn icon(v: &View) -> Vec<Icon> {
 pub struct Tray {
     pub view: View,
     send: Arc<dyn Fn(Cmd) + Send + Sync>,
+    online: Arc<AtomicBool>,
 }
 
 impl KsniTray for Tray {
+    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        self.online.store(false, Ordering::Release);
+        eprintln!("rec: warning: tray watcher lost; closing the window will quit Rec");
+        super::wake();
+        // Stop rather than trusting watcher_online: ksni calls that before
+        // re-registration has succeeded, so it is not confirmation.
+        false
+    }
+
     fn id(&self) -> String {
         "rec-rs".into()
     }
@@ -249,30 +260,63 @@ impl KsniTray for Tray {
     }
 }
 
+/// A successfully registered item, invalidated immediately on watcher loss.
+pub struct Handle {
+    inner: ksni::blocking::Handle<Tray>,
+    online: Arc<AtomicBool>,
+}
+
+impl Handle {
+    pub fn available(&self) -> bool {
+        self.online.load(Ordering::Acquire) && !self.inner.is_closed()
+    }
+}
+
+/// Poll startup without blocking; a failed worker is terminal, just like a
+/// missing watcher. While pending, this returns no confirmed handle.
+pub fn poll_start(
+    pending: &mut Option<std::sync::mpsc::Receiver<Option<Handle>>>,
+) -> Option<Handle> {
+    use std::sync::mpsc::TryRecvError;
+    match pending.as_ref()?.try_recv() {
+        Ok(handle) => {
+            *pending = None;
+            handle
+        }
+        Err(TryRecvError::Disconnected) => {
+            *pending = None;
+            None
+        }
+        Err(TryRecvError::Empty) => None,
+    }
+}
+
 /// Start the tray. `None` (with a warning) when the session has no
 /// StatusNotifierWatcher, so the app keeps working without one.
-pub fn start(
-    view: View,
-    send: Arc<dyn Fn(Cmd) + Send + Sync>,
-) -> Option<ksni::blocking::Handle<Tray>> {
+pub fn start(view: View, send: Arc<dyn Fn(Cmd) + Send + Sync>) -> Option<Handle> {
     use ksni::blocking::TrayMethods;
     // Flatpak: owning the well-known name is not allowed inside the sandbox.
     let flatpak = super::install::is_flatpak();
-    let tray = Tray { view, send };
+    // Only returned after spawn confirms registration AND a registered host.
+    // Setting this before spawn also preserves an offline callback racing it.
+    let online = Arc::new(AtomicBool::new(true));
+    let tray = Tray {
+        view,
+        send,
+        online: online.clone(),
+    };
     match tray.disable_dbus_name(flatpak).spawn() {
-        Ok(h) => Some(h),
+        Ok(inner) => Some(Handle { inner, online }),
         Err(e) => {
-            eprintln!(
-                "rec: warning: no tray item ({e}); close the window to keep Rec running hidden"
-            );
+            eprintln!("rec: warning: no tray item ({e}); closing the window will quit Rec");
             None
         }
     }
 }
 
 /// Update the item's state (title, icon, menu).
-pub fn update(handle: &ksni::blocking::Handle<Tray>, view: View) {
-    handle.update(move |t| {
+pub fn update(handle: &Handle, view: View) {
+    handle.inner.update(move |t| {
         if t.view != view {
             t.view = view;
         }
@@ -299,6 +343,42 @@ mod tests {
                 Entry::Separator => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn pending_failed_and_disconnected_startup_are_not_available() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = Some(rx);
+        assert!(poll_start(&mut pending).is_none());
+        assert!(pending.is_some());
+        tx.send(None).unwrap();
+        assert!(poll_start(&mut pending).is_none());
+        assert!(pending.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = Some(rx);
+        drop(tx); // A startup worker that panicked / could not be started.
+        assert!(poll_start(&mut pending).is_none());
+        assert!(pending.is_none());
+    }
+
+    /// Run under dbus-run-session: no watcher and no desktop/portal needed.
+    #[test]
+    #[ignore = "requires an isolated session bus without a StatusNotifierWatcher"]
+    fn absent_watcher_does_not_create_a_handle() {
+        assert!(start(idle(), Arc::new(|_| panic!("unexpected command"))).is_none());
+    }
+
+    #[test]
+    fn watcher_loss_invalidates_the_item_and_stops_the_service() {
+        let online = Arc::new(AtomicBool::new(true));
+        let tray = Tray {
+            view: idle(),
+            send: Arc::new(|_| panic!("watcher loss must not issue recording commands")),
+            online: online.clone(),
+        };
+        assert!(!tray.watcher_offline(ksni::OfflineReason::No));
+        assert!(!online.load(Ordering::Acquire));
     }
 
     #[test]

@@ -46,7 +46,9 @@ use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::raw_window_handle::{
+    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+};
 use winit::window::{Window, WindowId};
 
 use crate::compose::{PipSpec, Scene};
@@ -102,6 +104,13 @@ fn wake() {
 pub fn push(c: Cmd) {
     QUEUE.lock().unwrap().push(c);
     wake();
+}
+
+/// The actual winit backend, not the session environment (XWayland can have
+/// WAYLAND_DISPLAY set too). Initialized before any app windows are opened.
+static WAYLAND: AtomicBool = AtomicBool::new(false);
+pub(crate) fn wayland() -> bool {
+    WAYLAND.load(Ordering::Relaxed)
 }
 
 /// `REC_GUI_HIDDEN`: start without opening the window (a login item, and the
@@ -427,6 +436,42 @@ pub(crate) fn exclusion_is_done_by_capture(
     matches!(backend, Ok(crate::capture::screen::Backend::X11))
 }
 
+/// What closing (or Ctrl+W) does on this session (1E): keep running in the
+/// tray, or quit when nothing would show the window again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HideAction {
+    /// Wayland cannot hide a window (`winit::Window::set_visible` is a no-op
+    /// there): destroy it and recreate it on show.
+    DestroyWindow,
+    /// X11: hide it in place.
+    SetInvisible,
+    /// No tray host: the window is the only way back, so closing quits.
+    Quit,
+}
+
+pub(crate) fn hide_action(on_wayland: bool, tray_available: bool) -> HideAction {
+    if !tray_available {
+        HideAction::Quit
+    } else if on_wayland {
+        HideAction::DestroyWindow
+    } else {
+        HideAction::SetInvisible
+    }
+}
+
+/// Whether a camera scene's camera has not delivered a frame: the preview
+/// would be black with no explanation (1B's portal path can fail after the
+/// session started, and a camera that never opens looks the same).
+pub(crate) fn camera_not_delivering(live: bool, has_aspect: bool, elapsed: Duration) -> bool {
+    live && !has_aspect && elapsed >= Duration::from_secs(5)
+}
+
+/// Whether closing should explain itself: once, only when the app keeps
+/// running (a quit needs no explanation).
+pub(crate) fn should_notify_hidden(already_notified: bool, action: HideAction) -> bool {
+    !already_notified && matches!(action, HideAction::DestroyWindow | HideAction::SetInvisible)
+}
+
 /// Whether the main window must be hidden for a recording (G3): a display or
 /// region capture that cannot exclude Rec's own window would film the preview;
 /// a single-window capture cannot contain it, the user can turn the behaviour
@@ -487,6 +532,166 @@ fn load_devices(st: &mut State) {
         .collect();
 }
 
+struct CaptureHide {
+    windows: Vec<WindowId>,
+    sync: Option<WaylandSync>,
+    deadline: Instant,
+}
+
+impl CaptureHide {
+    fn destroyed(&mut self, id: WindowId) {
+        self.windows.retain(|w| *w != id);
+    }
+
+    fn ready_to_sync(&self, now: Instant) -> Result<bool> {
+        anyhow::ensure!(
+            now < self.deadline,
+            "timed out waiting for Wayland window destruction/sync"
+        );
+        Ok(self.windows.is_empty())
+    }
+}
+
+/// A nonblocking wl_display.sync on winit's libwayland connection. A private
+/// event queue avoids dispatching winit callbacks reentrantly. Winit reads the
+/// socket; we dispatch only our callback. No second Wayland connection is used.
+///
+/// This acknowledges processing of destruction requests, NOT presentation of a
+/// new desktop frame, nor draining frames already queued by a portal backend.
+struct WaylandSync {
+    _display: winit::event_loop::OwnedDisplayHandle,
+    library: *mut libc::c_void,
+    display: *mut libc::c_void,
+    queue: *mut libc::c_void,
+    callback: *mut libc::c_void,
+    done: Box<bool>,
+    dispatch: unsafe extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> libc::c_int,
+    flush: unsafe extern "C" fn(*mut libc::c_void) -> libc::c_int,
+    destroy_proxy: unsafe extern "C" fn(*mut libc::c_void),
+    destroy_queue: unsafe extern "C" fn(*mut libc::c_void),
+}
+
+impl WaylandSync {
+    fn new(el: &ActiveEventLoop) -> Result<Self> {
+        let owned = el.owned_display_handle();
+        let RawDisplayHandle::Wayland(display) = owned.display_handle()?.as_raw() else {
+            anyhow::bail!("winit is not using Wayland");
+        };
+        // SAFETY: winit 0.30 uses wayland-backend/client_system; its raw display
+        // is a libwayland wl_display. The owned handle keeps it alive. All calls
+        // and callback dispatch happen on the event-loop thread. Function ABIs
+        // below are from wayland-client-core.h (sync is display opcode 0).
+        unsafe {
+            let library = libc::dlopen(c"libwayland-client.so.0".as_ptr(), libc::RTLD_NOW);
+            anyhow::ensure!(!library.is_null(), "could not load libwayland-client");
+            macro_rules! symbol {
+                ($name:literal) => {{
+                    let p = libc::dlsym(library, $name.as_ptr());
+                    if p.is_null() {
+                        libc::dlclose(library);
+                        anyhow::bail!("missing libwayland symbol");
+                    }
+                    p
+                }};
+                ($name:literal, $ty:ty) => {{ std::mem::transmute::<*mut libc::c_void, $ty>(symbol!($name)) }};
+            }
+            type Ptr = *mut libc::c_void;
+            let create_queue =
+                symbol!(c"wl_display_create_queue", unsafe extern "C" fn(Ptr) -> Ptr);
+            let create_wrapper =
+                symbol!(c"wl_proxy_create_wrapper", unsafe extern "C" fn(Ptr) -> Ptr);
+            let destroy_wrapper = symbol!(c"wl_proxy_wrapper_destroy", unsafe extern "C" fn(Ptr));
+            let set_queue = symbol!(c"wl_proxy_set_queue", unsafe extern "C" fn(Ptr, Ptr));
+            let marshal = symbol!(
+                c"wl_proxy_marshal_constructor",
+                unsafe extern "C" fn(Ptr, u32, Ptr, ...) -> Ptr
+            );
+            let add_listener = symbol!(
+                c"wl_proxy_add_listener",
+                unsafe extern "C" fn(Ptr, *const unsafe extern "C" fn(), Ptr) -> libc::c_int
+            );
+            let interface = symbol!(c"wl_callback_interface");
+            let mut sync = Self {
+                _display: owned,
+                library,
+                display: display.display.as_ptr(),
+                queue: std::ptr::null_mut(),
+                callback: std::ptr::null_mut(),
+                done: Box::new(false),
+                dispatch: symbol!(
+                    c"wl_display_dispatch_queue_pending",
+                    unsafe extern "C" fn(Ptr, Ptr) -> libc::c_int
+                ),
+                flush: symbol!(
+                    c"wl_display_flush",
+                    unsafe extern "C" fn(Ptr) -> libc::c_int
+                ),
+                destroy_proxy: symbol!(c"wl_proxy_destroy", unsafe extern "C" fn(Ptr)),
+                destroy_queue: symbol!(c"wl_event_queue_destroy", unsafe extern "C" fn(Ptr)),
+            };
+            sync.queue = create_queue(sync.display);
+            anyhow::ensure!(!sync.queue.is_null(), "could not create Wayland sync queue");
+            let wrapper = create_wrapper(sync.display);
+            anyhow::ensure!(!wrapper.is_null(), "could not wrap Wayland display");
+            set_queue(wrapper, sync.queue);
+            sync.callback = marshal(wrapper, 0, interface, std::ptr::null_mut::<libc::c_void>());
+            destroy_wrapper(wrapper);
+            anyhow::ensure!(
+                !sync.callback.is_null(),
+                "could not create Wayland sync callback"
+            );
+            unsafe extern "C" fn done(data: Ptr, _: Ptr, _: u32) {
+                // SAFETY: data points to the stable Box until proxy destruction.
+                unsafe {
+                    *data.cast::<bool>() = true;
+                }
+            }
+            static LISTENER: [unsafe extern "C" fn(Ptr, Ptr, u32); 1] = [done];
+            anyhow::ensure!(
+                add_listener(
+                    sync.callback,
+                    LISTENER.as_ptr().cast(),
+                    (&mut *sync.done as *mut bool).cast()
+                ) == 0,
+                "could not attach Wayland sync listener"
+            );
+            Ok(sync)
+        }
+    }
+
+    fn poll(&mut self) -> Result<bool> {
+        // SAFETY: see new(); these objects remain live until Drop.
+        unsafe {
+            let rc = (self.flush)(self.display);
+            anyhow::ensure!(
+                rc >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN),
+                "could not flush Wayland sync"
+            );
+            anyhow::ensure!(
+                (self.dispatch)(self.display, self.queue) >= 0,
+                "Wayland sync dispatch failed"
+            );
+        }
+        Ok(*self.done)
+    }
+}
+
+impl Drop for WaylandSync {
+    fn drop(&mut self) {
+        // SAFETY: only our callback/queue are destroyed, not winit's display.
+        // Destroying the proxy also makes a late callback harmless on timeout.
+        unsafe {
+            if !self.callback.is_null() {
+                (self.destroy_proxy)(self.callback);
+            }
+            if !self.queue.is_null() {
+                (self.destroy_queue)(self.queue);
+            }
+            libc::dlclose(self.library);
+        }
+    }
+}
+
 struct App {
     gpu: Option<Gpu>,
     main: Option<Win>,
@@ -498,12 +703,20 @@ struct App {
     /// The main window was hidden for the running recording (G3): a capture
     /// that cannot exclude Rec's window would film it. Restored on stop.
     hidden_for_recording: bool,
+    /// Wait for winit's deferred destruction, then a same-connection wl_display.sync.
+    capture_hide: Option<CaptureHide>,
     /// The screen is locked (G8): nothing is drawn and no preview frames are
     /// converted until it is unlocked.
     screen_locked: bool,
     /// The main window is covered or minimized (winit's occlusion event, which
     /// Wayland often does not send).
     main_occluded: bool,
+    /// The main window's last logical size and (X11 only) position, to reopen
+    /// where it was after a Wayland destroy.
+    main_size: (f64, f64),
+    main_pos: Option<(i32, i32)>,
+    /// The "no camera frames" warning was shown for the running session.
+    camera_warned: bool,
     /// The lock watcher (G8), if a bus answered.
     lock: Option<lock::LockWatcher>,
     /// The device lists as last seen, to ignore a watch event that changes
@@ -513,10 +726,10 @@ struct App {
     _camera_watch: Option<crate::capture::camera::DeviceWatch>,
     _audio_watch: Option<crate::capture::audio::DeviceWatch>,
     st: State,
-    tray: Option<ksni::blocking::Handle<tray::Tray>>,
+    tray: Option<tray::Handle>,
     /// The tray starts on a thread: registering the status item talks to D-Bus,
     /// and a slow (or missing) watcher must not hold up the first frame.
-    tray_rx: Option<Receiver<Option<ksni::blocking::Handle<tray::Tray>>>>,
+    tray_rx: Option<Receiver<Option<tray::Handle>>>,
     tap: preview::Tap,
     tap_sink: FrameSink,
     /// Where the writer's compositor publishes its texture (G10), and the sink
@@ -596,8 +809,12 @@ impl App {
             main_visible: true,
             quitting: false,
             hidden_for_recording: false,
+            capture_hide: None,
             screen_locked: false,
             main_occluded: false,
+            main_size: (1040.0, 660.0),
+            main_pos: None,
+            camera_warned: false,
             device_fingerprint,
             st,
             tray: None,
@@ -753,24 +970,35 @@ impl App {
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
         if self.main.is_none() {
-            // REC_MAIN_SIZE=WxH or full: open at this size or fullscreen
-            // (layout checks and screenshots).
+            // REC_MAIN_SIZE=WxH or full overrides the remembered size (layout
+            // checks and screenshots). A window destroyed on hide reopens where
+            // it was; Wayland lets the compositor place it, an X11 position is
+            // honoured.
             let size = std::env::var("REC_MAIN_SIZE")
                 .ok()
                 .and_then(|v| {
                     v.split_once('x')
                         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                 })
-                .unwrap_or((1040.0, 660.0));
+                .unwrap_or(self.main_size);
             let w = self.open_window(el, "Rec", size, (860.0, 560.0));
+            if let Some((x, y)) = self.main_pos {
+                w.window
+                    .set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
             if std::env::var("REC_MAIN_SIZE").as_deref() == Ok("full") {
                 w.window
                     .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
             }
             self.main = Some(w);
+            if std::env::var_os("REC_DEBUG").is_some() {
+                eprintln!("rec: debug: window created ({:?})", self.main_size);
+            }
         }
         if let Some(w) = &self.main {
-            w.window.set_visible(true);
+            if !wayland() {
+                w.window.set_visible(true);
+            }
             if !background() {
                 w.window.focus_window();
             }
@@ -781,15 +1009,70 @@ impl App {
         self.sync_preview();
     }
 
+    /// Hide the main window. On Wayland `set_visible(false)` is a no-op, so the
+    /// window (surface, egui state, preview textures) is destroyed and recreated
+    /// by [`show_main`](App::show_main); X11 hides it in place.
     fn hide_main(&mut self) {
         if let Some(w) = &self.main {
-            w.window.set_visible(false);
+            self.main_size = {
+                let s = w
+                    .window
+                    .inner_size()
+                    .to_logical::<f64>(w.window.scale_factor());
+                (s.width, s.height)
+            };
+            self.main_pos = w.window.outer_position().ok().map(|p| (p.x, p.y));
+            if !wayland() {
+                w.window.set_visible(false);
+                self.main_size = (
+                    w.window.inner_size().width as f64,
+                    w.window.inner_size().height as f64,
+                );
+            }
+        }
+        if wayland() {
+            // Drop the window and everything that belongs to it; the app state
+            // (settings, sessions, tray) stays.
+            self.main = None;
+            if std::env::var_os("REC_DEBUG").is_some() {
+                eprintln!("rec: debug: window destroyed (Wayland cannot hide it)");
+            }
         }
         self.main_visible = false;
         // Nothing is drawn while the window is hidden: the tap drops frames.
         self.update_tap_wanted();
         self.st.preview_frame = None;
         self.sync_preview();
+    }
+
+    /// The close button / Ctrl+W: hide to the tray, or quit when no tray host
+    /// exists (otherwise the app would be unreachable). Wayland destroys the
+    /// window; the first close explains itself once.
+    fn close_or_hide(&mut self, el: &ActiveEventLoop) {
+        let action = hide_action(wayland(), self.tray_available());
+        if action == HideAction::Quit {
+            if std::env::var_os("REC_DEBUG").is_some() {
+                eprintln!("rec: debug: no tray host; closing quits");
+            }
+            self.handle(el, Cmd::Quit);
+            return;
+        }
+        let notify = should_notify_hidden(self.st.settings.notifies_when_hidden, action);
+        self.hide_main();
+        if notify {
+            self.st.settings.notifies_when_hidden = true;
+            let _ = self.st.settings.save();
+            linux_desktop::notify(
+                "Rec",
+                "Rec is still running in the background; quit it from the tray.",
+            );
+        }
+    }
+
+    /// Only a confirmed, still-online registration is a way back to the app.
+    /// A pending, failed or disconnected startup channel is never a tray host.
+    fn tray_available(&self) -> bool {
+        self.tray.as_ref().is_some_and(tray::Handle::available)
     }
 
     fn show_settings(&mut self, el: &ActiveEventLoop) {
@@ -980,7 +1263,8 @@ impl App {
         // window is closed.
         let want = (self.main_visible || self.live_wanted())
             && self.st.recording.is_none()
-            && !self.st.finishing;
+            && !self.st.finishing
+            && self.capture_hide.is_none();
         // Overlay changes are applied live (`apply_pip`), not by restarting.
         let stale = self.st.preview_settings.as_ref().map(Settings::capture_key)
             != Some(self.st.settings.capture_key());
@@ -1019,18 +1303,18 @@ impl App {
         }
     }
 
-    fn toggle_recording(&mut self) {
-        if self.st.finishing {
+    fn toggle_recording(&mut self, el: &ActiveEventLoop) {
+        if self.st.finishing || self.capture_hide.is_some() {
             return;
         }
         if self.st.recording.is_some() {
             self.stop_recording();
         } else {
-            self.start_recording();
+            self.start_recording(el);
         }
     }
 
-    fn start_recording(&mut self) {
+    fn start_recording(&mut self, el: &ActiveEventLoop) {
         // One capture session at a time: the recording feeds the preview and
         // takes over its camera, already exposed for the room.
         let mut cam = self.st.spare_cam.take();
@@ -1040,6 +1324,34 @@ impl App {
         }
         self.st.preview_settings = None;
         self.st.error = None;
+        // G3: the window must be off the screen before the first frame is
+        // captured, so hide it here, not after the session started.
+        if hides_window_for_recording(
+            &self.st.settings,
+            self.main_visible,
+            Self::capture_excludes_ours(),
+        ) {
+            if wayland() {
+                self.capture_hide = Some(CaptureHide {
+                    windows: [self.main.as_ref(), self.settings_win.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|w| w.window.id())
+                        .collect(),
+                    sync: None,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                });
+            }
+            self.hide_window_for_recording();
+        }
+        self.st.spare_cam = cam;
+        if self.capture_hide.is_none() {
+            self.finish_start_recording(el);
+        }
+    }
+
+    fn finish_start_recording(&mut self, el: &ActiveEventLoop) {
+        let cam = self.st.spare_cam.take();
         let file = self.st.settings.new_output_file();
         // The capture reads the exclusion list when it opens, so the recording
         // (which replaces the preview's capture) gets the current windows.
@@ -1063,20 +1375,11 @@ impl App {
                 self.start_recorder_socket();
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
-                // G3: a display (or region) capture includes Rec's own window
-                // unless it is hidden; a single-window capture cannot.
-                if hides_window_for_recording(
-                    &self.st.settings,
-                    self.main_visible,
-                    Self::capture_excludes_ours(),
-                ) {
-                    self.hide_window_for_recording();
-                }
             }
             Err(e) => {
                 eprintln!("rec: could not start recording: {e:#}");
                 self.st.error = Some(format!("Could not start recording: {e:#}"));
-                self.restore_after_recording();
+                self.restore_after_recording(el);
                 self.sync_preview();
             }
         }
@@ -1168,9 +1471,24 @@ impl App {
         }
     }
 
-    /// Hide the main window for the running recording, and say so (G3).
+    /// Hide the main window *before* the capture starts, and say so (G3).
+    ///
+    /// Wayland destruction is deferred by winit. `poll_capture_hide` waits for
+    /// Destroyed events and then syncs the *same* display connection before
+    /// opening capture. Portal setup on a different connection is not a fence.
     fn hide_window_for_recording(&mut self) {
+        if !self.main_visible {
+            return;
+        }
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!(
+                "rec: debug: hiding own window for the recording (the portal cannot exclude it)"
+            );
+        }
         self.hide_main();
+        // The settings window is Rec's own window too: it would be filmed as
+        // well (the portal cannot exclude either), so it closes here.
+        self.settings_win = None;
         self.hidden_for_recording = true;
         let message = "Rec's window is hidden while recording, because a screen capture would \
                        film it. Open it from the tray.";
@@ -1181,15 +1499,41 @@ impl App {
         // (`set_excluded_windows`); hiding is the portal's only exclusion.
     }
 
-    /// Bring the window back after a recording that hid it (G3).
-    fn restore_after_recording(&mut self) {
+    fn poll_capture_hide(&mut self, el: &ActiveEventLoop) {
+        let Some(hide) = &mut self.capture_hide else {
+            return;
+        };
+        let result = (|| -> Result<bool> {
+            if !hide.ready_to_sync(Instant::now())? {
+                return Ok(false);
+            }
+            if hide.sync.is_none() {
+                // winit sends Destroyed only AFTER dropping WindowState, which
+                // queues xdg_toplevel/xdg_surface/wl_surface destruction.
+                hide.sync = Some(WaylandSync::new(el)?);
+            }
+            hide.sync.as_mut().unwrap().poll()
+        })();
+        match result {
+            Ok(false) => (),
+            Ok(true) => {
+                self.capture_hide = None;
+                self.finish_start_recording(el);
+            }
+            Err(e) => {
+                self.capture_hide = None;
+                self.st.error = Some(format!("Could not hide window before recording: {e:#}"));
+                self.restore_after_recording(el);
+            }
+        }
+    }
+
+    /// Bring the window back after a recording that hid it (G3): a window
+    /// destroyed on hide is recreated here.
+    fn restore_after_recording(&mut self, el: &ActiveEventLoop) {
         if self.hidden_for_recording {
             self.hidden_for_recording = false;
-            if let Some(w) = &self.main {
-                w.window.set_visible(true);
-            }
-            self.main_visible = true;
-            self.update_tap_wanted();
+            self.show_main(el);
         }
     }
 
@@ -1293,8 +1637,14 @@ impl App {
     }
 
     fn handle(&mut self, el: &ActiveEventLoop, c: Cmd) {
+        // Reopening a window during the fence would invalidate the exclusion.
+        // Treat an explicit show request as cancellation of the pending start.
+        if matches!(c, Cmd::ShowWindow | Cmd::ShowSettings) && self.capture_hide.is_some() {
+            self.capture_hide = None;
+            self.restore_after_recording(el);
+        }
         match c {
-            Cmd::ToggleRecording => self.toggle_recording(),
+            Cmd::ToggleRecording => self.toggle_recording(el),
             Cmd::TogglePause => self.toggle_pause(),
             Cmd::Pause => {
                 if let Some(s) = &self.st.recording {
@@ -1307,7 +1657,7 @@ impl App {
                 }
             }
             Cmd::ShowWindow => self.show_main(el),
-            Cmd::HideWindow => self.hide_main(),
+            Cmd::HideWindow => self.close_or_hide(el),
             Cmd::ShowSettings => self.show_settings(el),
             Cmd::CloseSettings => self.settings_win = None,
             Cmd::RevealLast => {
@@ -1327,6 +1677,7 @@ impl App {
     /// Periodic work: commands, signals, finished recordings, failures, tray,
     /// meters.
     fn tick(&mut self, el: &ActiveEventLoop) {
+        self.poll_capture_hide(el);
         if self.quitting {
             return;
         }
@@ -1359,7 +1710,7 @@ impl App {
         if let Some((file, r)) = done {
             self.st.finishing = false;
             self.stop_recorder_socket();
-            self.restore_after_recording();
+            self.restore_after_recording(el);
             match r {
                 Ok(_) => {
                     self.st.last_file = Some(file.clone());
@@ -1441,6 +1792,22 @@ impl App {
                 }
             }
         }
+        // A camera scene whose camera never delivers: say so once instead of
+        // showing a black preview (1B's portal path can fail late).
+        if self.st.settings.scene.uses_cam()
+            && !self.camera_warned
+            && let Some(sess) = self.st.recording.as_ref().or(self.st.preview.as_ref())
+            && camera_not_delivering(true, sess.cam_aspect().is_some(), sess.started.elapsed())
+        {
+            self.camera_warned = true;
+            self.st.error = Some(
+                "The camera is not delivering frames; check the camera (and the camera portal in Flatpak)."
+                    .into(),
+            );
+        }
+        if self.st.preview.is_none() && self.st.recording.is_none() {
+            self.camera_warned = false;
+        }
         // G8: the screen lock stops the preview (the recording keeps going).
         let locked = self.lock.as_ref().is_some_and(|l| l.locked());
         if locked != self.screen_locked {
@@ -1479,14 +1846,25 @@ impl App {
             updates: self.st.updates,
             hotkey_ok: self.st.hotkey_ok,
         };
-        if let Some(rx) = &self.tray_rx
-            && let Ok(handle) = rx.try_recv()
-        {
-            self.tray_rx = None;
-            self.tray = handle;
+        if let Some(handle) = tray::poll_start(&mut self.tray_rx) {
+            self.tray = Some(handle);
         }
         if let Some(t) = &self.tray {
-            tray::update(t, view);
+            if t.available() {
+                tray::update(t, view);
+            } else {
+                self.tray = None;
+                // A hidden app must not become unreachable when its host dies.
+                // Don't undo the deliberate capture hide (that would film Rec),
+                // or the explicit headless/background modes.
+                if !self.main_visible
+                    && !self.hidden_for_recording
+                    && !background()
+                    && std::env::var_os("REC_GUI_HIDDEN").is_none()
+                {
+                    self.show_main(el);
+                }
+            }
         }
         while let Ok(c) = self.recorder_rx.try_recv() {
             let cmd = match c {
@@ -1511,6 +1889,7 @@ impl App {
                     }
                 }
                 Control::ToggleRecording => Cmd::ToggleRecording,
+                Control::Hide => Cmd::HideWindow,
                 Control::Stop => {
                     if self.st.recording.is_some() {
                         Cmd::ToggleRecording
@@ -1684,6 +2063,8 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        use winit::platform::wayland::ActiveEventLoopExtWayland;
+        WAYLAND.store(el.is_wayland(), Ordering::Relaxed);
         if self.main.is_some() {
             return;
         }
@@ -1711,6 +2092,7 @@ impl ApplicationHandler for App {
             .name("rec-tray-start".into())
             .spawn(move || {
                 let _ = tx.send(tray::start(view, Arc::new(push)));
+                wake();
             })
             .ok();
         self.tray_rx = Some(rx);
@@ -1756,6 +2138,11 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if matches!(event, WindowEvent::Destroyed)
+            && let Some(hide) = &mut self.capture_hide
+        {
+            hide.destroyed(id);
+        }
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == id);
         let win = if is_main {
             self.main.as_mut()
@@ -1767,7 +2154,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 if is_main {
-                    self.hide_main();
+                    // Close hides to the tray (quitting when nothing hosts it);
+                    // Wayland destroys the window instead of hiding it.
+                    self.close_or_hide(el);
                 } else {
                     self.settings_win = None;
                 }
@@ -1862,6 +2251,7 @@ impl App {
     /// Destroy the windows (their surfaces, renderers and egui contexts) while
     /// the event loop is still running: a Wayland surface must not outlive it.
     fn close_windows(&mut self) {
+        self.capture_hide = None;
         self.st.preview_frame = None;
         self.st.preview_px = [0, 0];
         self.settings_win = None;
@@ -1963,6 +2353,99 @@ pub fn run(
 mod tests {
     use super::*;
 
+    /// Run under headless sway with WAYLAND_DISPLAY set. Exercises the real
+    /// winit deferred drop and the libwayland callback ABI, not presentation.
+    #[test]
+    #[ignore = "requires a running Wayland compositor"]
+    fn capture_fence_on_winit_connection() {
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        struct Check {
+            hide: Option<CaptureHide>,
+            acknowledged: bool,
+        }
+        impl ApplicationHandler for Check {
+            fn resumed(&mut self, el: &ActiveEventLoop) {
+                let window = el.create_window(Window::default_attributes()).unwrap();
+                self.hide = Some(CaptureHide {
+                    windows: vec![window.id()],
+                    sync: None,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                });
+                drop(window);
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+                if matches!(event, WindowEvent::Destroyed) {
+                    self.hide.as_mut().unwrap().destroyed(id);
+                }
+            }
+            fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+                let hide = self.hide.as_mut().unwrap();
+                if hide
+                    .ready_to_sync(Instant::now())
+                    .expect("destruction/sync timed out")
+                {
+                    if hide.sync.is_none() {
+                        hide.sync = Some(WaylandSync::new(el).unwrap());
+                    }
+                    if hide.sync.as_mut().unwrap().poll().unwrap() {
+                        self.acknowledged = true;
+                        self.hide = None;
+                        el.exit();
+                        return;
+                    }
+                }
+                el.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(10),
+                ));
+            }
+        }
+        let el = EventLoop::builder()
+            .with_wayland()
+            .with_any_thread(true)
+            .build()
+            .unwrap();
+        let mut check = Check {
+            hide: None,
+            acknowledged: false,
+        };
+        el.run_app(&mut check).unwrap();
+        assert!(check.acknowledged);
+    }
+
+    #[test]
+    fn capture_fence_waits_for_both_destroyed_windows() {
+        let now = Instant::now();
+        let main = WindowId::from(1);
+        let settings = WindowId::from(2);
+        let mut hide = CaptureHide {
+            windows: vec![main, settings],
+            sync: None,
+            deadline: now + Duration::from_secs(5),
+        };
+        assert!(!hide.ready_to_sync(now).unwrap());
+        hide.destroyed(WindowId::from(3));
+        hide.destroyed(main);
+        assert!(!hide.ready_to_sync(now).unwrap());
+        hide.destroyed(main); // duplicate events cannot advance the fence
+        assert!(!hide.ready_to_sync(now).unwrap());
+        hide.destroyed(settings);
+        assert!(hide.ready_to_sync(now).unwrap());
+        assert!(hide.sync.is_none()); // destruction alone is NOT an acknowledgement
+    }
+
+    #[test]
+    fn capture_fence_times_out_even_after_destruction() {
+        let now = Instant::now();
+        let mut hide = CaptureHide {
+            windows: vec![WindowId::from(1)],
+            sync: None,
+            deadline: now,
+        };
+        assert!(hide.ready_to_sync(now).is_err());
+        hide.destroyed(WindowId::from(1));
+        assert!(hide.ready_to_sync(now).is_err());
+    }
+
     #[test]
     fn the_preview_banner_names_the_phase() {
         // A backend that isn't built says which phase owes it, so the banner is
@@ -2054,6 +2537,51 @@ mod tests {
         let wayland =
             RawWindowHandle::Wayland(WaylandWindowHandle::new(std::ptr::NonNull::dangling()));
         assert_eq!(x11_window_id(&wayland), None);
+    }
+
+    #[test]
+    fn closing_hides_where_it_can_and_quits_without_a_tray() {
+        // Wayland cannot hide a window (winit: set_visible is unsupported), so
+        // closing destroys it and the app keeps running; X11 hides in place; and
+        // with no tray host closing must quit, or nothing could show the window
+        // again.
+        assert_eq!(hide_action(true, true), HideAction::DestroyWindow);
+        assert_eq!(hide_action(false, true), HideAction::SetInvisible);
+        assert_eq!(hide_action(true, false), HideAction::Quit);
+        assert_eq!(hide_action(false, false), HideAction::Quit);
+    }
+
+    #[test]
+    fn the_first_close_explains_itself_once() {
+        // A quit needs no explanation; the first hide does, later ones don't.
+        assert!(should_notify_hidden(false, HideAction::DestroyWindow));
+        assert!(should_notify_hidden(false, HideAction::SetInvisible));
+        assert!(!should_notify_hidden(true, HideAction::DestroyWindow));
+        assert!(!should_notify_hidden(true, HideAction::SetInvisible));
+        assert!(!should_notify_hidden(false, HideAction::Quit));
+        // The flag is remembered in settings.json.
+        let s = Settings {
+            notifies_when_hidden: true,
+            ..Default::default()
+        };
+        let back = crate::settings::Settings::from_json(&serde_json::to_string(&s).unwrap())
+            .expect("valid json");
+        assert!(back.notifies_when_hidden);
+        assert!(!Settings::default().notifies_when_hidden);
+    }
+
+    #[test]
+    fn a_camera_scene_without_frames_says_so() {
+        // A camera that never delivers would otherwise leave a black preview
+        // (1B's portal path can fail after the session started).
+        assert!(camera_not_delivering(true, false, Duration::from_secs(6)));
+        assert!(!camera_not_delivering(true, false, Duration::from_secs(4)));
+        assert!(!camera_not_delivering(true, true, Duration::from_secs(30)));
+        assert!(!camera_not_delivering(
+            false,
+            false,
+            Duration::from_secs(30)
+        ));
     }
 
     #[test]

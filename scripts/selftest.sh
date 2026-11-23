@@ -1148,10 +1148,15 @@ i=0
 while [ ! -S "\$XDG_RUNTIME_DIR/wayland-1" ] && [ \$i -lt 150 ]; do sleep 0.1; i=\$((i+1)); done
 [ -S "\$XDG_RUNTIME_DIR/wayland-1" ] || { kill \$sway_pid; exit 10; }
 export WAYLAND_DISPLAY=wayland-1 REC_DEBUG=1
+export SWAYSOCK="\$XDG_RUNTIME_DIR/sway-ipc.\$(id -u).\$sway_pid.sock"
 export REC_SYNTH_CAM=1 REC_SYNTH_CAM_SIZE=320x180 REC_SYNTH_CAM_FPS=30
 "$REC" gui --test-pattern --start-recording >"$d/app.log" 2>&1 &
 app=\$!
 sleep 7
+# G3 on Wayland: the window is destroyed before the capture starts, so the
+# compositor must not list it while the recording runs (the second launch below
+# recreates it, so this has to come first).
+swaymsg -s "\$SWAYSOCK" -t get_tree >"$d/tree-recording" 2>/dev/null || exit 11
 # A second launch hands over to the running app instead of starting another.
 "$REC" gui >"$d/second.log" 2>&1 || true
 # ...and a CLI recorder refuses while the app is recording (upstream's rule).
@@ -1168,6 +1173,9 @@ sleep 1
 "$REC" resume >>"$d/controls.log" 2>&1 && echo resumed >>"$d/controls.log" || echo "resume failed" >>"$d/controls.log"
 sleep 1
 "$REC" stop >"$d/stop.out" 2>>"$d/app.log" || true
+# The second launch requested show, so the window should be back by now.
+sleep 1
+swaymsg -s "\$SWAYSOCK" -t get_tree >"$d/tree-after" 2>/dev/null || true
 # A second recording, ended by SIGTERM: quitting must finalize it first (the
 # app prints the file's path on quit).
 "$REC" gui --start-recording --test-pattern >>"$d/second.log" 2>&1 || true
@@ -1200,13 +1208,15 @@ INNER
            "$REC" probe "$quit_file" >"$d/probe-quit.txt" 2>&1 &&
            grep -q "already running" "$d/second.log" 2>/dev/null &&
            grep -qx refused "$d/blocked" 2>/dev/null &&
+           ! grep -q '"name": "Rec"' "$d/tree-recording" 2>/dev/null &&
+           grep -q '"name": "Rec"' "$d/tree-after" 2>/dev/null &&
            grep -q "paused" "$d/controls.log" 2>/dev/null &&
            grep -q "resumed" "$d/controls.log" 2>/dev/null &&
            grep -q "app running" "$d/app.log" 2>/dev/null &&
            grep -q "preview frame" "$d/app.log" 2>/dev/null &&
            grep -q "app exit=0" "$d/exit" 2>/dev/null &&
            [ ! -e "$d/rt/rec-rs.pid" ]; then
-            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), second launch handed over, a second recorder refused, pause/resume/stop via the CLI, clean exit)"
+            echo "PASS  gui  ($frames frames then $quit_frames on SIGTERM, $(grep -c '^track' "$d/probe.txt") tracks, preview shown ($(grep -m1 -o 'preview frame [0-9]*x[0-9]*' "$d/app.log")), window absent while recording and shown after second launch, second launch handed over, a second recorder refused, pause/resume/stop via the CLI, clean exit)"
             pass=$((pass+1))
         else
             echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"
