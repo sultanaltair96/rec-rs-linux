@@ -318,7 +318,7 @@ What runs headless in the dev container, on every `scripts/selftest.sh` run:
 
 | Case | Session | Proves |
 |---|---|---|
-| `pattern-screen` | sway (wlroots, headless 1280x720) + xdg-desktop-portal-wlr + PipeWire | the whole Wayland pipeline: picker → PipeWire node → 1280x720 BGRA frames at a constant 60 fps, all 180 frames different (a terminal scrolling in the capture), `probe` and a full ffmpeg decode clean, and a 0600 restore token stored |
+| `pattern-screen` | sway (wlroots, headless 1280x720) + xdg-desktop-portal-wlr + PipeWire | the whole Wayland pipeline: picker → PipeWire node → 1280x720 BGRA frames at a constant 60 fps, all 180 frames different (a terminal scrolling in the capture), `probe` and a full ffmpeg decode clean, and a 0600 restore token stored. The harness first records one second of its own, so the case only starts once a real frame arrived |
 | `screen-region` | same | `--region` crops the shared monitor to 640x480 native pixels (not a scaled 16:9 frame) |
 | `screen-token` | same | `permissions --request` forgets the stored grant so the dialog runs again (the harness chooser log proves the second picker ran), stores a 0600 grant; a corrupted token is ignored with a message and the recording still happens |
 | `screen-x11` | Xvfb 1280x800 | RandR enumeration (`devices` lists `[1]`), a root-window capture at the native size with motion, no portal involved |
@@ -352,6 +352,17 @@ under a compositor, screen lock and a revoked grant are in
   The log names the monitor that was picked when XWayland's monitor list identifies it.
 - **Window substring matching on Wayland.** The same: the picker owns it, and
   xdg-desktop-portal-wlr does not offer window sources at all (it says so and suggests `--region`).
+- **A screen-cast session that never negotiates.** Under load (and once in the self-test's own
+  history) a desktop's portal session can come up poisoned: the stream connects and reaches `Paused`,
+  but PipeWire never delivers a single `param` — no format, no buffer — and every node and every
+  portal session of that stack behaves the same until the stack is replaced (wlr's own log still
+  shows its stream `paused`/`streaming`, so the compositor is fine). `resolve` gives the first session
+  2 s, then asks the portal for a fresh one (silent, the restore token) with 5 s, and if that also
+  never negotiates it fails with a clear message instead of recording three seconds of nothing.
+  `REC_DEBUG=1` prints the stream state transitions, the param ids and the first buffer, which is
+  how this was diagnosed. The self-test harness waits for a real captured frame before running a
+  case and retries a session that never produced one, so the failure is a retried pass rather than a
+  flaky case.
 - **Own windows in the picture.** `set_excluded_windows` lets the app leave its own windows out. On
   X11 that works: their visible parts (occluded by anything stacked above them) are filled with the
   desktop colour sampled around them. What is really *beneath* a mapped window is not readable — no

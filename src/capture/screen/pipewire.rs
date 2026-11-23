@@ -59,8 +59,18 @@ use super::format::{self, Rect, pts_secs};
 /// are dropped.
 const QUEUE: usize = 3;
 
-/// How long a probe waits for the compositor to offer a format.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the first probe waits for the compositor to offer a format.
+///
+/// Short on purpose: a node that offers none is a node whose stream never got
+/// its params through (measured under load: our stream reaches `Paused` and
+/// receives no `param` at all, on every connection, until the whole portal and
+/// PipeWire session is replaced). The portal session is what has to be replaced
+/// first, so waiting here only delays that.
+pub const PROBE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the probe of the *second* session waits: a fresh handshake deserves
+/// more patience before a recording is refused.
+pub const PROBE_RETRY_WAIT: Duration = Duration::from_secs(5);
 
 /// Longest cursor bitmap edge we accept. A cursor is 24-64 px.
 const MAX_CURSOR: usize = 256;
@@ -128,6 +138,8 @@ struct StreamData {
     error: Arc<Mutex<Option<String>>>,
     /// Warned already that the compositor sends positions but no bitmap.
     warned_no_bitmap: bool,
+    /// A buffer has been seen (debug log once).
+    saw_buffer: bool,
     /// The probe leaves the loop as soon as a format arrived.
     quit_on_format: Option<pw::main_loop::MainLoopRc>,
     /// Leaves the loop when the stream fails, so a dead capture does not sit in
@@ -306,6 +318,7 @@ fn run(
         cursor: None,
         error: error.clone(),
         warned_no_bitmap: false,
+        saw_buffer: false,
         quit_on_format: None,
         quit_on_error: Some(main.clone()),
         probe_done: None,
@@ -314,7 +327,10 @@ fn run(
         .add_local_listener_with_user_data(data)
         .param_changed(on_param_changed)
         .process(on_process)
-        .state_changed(|_, data, _, new| {
+        .state_changed(|_, data, old, new| {
+            if super::debug() {
+                eprintln!("rec: debug: screen stream {old:?} -> {new:?}");
+            }
             if let pw::stream::StreamState::Error(e) = new {
                 set_error(&data.error, format!("PipeWire stream error: {e}"));
                 // A dead stream is not worth waiting in `run()` for.
@@ -326,7 +342,13 @@ fn run(
         .register()
         .context("registering the stream listener")?;
     connect_stream(&stream, node_id)?;
+    if super::debug() {
+        eprintln!("rec: debug: screen stream connected to node {node_id}");
+    }
     main.run();
+    if super::debug() {
+        eprintln!("rec: debug: screen stream loop left run()");
+    }
     drop(listener);
     let _ = stream.disconnect();
     Ok(())
@@ -498,6 +520,13 @@ fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
     }
     let mut copy = vec![0u8; plane];
     copy.copy_from_slice(&bytes[offset..offset + plane]);
+    if super::debug() && !data.saw_buffer {
+        data.saw_buffer = true;
+        eprintln!(
+            "rec: debug: first screen buffer {width}x{height} stride {stride} plane {plane} \
+             (chunk offset {offset}, pts {pts:.3})"
+        );
+    }
     let raw = RawFrame {
         pts,
         width,
@@ -669,7 +698,12 @@ fn format_pods() -> Vec<Vec<u8>> {
 /// portal's own `size` field is in the compositor's (logical) coordinate space
 /// and can be half the pixels on a HiDPI desktop. The caller passes a duplicate
 /// of the portal's fd, so the same remote is used again for the real capture.
-pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
+pub fn probe_size(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize)> {
+    probe_once(fd, node_id, wait)
+}
+
+/// One probe connection: connect, wait for a format, disconnect.
+fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize)> {
     pw::init();
     let main = pw::main_loop::MainLoopRc::new(None).context("creating the PipeWire main loop")?;
     let context =
@@ -678,6 +712,9 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
         .connect_fd_rc(fd, None)
         .map_err(|e| anyhow!("connecting to the portal's PipeWire remote: {e}"))?;
     let stream = new_stream(&core)?;
+    if super::debug() {
+        eprintln!("rec: debug: probe connecting to node {node_id} (wait {wait:?})");
+    }
     let size = Arc::new(Mutex::new(None::<(usize, usize)>));
     let error = Arc::new(Mutex::new(None::<String>));
     let (tx, _rx) = sync_channel(1);
@@ -696,15 +733,23 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
         cursor: None,
         error: error.clone(),
         warned_no_bitmap: false,
+        saw_buffer: false,
         quit_on_format: Some(main.clone()),
         quit_on_error: Some(main.clone()),
         probe_done: Some(probe_done),
     };
     let size2 = size.clone();
     let error2 = error.clone();
+    let debug_state = super::debug();
     let listener = stream
         .add_local_listener_with_user_data(data)
         .param_changed(move |_, data, id, param| {
+            if debug_state {
+                eprintln!(
+                    "rec: debug: probe param id {id} (value {})",
+                    if param.is_some() { "present" } else { "NULL" }
+                );
+            }
             if !read_format(data, id, param) {
                 return;
             }
@@ -718,7 +763,10 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
                 main.quit();
             }
         })
-        .state_changed(move |_, data, _, new| {
+        .state_changed(move |_, data, old, new| {
+            if debug_state {
+                eprintln!("rec: debug: probe stream {old:?} -> {new:?} (target node {node_id})");
+            }
             if let pw::stream::StreamState::Error(e) = new {
                 set_error(&error2, format!("PipeWire stream error: {e}"));
                 // The watchdog must not keep waiting for a format that will
@@ -741,7 +789,7 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
         // wakes the loop through the channel instead. A message that nobody
         // reads (the loop already left `run()`) is a no-op on a pipe the
         // channel owns.
-        if done_rx.recv_timeout(PROBE_TIMEOUT).is_err() {
+        if done_rx.recv_timeout(wait).is_err() {
             let _ = quit_tx.send(());
         }
     });
@@ -761,9 +809,7 @@ pub fn probe_size(fd: OwnedFd, node_id: u32) -> Result<(usize, usize)> {
     }
     match error.lock().unwrap().take() {
         Some(e) => bail!("the portal's PipeWire stream failed: {e}"),
-        None => bail!(
-            "the portal's PipeWire stream did not offer a video format within {PROBE_TIMEOUT:?}"
-        ),
+        None => bail!("the portal's PipeWire stream did not offer a video format within {wait:?}"),
     }
 }
 
@@ -775,7 +821,8 @@ fn process_frames(
     opts: CaptureOptions,
 ) {
     let mut clicks: Vec<super::cursor::Click> = Vec::new();
-    for raw in rx {
+    let debug = super::debug();
+    for (delivered, raw) in rx.into_iter().enumerate() {
         let mut data = raw.data;
         let mut width = raw.width;
         let mut height = raw.height;
@@ -802,6 +849,9 @@ fn process_frames(
         if opts.clicks && !clicks.is_empty() {
             clicks.retain(|c| raw.pts - c.at < super::cursor::CLICK_LIFE);
             draw_clicks(&mut frame, &clicks, raw.pts);
+        }
+        if debug && delivered == 0 {
+            eprintln!("rec: debug: first screen frame delivered ({width}x{height})");
         }
         sink(VideoFrame {
             pts: raw.pts,

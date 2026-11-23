@@ -27,11 +27,21 @@ if [ "${REC_HEADLESS_SESSION:-}" != "1" ]; then
 fi
 
 # --- paths and cleanup ------------------------------------------------------
+# The runtime directory (sockets, locks, the compositor's display) must be new
+# for every session: one left over from an earlier run holds stale
+# `pipewire-0`/`wayland-1` sockets and the next session comes up poisoned -
+# PipeWire and the portal answer, but no screen-cast format ever reaches a
+# client (seen when this dir was reused).
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/rec-screen-headless.XXXXXX")
 RUNTIME="$TMP/run"
 STATE="$TMP/state"
 CONFIG="$TMP/config"
-LOG="$TMP/log"
+# SCREEN_LOG_DIR keeps the logs (sway, PipeWire, both portal processes, the
+# warm-up and the animation) next to the self-test output, so a flaky case can
+# be diagnosed afterwards. Without it they go to the temp dir whose path is
+# printed. Fresh per run even when kept.
+LOG="${SCREEN_LOG_DIR:-$TMP}/log"
+rm -rf "$LOG"
 mkdir -p "$RUNTIME" "$STATE" "$CONFIG" "$LOG" "$CONFIG/xdg-desktop-portal-wlr"
 chmod 700 "$RUNTIME"
 
@@ -53,6 +63,10 @@ trap stop EXIT INT TERM
 export XDG_RUNTIME_DIR="$RUNTIME"
 export XDG_STATE_HOME="$STATE"
 export XDG_CONFIG_HOME="$CONFIG"
+# WirePlumber and friends keep caches under $XDG_CACHE_HOME; two sessions
+# sharing one would race over them.
+export XDG_CACHE_HOME="$TMP/cache"
+mkdir -p "$XDG_CACHE_HOME"
 export XDG_CURRENT_DESKTOP=sway
 export XDG_SESSION_TYPE=wayland
 export WLR_BACKENDS=headless
@@ -184,6 +198,32 @@ if [ -z "${SCREEN_NO_ANIMATION:-}" ]; then
         >"$LOG/animation.log" 2>&1 &
     pids="$pids $!"
     sleep 1.5
+fi
+
+# --- wait for a real first frame -------------------------------------------
+# Everything above answering on D-Bus is not the same as the compositor
+# capturing: xdg-desktop-portal-wlr can export a stream whose format never
+# negotiates (seen under heavy load), and a recording started then captures
+# nothing for its whole session. So "ready" means a real capture produced real
+# frames: record one second and retry until it does. The restore token this
+# leaves behind also makes the case's own handshake silent.
+if [ -n "${REC_BIN:-}" ] && [ -z "${SCREEN_NO_WARMUP:-}" ]; then
+    warm=0
+    while [ "$warm" -lt "${SCREEN_WARMUP_TRIES:-8}" ]; do
+        warm=$((warm + 1))
+        if "$REC_BIN" record -q -t 1 --no-mic --no-system-audio \
+            -o "$LOG/warmup.mp4" >"$LOG/warmup-$warm.log" 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if [ -f "$LOG/warmup.mp4" ]; then
+        echo "headless: capture warm-up ok after $warm try/tries" >&2
+        rm -f "$LOG/warmup.mp4"
+    else
+        echo "headless: no capture produced frames in $warm tries (see $LOG/warmup-*.log)" >&2
+        exit 1
+    fi
 fi
 
 echo "headless: $WAYLAND_DISPLAY ${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}, portal ready, logs in $LOG" >&2
