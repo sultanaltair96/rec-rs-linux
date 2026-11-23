@@ -52,7 +52,7 @@ case "${1:-}" in
         echo "pattern-4k-long (20 s, RSS bound)"
         echo "tracks audio-tracks sync audio-gaps pause-resume gain h264-bitrate"
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
-        echo "pattern-screen screen-region screen-x11 screen-window screen-token"
+        echo "pattern-screen screen-region screen-x11 screen-window screen-token no-sink"
         echo "opt-in: long-finalize (10 min)"
         echo "pattern-mic pattern-system-audio"
         echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay"
@@ -643,6 +643,14 @@ if wanted compositor; then
     fi
 fi
 
+# --- audio/camera policy (phase 1B) -----------------------------------------
+# G4: a headless session has PipeWire but no sink. `record` must warn about the
+# missing default system audio and still write a file (audio never blocks a
+# session), instead of failing.
+if wanted no-sink; then
+    wanted_no_sink=1
+fi
+
 # --- screen capture (phase 1A) ----------------------------------------------
 # Both real pipelines, headless: a sway desktop with xdg-desktop-portal-wlr (the
 # Wayland path: portal -> PipeWire) and Xvfb (the direct X11 path). Each harness
@@ -698,6 +706,8 @@ screen_test() {
     fi
 }
 
+# G4: the same headless session has no sink; a plain recording must warn and
+# continue (see the wanted_no_sink block below, after REC_ABS is known).
 # Wayland: portal + PipeWire, 1280x720 headless sway, restore token stored.
 screen_test pattern-screen headless.sh portal 1280 720 100
 # Wayland: --region crops the shared monitor (640x480 native pixels).
@@ -799,6 +809,23 @@ later() {
     wanted "$1" || return 0
     echo "SKIP  $1  ($2)"; skip=$((skip+1))
 }
+if [ "${wanted_no_sink:-0}" = 1 ]; then
+    if [ -n "$screen_harness" ]; then
+        if REC_BIN="$REC_ABS" timeout "$TIMEOUT" scripts/screen/headless.sh \
+               "$REC_ABS" record -q -t 2 --no-mic -o "$OUT/no-sink.mp4" \
+               >"$OUT/no-sink.log" 2>&1 \
+           && grep -q 'recording without system audio' "$OUT/no-sink.log" \
+           && [ -s "$OUT/no-sink.mp4" ]; then
+            echo "PASS  no-sink  (no default sink: warned 'recording without system audio' and wrote a file)"
+            pass=$((pass+1))
+        else
+            echo "FAIL  no-sink  (see $OUT/no-sink.log)"; fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  no-sink  (needs sway, Xvfb and dbus-run-session)"; skip=$((skip+1))
+    fi
+fi
+
 later pattern-webcam  "no camera on the CI host (needs a real desktop; PARITY.md has the checklist)"
 later scene-webcam    "needs a real desktop: a camera over the screen (the synthetic one is covered by 'camera')"
 later replay          "phase 1D: replay buffer"
