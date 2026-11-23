@@ -73,11 +73,7 @@ fn stsd() -> Vec<u8> {
 
 fn empty_tables() -> Vec<u8> {
     let mut out = stsd();
-    for (kind, extra) in [
-        (b"stts", 0usize),
-        (b"stsc", 0),
-        (b"stco", 0),
-    ] {
+    for (kind, extra) in [(b"stts", 0usize), (b"stsc", 0), (b"stco", 0)] {
         let mut body = vec![0, 0, 0, 0]; // entry count 0
         body.extend_from_slice(&[0; 0][..extra]);
         out.extend_from_slice(&full_flags(kind, 0, 0, &body));
@@ -102,12 +98,7 @@ fn stbl_with_tables() -> Vec<u8> {
         0,
         &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1],
     ));
-    out.extend_from_slice(&full_flags(
-        b"stsz",
-        0,
-        0,
-        &[0, 0, 0, 10, 0, 0, 0, 2],
-    ));
+    out.extend_from_slice(&full_flags(b"stsz", 0, 0, &[0, 0, 0, 10, 0, 0, 0, 2]));
     out.extend_from_slice(&full_flags(b"stco", 0, 0, &[0, 0, 0, 1, 0, 0, 0x10, 0x00]));
     out
 }
@@ -126,7 +117,7 @@ fn trak(t: &TrackFixture) -> Vec<u8> {
     let mut mdia = mdhd(t.timescale, t.duration);
     mdia.extend_from_slice(&hdlr(&t.handler));
     let mut minf = full_flags(b"vmhd", 0, 1, &[0; 8]);
-    minf.extend_from_slice(&vec![0, 0, 0, 8, b'd', b'i', b'n', b'f']);
+    minf.extend_from_slice(&[0, 0, 0, 8, b'd', b'i', b'n', b'f']);
     let mut stbl = vec![];
     push_box(&mut stbl, b"stbl", &t.tables);
     minf.extend_from_slice(&stbl);
@@ -302,7 +293,10 @@ fn parses_a_moof_the_way_qtmux_writes_it() {
 
 #[test]
 fn a_traf_without_a_data_offset_continues_the_previous_one() {
-    let video: [S; 2] = [(100, 10, opt_flags(true), 0), (100, 10, opt_flags(false), 0)];
+    let video: [S; 2] = [
+        (100, 10, opt_flags(true), 0),
+        (100, 10, opt_flags(false), 0),
+    ];
     let audio: [S; 2] = [(1024, 5, 0, 0), (1024, 6, 0, 0)];
     let trafs = [
         TrafSpec {
@@ -366,9 +360,27 @@ fn tfhd_defaults_and_trex_fill_missing_sample_fields() {
 fn tables_cover_co64_ctts_and_sync_samples() {
     let big = 5u64 << 30; // 5 GiB, above what stco can hold
     let samples = vec![
-        Sample { offset: big, size: 10, duration: 100, cts: 0, sync: true },
-        Sample { offset: big + 10, size: 11, duration: 100, cts: 3, sync: false },
-        Sample { offset: big + 21, size: 12, duration: 101, cts: 3, sync: true },
+        Sample {
+            offset: big,
+            size: 10,
+            duration: 100,
+            cts: 0,
+            sync: true,
+        },
+        Sample {
+            offset: big + 10,
+            size: 11,
+            duration: 100,
+            cts: 3,
+            sync: false,
+        },
+        Sample {
+            offset: big + 21,
+            size: 12,
+            duration: 101,
+            cts: 3,
+            sync: true,
+        },
     ];
     let t = build_tables(&samples);
     assert!(t.co64);
@@ -379,7 +391,10 @@ fn tables_cover_co64_ctts_and_sync_samples() {
     assert_eq!(t.chunks.len(), 1, "contiguous samples form one chunk");
     assert_eq!(t.stsc, vec![(1, 3)]);
     let bytes = stbl_table_boxes(&t, 3);
-    assert!(bytes.windows(4).any(|w| w == b"co64"), "co64 for a 5 GiB offset");
+    assert!(
+        bytes.windows(4).any(|w| w == b"co64"),
+        "co64 for a 5 GiB offset"
+    );
     assert!(!bytes.windows(4).any(|w| w == b"stco"));
     // The offset is there, as a 64-bit value.
     assert!(bytes.windows(8).any(|w| w == big.to_be_bytes()));
@@ -388,8 +403,20 @@ fn tables_cover_co64_ctts_and_sync_samples() {
 #[test]
 fn a_negative_composition_offset_uses_ctts_version_1() {
     let samples = vec![
-        Sample { offset: 0, size: 1, duration: 1, cts: -2, sync: true },
-        Sample { offset: 1, size: 1, duration: 1, cts: 0, sync: true },
+        Sample {
+            offset: 0,
+            size: 1,
+            duration: 1,
+            cts: -2,
+            sync: true,
+        },
+        Sample {
+            offset: 1,
+            size: 1,
+            duration: 1,
+            cts: 0,
+            sync: true,
+        },
     ];
     let t = build_tables(&samples);
     assert_eq!(t.ctts, Some((1, vec![(1, -2), (1, 0)])));
@@ -401,8 +428,20 @@ fn a_negative_composition_offset_uses_ctts_version_1() {
 #[test]
 fn all_sync_samples_need_no_stss() {
     let samples = vec![
-        Sample { offset: 0, size: 4, duration: 1, cts: 0, sync: true },
-        Sample { offset: 4, size: 4, duration: 1, cts: 0, sync: true },
+        Sample {
+            offset: 0,
+            size: 4,
+            duration: 1,
+            cts: 0,
+            sync: true,
+        },
+        Sample {
+            offset: 4,
+            size: 4,
+            duration: 1,
+            cts: 0,
+            sync: true,
+        },
     ];
     let t = build_tables(&samples);
     assert!(t.stss.is_empty());
@@ -419,23 +458,69 @@ fn all_sync_samples_need_no_stss() {
 /// video and one for each audio track, as the recorder produces.
 fn fragmented_fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
     let tracks = vec![
-        TrackFixture { id: 1, handler: *b"vide", timescale: 3000, duration: 0, flags: 0x7, tables: empty_tables() },
-        TrackFixture { id: 2, handler: *b"soun", timescale: 48000, duration: 0, flags: 0x7, tables: empty_tables() },
-        TrackFixture { id: 3, handler: *b"soun", timescale: 48000, duration: 0, flags: 0x7, tables: empty_tables() },
-        TrackFixture { id: 4, handler: *b"soun", timescale: 48000, duration: 0, flags: 0x7, tables: empty_tables() },
+        TrackFixture {
+            id: 1,
+            handler: *b"vide",
+            timescale: 3000,
+            duration: 0,
+            flags: 0x7,
+            tables: empty_tables(),
+        },
+        TrackFixture {
+            id: 2,
+            handler: *b"soun",
+            timescale: 48000,
+            duration: 0,
+            flags: 0x7,
+            tables: empty_tables(),
+        },
+        TrackFixture {
+            id: 3,
+            handler: *b"soun",
+            timescale: 48000,
+            duration: 0,
+            flags: 0x7,
+            tables: empty_tables(),
+        },
+        TrackFixture {
+            id: 4,
+            handler: *b"soun",
+            timescale: 48000,
+            duration: 0,
+            flags: 0x7,
+            tables: empty_tables(),
+        },
     ];
     let mut out = ftyp();
     out.extend_from_slice(&init_moov(1000, &tracks));
 
     let mut payloads: Vec<Vec<u8>> = vec![];
     // Fragment 1: two video samples, half of each audio track.
-    let video1: [S; 2] = [(100, 10, opt_flags(true), 0), (100, 11, opt_flags(false), 0)];
+    let video1: [S; 2] = [
+        (100, 10, opt_flags(true), 0),
+        (100, 11, opt_flags(false), 0),
+    ];
     let mix1: [S; 2] = [(1024, 5, 0, 0), (1024, 6, 0, 0)];
     let sys1: [S; 2] = [(1024, 7, 0, 0), (1024, 8, 0, 0)];
     let trafs1 = [
-        TrafSpec { track_id: 1, defaults: None, samples: &video1, data_offset: true },
-        TrafSpec { track_id: 2, defaults: None, samples: &mix1, data_offset: false },
-        TrafSpec { track_id: 3, defaults: None, samples: &sys1, data_offset: false },
+        TrafSpec {
+            track_id: 1,
+            defaults: None,
+            samples: &video1,
+            data_offset: true,
+        },
+        TrafSpec {
+            track_id: 2,
+            defaults: None,
+            samples: &mix1,
+            data_offset: false,
+        },
+        TrafSpec {
+            track_id: 3,
+            defaults: None,
+            samples: &sys1,
+            data_offset: false,
+        },
     ];
     let moof1 = moof_at(out.len() as u64, &trafs1);
     let mut data1: Vec<u8> = (0..10).collect();
@@ -449,15 +534,43 @@ fn fragmented_fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
     out.extend_from_slice(&mdat(&data1));
 
     // Fragment 2: the last two video samples and the rest of every audio track.
-    let video2: [S; 2] = [(100, 12, opt_flags(false), 0), (100, 13, opt_flags(true), 0)];
+    let video2: [S; 2] = [
+        (100, 12, opt_flags(false), 0),
+        (100, 13, opt_flags(true), 0),
+    ];
     let mix2: [S; 2] = [(1024, 7, 0, 0), (1024, 8, 0, 0)];
     let sys2: [S; 2] = [(1024, 9, 0, 0), (1024, 10, 0, 0)];
-    let mic2: [S; 4] = [(1024, 9, 0, 0), (1024, 10, 0, 0), (1024, 11, 0, 0), (1024, 12, 0, 0)];
+    let mic2: [S; 4] = [
+        (1024, 9, 0, 0),
+        (1024, 10, 0, 0),
+        (1024, 11, 0, 0),
+        (1024, 12, 0, 0),
+    ];
     let trafs2 = [
-        TrafSpec { track_id: 1, defaults: None, samples: &video2, data_offset: true },
-        TrafSpec { track_id: 2, defaults: None, samples: &mix2, data_offset: false },
-        TrafSpec { track_id: 3, defaults: None, samples: &sys2, data_offset: false },
-        TrafSpec { track_id: 4, defaults: None, samples: &mic2, data_offset: false },
+        TrafSpec {
+            track_id: 1,
+            defaults: None,
+            samples: &video2,
+            data_offset: true,
+        },
+        TrafSpec {
+            track_id: 2,
+            defaults: None,
+            samples: &mix2,
+            data_offset: false,
+        },
+        TrafSpec {
+            track_id: 3,
+            defaults: None,
+            samples: &sys2,
+            data_offset: false,
+        },
+        TrafSpec {
+            track_id: 4,
+            defaults: None,
+            samples: &mic2,
+            data_offset: false,
+        },
     ];
     let moof2 = moof_at(out.len() as u64, &trafs2);
     let mut data2: Vec<u8> = (20..32).collect();
@@ -485,8 +598,17 @@ fn layout() -> Layout {
 /// The `stco`/`co64` offsets of the nth `trak` in a moov.
 fn chunk_offsets(moov: &[u8], index: usize) -> Vec<u64> {
     let kids = children(moov, 8, moov.len()).unwrap();
-    let trak = kids.iter().filter(|b| &b.kind == b"trak").nth(index).unwrap();
-    let tk = children(moov, trak.body_start() as usize, (trak.start + trak.size) as usize).unwrap();
+    let trak = kids
+        .iter()
+        .filter(|b| &b.kind == b"trak")
+        .nth(index)
+        .unwrap();
+    let tk = children(
+        moov,
+        trak.body_start() as usize,
+        (trak.start + trak.size) as usize,
+    )
+    .unwrap();
     let mdia = find(&tk, b"mdia").unwrap();
     let mdia_buf = slice(moov, mdia);
     let mk = children(mdia_buf, 8, mdia_buf.len()).unwrap();
@@ -539,7 +661,11 @@ fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
             .windows(payload.len())
             .position(|w| w == payload.as_slice())
             .unwrap();
-        assert_eq!(&after[from..from + payload.len()], payload.as_slice(), "fragment {i}");
+        assert_eq!(
+            &after[from..from + payload.len()],
+            payload.as_slice(),
+            "fragment {i}"
+        );
     }
 
     let info = read(&path).unwrap();
@@ -552,20 +678,30 @@ fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
     assert_eq!(info.tracks[3].samples, 4);
 
     // The audio tracks form one group with only the first enabled.
-    let audio: Vec<&TrackInfo> = info.tracks.iter().filter(|t| t.handler == Handler::Audio).collect();
+    let audio: Vec<&TrackInfo> = info
+        .tracks
+        .iter()
+        .filter(|t| t.handler == Handler::Audio)
+        .collect();
     assert_eq!(audio.len(), 3);
     for t in &audio {
         assert_eq!(t.alternate_group, 1);
     }
     assert!(audio[0].enabled, "the mix track stays enabled");
-    assert!(!audio[1].enabled && !audio[2].enabled, "stems are disabled alternatives");
+    assert!(
+        !audio[1].enabled && !audio[2].enabled,
+        "stems are disabled alternatives"
+    );
     assert!(info.tracks[0].enabled);
 
     // Every audio track skips its priming with an edit list.
     for t in &audio {
         assert_eq!(
             t.edits,
-            vec![Edit { segment_duration: 43, media_time: 2048 }],
+            vec![Edit {
+                segment_duration: 43,
+                media_time: 2048
+            }],
             "4 audio frames of 1024 samples minus 2048 priming = 42.67 ms"
         );
     }
@@ -573,7 +709,9 @@ fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
     // Chunk offsets point at the original mdat payloads.
     let (_, boxes, _) = scan(&path).unwrap();
     let moov = boxes.last().unwrap();
-    let moov_bytes = std::fs::read(&path).unwrap()[moov.start as usize..(moov.start + moov.size) as usize].to_vec();
+    let moov_bytes = std::fs::read(&path).unwrap()
+        [moov.start as usize..(moov.start + moov.size) as usize]
+        .to_vec();
     let video_chunks = chunk_offsets(&moov_bytes, 0);
     assert_eq!(video_chunks.len(), 2, "one chunk per fragment");
     let first_sample = &payloads[0][0..10];
@@ -581,7 +719,10 @@ fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
         .windows(first_sample.len())
         .position(|w| w == first_sample)
         .unwrap();
-    assert_eq!(video_chunks[0] as usize, base, "first video sample where it was");
+    assert_eq!(
+        video_chunks[0] as usize, base,
+        "first video sample where it was"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -611,11 +752,19 @@ fn a_two_moov_file_still_reads_as_a_movie() {
     f.write_all(&new_moov).unwrap();
     f.sync_all().unwrap();
     drop(f);
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), len + new_moov.len() as u64);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        len + new_moov.len() as u64
+    );
     let info = read(&path).unwrap();
     assert_eq!(info.tracks.len(), 4);
     // The init moov is still a fragmented one and still parses.
-    let first = read_at(&mut File::open(&path).unwrap(), moov_ref.start, moov_ref.size).unwrap();
+    let first = read_at(
+        &mut File::open(&path).unwrap(),
+        moov_ref.start,
+        moov_ref.size,
+    )
+    .unwrap();
     assert!(parse_moov(&first).unwrap().has_mvex);
     std::fs::remove_file(&path).ok();
 }
@@ -625,8 +774,22 @@ fn a_regular_movie_is_patched_without_growing_media_offsets() {
     // A non-fragmented file (REC_FRAGMENT_SECS=0): the finalise must still
     // apply the track layout, by appending a patched moov at the end.
     let tracks = vec![
-        TrackFixture { id: 1, handler: *b"vide", timescale: 3000, duration: 3000, flags: 0x7, tables: stbl_with_tables() },
-        TrackFixture { id: 2, handler: *b"soun", timescale: 48000, duration: 96000, flags: 0x7, tables: stbl_with_tables() },
+        TrackFixture {
+            id: 1,
+            handler: *b"vide",
+            timescale: 3000,
+            duration: 3000,
+            flags: 0x7,
+            tables: stbl_with_tables(),
+        },
+        TrackFixture {
+            id: 2,
+            handler: *b"soun",
+            timescale: 48000,
+            duration: 96000,
+            flags: 0x7,
+            tables: stbl_with_tables(),
+        },
     ];
     let mut bytes = ftyp();
     let media_at = bytes.len() + 4096; // mdat payload position, set below
@@ -645,7 +808,11 @@ fn a_regular_movie_is_patched_without_growing_media_offsets() {
     assert!(!report.defragmented);
     let info = read(&path).unwrap();
     assert!(!info.fragmented);
-    let audio = info.tracks.iter().find(|t| t.handler == Handler::Audio).unwrap();
+    let audio = info
+        .tracks
+        .iter()
+        .find(|t| t.handler == Handler::Audio)
+        .unwrap();
     assert!(audio.enabled, "the only audio track is the default");
     assert_eq!(audio.alternate_group, 1);
     assert_eq!(audio.edits.len(), 1);
@@ -657,20 +824,30 @@ fn a_regular_movie_is_patched_without_growing_media_offsets() {
 
 #[test]
 fn priming_is_scaled_to_the_track_timescale() {
-    let tracks = vec![TrackFixture { id: 1, handler: *b"soun", timescale: 44100, duration: 0, flags: 0x7, tables: empty_tables() }];
+    let tracks = vec![TrackFixture {
+        id: 1,
+        handler: *b"soun",
+        timescale: 44100,
+        duration: 0,
+        flags: 0x7,
+        tables: empty_tables(),
+    }];
     let path = write_temp("scale", &[ftyp(), init_moov(1000, &tracks)].concat());
     // Two AAC frames at 44.1 kHz: 2 * 1024/48000 s = 42.67 ms worth of media.
     // Put samples into the file through the fragmented path instead: a moof.
     let mut bytes = std::fs::read(&path).unwrap();
     let samples: [S; 10] = [(940, 5, 0, 0); 10];
-    let moof = moof_at(bytes.len() as u64, &[TrafSpec {
-        track_id: 1,
-        defaults: None,
-        samples: &samples,
-        data_offset: true,
-    }]);
+    let moof = moof_at(
+        bytes.len() as u64,
+        &[TrafSpec {
+            track_id: 1,
+            defaults: None,
+            samples: &samples,
+            data_offset: true,
+        }],
+    );
     bytes.extend_from_slice(&moof);
-    bytes.extend_from_slice(&mdat(&vec![0u8; 50]));
+    bytes.extend_from_slice(&mdat(&[0u8; 50]));
     std::fs::write(&path, &bytes).unwrap();
     let layout = Layout {
         audio_alternate_group: Some(1),
@@ -699,5 +876,3 @@ fn keep_copies_the_fragmented_file_before_the_append() {
     std::fs::remove_file(&keep).ok();
     std::fs::remove_file(&path).ok();
 }
-
-

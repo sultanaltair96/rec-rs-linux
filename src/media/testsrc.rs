@@ -47,7 +47,8 @@ fn beep_samples(start: i64, n: usize, hz: f64) -> Vec<f32> {
         let in_sec = s.rem_euclid(rate);
         let v = if in_sec < len {
             (BEEP_AMPLITUDE as f64
-                * (2.0 * std::f64::consts::PI * hz * in_sec as f64 / rate as f64).sin()) as f32
+                * (2.0 * std::f64::consts::PI * hz * in_sec as f64 / rate as f64).sin())
+                as f32
         } else {
             0.0
         };
@@ -194,7 +195,10 @@ impl TestCamera {
 
 impl VideoSource for TestCamera {
     fn describe(&self) -> String {
-        format!("synthetic camera ({}x{} @ {})", self.width, self.height, self.fps)
+        format!(
+            "synthetic camera ({}x{} @ {})",
+            self.width, self.height, self.fps
+        )
     }
 
     fn start(&mut self, sink: FrameSink) -> Result<()> {

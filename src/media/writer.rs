@@ -340,6 +340,7 @@ impl Writer {
     ///
     /// `system` and `mic` say which audio sources the session will feed;
     /// tracks are created for them according to `layout`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: Option<&Path>,
         spec: &VideoSpec,
@@ -532,9 +533,7 @@ impl Writer {
     pub fn set_scene(&mut self, scene: Scene) -> bool {
         let ok = match scene {
             Scene::Screen => true,
-            Scene::Cam => {
-                self.renderer.is_some() || self.cam_expected || self.cam_last.is_some()
-            }
+            Scene::Cam => self.renderer.is_some() || self.cam_expected || self.cam_last.is_some(),
             Scene::ScreenCam => self.renderer.is_some(),
         };
         if ok {
@@ -675,12 +674,7 @@ impl Writer {
         let _ = counted;
         self.screen_q.push_back((pts, Arc::new(frame)));
         let due = self.due_time();
-        Self::cap(
-            &mut self.screen_q,
-            &mut self.screen_last,
-            QUEUE_MAX,
-            due,
-        );
+        Self::cap(&mut self.screen_q, &mut self.screen_last, QUEUE_MAX, due);
     }
 
     /// The first frame set the session clock: start the pipeline, the mix bus
@@ -691,7 +685,10 @@ impl Writer {
             let _ = sink.pipeline.set_state(gst::State::Playing);
         }
         if self.audio_wanted.iter().any(|w| *w) {
-            if self.sink.as_ref().is_some_and(|s| s.tracks.iter().any(|t| t.target == Target::Mix))
+            if self
+                .sink
+                .as_ref()
+                .is_some_and(|s| s.tracks.iter().any(|t| t.target == Target::Mix))
             {
                 self.mixer = Some(Mixer::new(0.0, self.audio_wanted[0], self.audio_wanted[1]));
             }
@@ -700,8 +697,7 @@ impl Writer {
                 // bus must start at the session clock: a bus starting at zero
                 // would place every buffer hours in (and try to allocate the
                 // samples for it).
-                self.live_mixer =
-                    Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
+                self.live_mixer = Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
             }
         }
         for (kind, chunk) in std::mem::take(&mut self.preroll) {
@@ -756,8 +752,7 @@ impl Writer {
         // whole buffer on the host clock.
         if self.live.is_some() {
             if self.live_mixer.is_none() {
-                self.live_mixer =
-                    Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
+                self.live_mixer = Some(Mixer::new(t0, self.audio_wanted[0], self.audio_wanted[1]));
             }
             if let Some(m) = self.live_mixer.as_mut() {
                 m.push(kind, real, mixer::RATE, frames.clone());
@@ -845,7 +840,9 @@ impl Writer {
 
     /// Offer the live mix to the shared encode.
     fn drain_live(&mut self, flush: bool) {
-        let Some(live) = self.live.clone() else { return };
+        let Some(live) = self.live.clone() else {
+            return;
+        };
         let mut chunks = vec![];
         if let Some(m) = self.live_mixer.as_mut() {
             while let Some(chunk) = m.pull_chunk(flush) {
@@ -870,7 +867,9 @@ impl Writer {
     /// later overlaps the silence and `write_track` trims the overlap, so the
     /// source's own samples replace it exactly.
     fn top_up_audio(&mut self, out_time: f64) {
-        let Some(sink) = self.sink.as_mut() else { return };
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
         let limit = self.limit.map(|l| l as f64 / self.spec.fps as f64);
         let out_time = limit.map_or(out_time, |l| out_time.min(l));
         let mut filled = 0u64;
@@ -916,7 +915,9 @@ impl Writer {
             return;
         }
         let limit_secs = self.limit.map(|l| l as f64 / self.spec.fps as f64);
-        let Some(sink) = self.sink.as_mut() else { return };
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
         let Some(track) = sink.tracks.iter_mut().find(|t| t.target == target) else {
             return;
         };
@@ -952,7 +953,6 @@ impl Writer {
         let body = &frames[skip..];
         // `--duration` cuts every track at the same output time, so the file
         // ends where the video grid does.
-        let mut pad = pad;
         let body = if let Some(limit) = limit_secs {
             if start >= limit {
                 return;
@@ -1084,8 +1084,7 @@ impl Writer {
                 self.stats.paused_slots += 1;
             }
             // The preview and the live encode get every frame, paused or not.
-            let want_preview =
-                self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
+            let want_preview = self.preview.is_some() && slot_t - self.last_preview >= 1.0 / 30.0;
             let want_live = self.live.as_ref().is_some_and(|l| l.active());
             if !write && !want_preview && !want_live {
                 continue;
@@ -1114,9 +1113,7 @@ impl Writer {
                 stamped.pts = slot_t;
                 l.push_video(&stamped);
             }
-            if want_preview
-                && let Some(p) = self.preview.clone()
-            {
+            if want_preview && let Some(p) = self.preview.clone() {
                 self.last_preview = slot_t;
                 p(frame.as_ref().clone());
             }
@@ -1132,11 +1129,11 @@ impl Writer {
         let cam = self.cam_last.clone();
         if self.renderer.is_some() {
             let started = std::time::Instant::now();
-            let rendered = self
-                .renderer
-                .as_mut()
-                .unwrap()
-                .render(screen.as_deref(), cam.as_deref(), slot_t);
+            let rendered =
+                self.renderer
+                    .as_mut()
+                    .unwrap()
+                    .render(screen.as_deref(), cam.as_deref(), slot_t);
             let took = started.elapsed().as_secs_f64();
             match rendered {
                 Ok(Some(frame)) => {
@@ -1153,7 +1150,9 @@ impl Writer {
                     // back to the CPU path and say so once.
                     if !self.warned_overlay {
                         self.warned_overlay = true;
-                        eprintln!("rec: warning: compositing failed ({e}); recording without the camera overlay");
+                        eprintln!(
+                            "rec: warning: compositing failed ({e}); recording without the camera overlay"
+                        );
                     }
                     self.renderer = None;
                 }
@@ -1216,7 +1215,9 @@ impl Writer {
     /// delivers its native size (a 1440p display into a 1080p recording) is
     /// accepted and scaled with Lanczos.
     fn ensure_video_caps(&mut self, frame: &VideoFrame) {
-        let Some(sink) = self.sink.as_ref() else { return };
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
         let key = (frame.width, frame.height, frame.format);
         if self.caps_key == Some(key) {
             return;
@@ -2009,7 +2010,9 @@ fn open_sink(
             let pad = mux
                 .request_pad_simple(&format!("audio_{n}"))
                 .with_context(|| format!("the muxer has no audio_{n} pad"))?;
-            q.static_pad("src").context("audio queue src pad")?.link(&pad)?;
+            q.static_pad("src")
+                .context("audio queue src pad")?
+                .link(&pad)?;
             tracks.push(AudioTrack {
                 target: *target,
                 appsrc: src,
@@ -2117,15 +2120,24 @@ mod tests {
             ]
         );
         // Mix only.
-        assert_eq!(audio_plan(true, true, AudioLayout::Mix), vec![(Target::Mix, 2, 256_000)]);
+        assert_eq!(
+            audio_plan(true, true, AudioLayout::Mix),
+            vec![(Target::Mix, 2, 256_000)]
+        );
         // Stems only: no group, both enabled.
         assert_eq!(
             audio_plan(true, true, AudioLayout::Stems),
             vec![(Target::System, 2, 256_000), (Target::Mic, 1, 192_000)]
         );
         // One source: that source's stem alone, whatever the layout says.
-        assert_eq!(audio_plan(true, false, AudioLayout::Both), vec![(Target::System, 2, 256_000)]);
-        assert_eq!(audio_plan(false, true, AudioLayout::Mix), vec![(Target::Mic, 1, 192_000)]);
+        assert_eq!(
+            audio_plan(true, false, AudioLayout::Both),
+            vec![(Target::System, 2, 256_000)]
+        );
+        assert_eq!(
+            audio_plan(false, true, AudioLayout::Mix),
+            vec![(Target::Mic, 1, 192_000)]
+        );
         assert!(audio_plan(false, false, AudioLayout::Both).is_empty());
     }
 
@@ -2162,7 +2174,10 @@ mod tests {
             muted: true,
         };
         assert_eq!(v.gain(), 0.0);
-        assert!((v.fader_gain() - 0.501_187).abs() < 1e-5, "meters read before mute");
+        assert!(
+            (v.fader_gain() - 0.501_187).abs() < 1e-5,
+            "meters read before mute"
+        );
     }
 
     #[test]
@@ -2297,7 +2312,10 @@ mod tests {
                 16,
             )],
         };
-        assert_eq!(tight_bytes(&padded).unwrap(), (0..32u8).collect::<Vec<u8>>());
+        assert_eq!(
+            tight_bytes(&padded).unwrap(),
+            (0..32u8).collect::<Vec<u8>>()
+        );
         // I420: three planes, concatenated.
         let i420 = VideoFrame {
             pts: 0.0,
@@ -2359,7 +2377,13 @@ mod tests {
     }
 
     fn frame_at(pts: f64, width: usize, height: usize) -> VideoFrame {
-        VideoFrame::packed(pts, width, height, PixelFormat::Bgra, vec![0u8; width * height * 4])
+        VideoFrame::packed(
+            pts,
+            width,
+            height,
+            PixelFormat::Bgra,
+            vec![0u8; width * height * 4],
+        )
     }
 
     /// A recording must never buffer without bound: a source that is silent
@@ -2408,7 +2432,10 @@ mod tests {
             // a clock 1000 s ahead (the pathological case).
             if i > 15 * 60 {
                 let at = t0 + 1000.0 + i as f64 * 0.01;
-                w.push_audio(AudioKind::Mic, &AudioChunk::stereo(at, 48_000, vec![0.001; 960]));
+                w.push_audio(
+                    AudioKind::Mic,
+                    &AudioChunk::stereo(at, 48_000, vec![0.001; 960]),
+                );
             }
             w.emit_until(t - w.lag());
         }
@@ -2513,7 +2540,10 @@ mod tests {
         );
         let info = crate::media::mp4::read(&path).expect("the file reads back");
         let secs = info.duration as f64 / info.movie_timescale.max(1) as f64;
-        assert!(secs < 5.0, "the file is {secs:.3}s, not stretched to the jump");
+        assert!(
+            secs < 5.0,
+            "the file is {secs:.3}s, not stretched to the jump"
+        );
         assert!(
             after.saturating_sub(before) < 300_000,
             "memory grew {} kB",
@@ -2522,5 +2552,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
-
 }

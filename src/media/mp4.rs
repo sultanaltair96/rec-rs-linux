@@ -452,7 +452,10 @@ fn parse_moov(moov: &[u8]) -> Result<Init> {
     if let Some(mvex_ref) = find(&kids, b"mvex") {
         has_mvex = true;
         let m = slice(moov, mvex_ref);
-        for t in children(m, 8, m.len())?.iter().filter(|b| &b.kind == b"trex") {
+        for t in children(m, 8, m.len())?
+            .iter()
+            .filter(|b| &b.kind == b"trex")
+        {
             let tb = slice(m, t);
             trex.insert(
                 be32(tb, 12)?,
@@ -627,7 +630,13 @@ fn parse_moof(
                 let cts = if rflags & 0x800 != 0 {
                     let v = be32(trun, p)?;
                     p += 4;
-                    if version == 0 { v as i32 } else { v as i32 }
+                    if version == 1 {
+                        v as i32
+                    } else {
+                        // Version 0 composition offsets are unsigned; saturate
+                        // instead of wrapping negative.
+                        v.min(i32::MAX as u32) as i32
+                    }
                 } else {
                     0
                 };
@@ -1136,7 +1145,11 @@ pub fn finalize(
             if priming_48k > 0 && t.info.timescale > 0 {
                 let priming = scale(priming_48k, 48_000, t.info.timescale);
                 if priming < media_duration {
-                    let shown = scale(media_duration - priming, t.info.timescale, init.movie_timescale);
+                    let shown = scale(
+                        media_duration - priming,
+                        t.info.timescale,
+                        init.movie_timescale,
+                    );
                     plan.edits = Some(vec![Edit {
                         segment_duration: shown,
                         media_time: priming as i64,

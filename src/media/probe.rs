@@ -71,11 +71,18 @@ pub fn probe(file: &Path) -> Result<()> {
         .map_err(|e| anyhow!("{}: {e}", abs.display()))?
         .to_string();
     println!("file      : {}", abs.display());
-    if std::env::var_os("REC_DEBUG").is_some() { eprintln!("rec: debug: reading mp4 boxes"); }
-    let movie = mp4::read(&abs).with_context(|| format!("reading the boxes of {}", abs.display()))?;
-    if std::env::var_os("REC_DEBUG").is_some() { eprintln!("rec: debug: mp4 boxes ok; structure"); }
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: reading mp4 boxes");
+    }
+    let movie =
+        mp4::read(&abs).with_context(|| format!("reading the boxes of {}", abs.display()))?;
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: mp4 boxes ok; structure");
+    }
     let (duration, mut streams) = structure(&abs)?;
-    if std::env::var_os("REC_DEBUG").is_some() { eprintln!("rec: debug: structure ok; decode"); }
+    if std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!("rec: debug: structure ok; decode");
+    }
     let decoded = decode(&uri)?;
     if std::env::var_os("REC_DEBUG").is_some() {
         for (i, d) in decoded.iter().enumerate() {
@@ -205,7 +212,9 @@ fn structure(path: &Path) -> Result<(Option<gst::ClockTime>, Vec<Stream>)> {
         if let Some(caps) = pad.current_caps().or_else(|| Some(pad.query_caps(None)))
             && let Some(s) = describe(&caps)
         {
-            if debug { eprintln!("rec: debug: structure pad {} {s:?}", pad.name()); }
+            if debug {
+                eprintln!("rec: debug: structure pad {} {s:?}", pad.name());
+            }
             found2.lock().unwrap().push(s);
         }
         // Consume the stream so the pipeline reaches EOS. The sinks are added
@@ -217,9 +226,11 @@ fn structure(path: &Path) -> Result<(Option<gst::ClockTime>, Vec<Stream>)> {
             && pipe.add(&sink).is_ok()
             && pad.link(&sink_pad).is_ok()
         {
-            let _ = sink.set_property("sync", false);
-            let _ = sink.set_property("async", false);
-            if debug { eprintln!("rec: debug: structure linked {}", pad.name()); }
+            sink.set_property("sync", false);
+            sink.set_property("async", false);
+            if debug {
+                eprintln!("rec: debug: structure linked {}", pad.name());
+            }
             let _ = sink.sync_state_with_parent();
         }
     });

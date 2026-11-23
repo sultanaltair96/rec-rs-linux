@@ -710,5 +710,4 @@ mod tests {
         );
         assert_eq!(m.overruns, 0, "a silent source is not an overrun");
     }
-
 }

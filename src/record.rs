@@ -29,7 +29,6 @@ use crate::media_types::{self, AudioSink, FrameSink, VideoSource};
 /// How long a freshly started camera needs before its exposure is close to
 /// settled (upstream measured a MacBook camera: 94% of the final brightness
 /// after 1.5 s, 98% after 2 s).
-const CAMERA_SETTLE_SECS: f64 = 2.0;
 use crate::mixer::Volume;
 use crate::synth::{Pattern, Synth};
 use crate::util::{clock, db, runtime_dir};
@@ -423,21 +422,24 @@ impl Session {
         // exposure has settled (upstream's 2 s gate), so the first frames are
         // not dark, and its frames feed the scene from the first slot.
         if let Some(sel) = &o.webcam {
-            let started = std::time::Instant::now();
             let req = CameraRequest {
                 device: sel.clone(),
             };
-            let mut cam = match testsrc::camera_from_env() {
-                Some(c) => c,
-                None => camera_capture::open(&req)?,
+            // The camera source knows how much of upstream's settle time is
+            // left (a device that was already running keeps its exposure).
+            let (mut cam, settle): (Box<dyn VideoSource>, f64) = match testsrc::camera_from_env() {
+                Some(c) => (c, camera_capture::CAMERA_SETTLE_SECS),
+                None => {
+                    let src = camera_capture::open_source(&req)?;
+                    let settle = src.settle_remaining();
+                    (Box::new(src), settle)
+                }
             };
             self.camera_desc = cam.describe();
             cam.start(camsink)?;
             // A preview just shows the dark frames; only a file waits.
             if o.write && o.scene.uses_cam() {
-                let settle = (CAMERA_SETTLE_SECS - started.elapsed().as_secs_f64()).max(0.0);
-                self.shared
-                    .with(|w| w.wait_for_camera(settle));
+                self.shared.with(|w| w.wait_for_camera(settle));
             }
             self.camera = Some(cam);
         }
@@ -461,10 +463,23 @@ impl Session {
                     noise,
                 });
                 self.description = synth.describe();
+                // Test hook (scripts/audio/integration.sh): take system audio
+                // from PipeWire instead of the pattern's own beeps.
+                let pattern_audio = match std::env::var("REC_PATTERN_SYSTEM_AUDIO").as_deref() {
+                    Err(_) | Ok("") => false,
+                    Ok("pipewire") => true,
+                    Ok(other) => {
+                        bail!("REC_PATTERN_SYSTEM_AUDIO={other}: only `pipewire` is supported")
+                    }
+                };
                 // Both halves of the pattern share one origin, so flash and
                 // beep stay aligned.
                 if o.system_audio {
-                    self.audio.push(Box::new(synth.audio(true)));
+                    if pattern_audio {
+                        self.audio.push(audio_capture::open_system()?);
+                    } else {
+                        self.audio.push(Box::new(synth.audio(true)));
+                    }
                 }
                 self.video = Some(Box::new(synth));
             }
@@ -688,7 +703,7 @@ pub fn run(o: Options) -> Result<Stats> {
             },
             if o.system_audio { "on" } else { "off" },
             mic_desc,
-            sess.camera_name().unwrap_or_else(|| "off".into()),
+            sess.camera_name().unwrap_or("off"),
         );
         if o.write && !o.quiet {
             eprintln!("rec: encoder {}", sess.encoder);

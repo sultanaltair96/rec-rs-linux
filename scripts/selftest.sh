@@ -50,8 +50,8 @@ case "${1:-}" in
         echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "opt-in: long-finalize (10 min)"
-        echo "skipped: pattern-webcam device-mic scene-webcam"
-        echo "         stream-rtmp stream-whip replay gui"
+        echo "pattern-mic pattern-system-audio"
+        echo "skipped: pattern-webcam scene-webcam stream-rtmp stream-whip replay gui"
         exit 0 ;;
 esac
 
@@ -552,6 +552,60 @@ fi
 # Cases that belong to later phases (they need a real device, the app or
 # streaming; the synthetic equivalents above cover the writer's side).
 
+# The microphone through a private, headless PipeWire session: a virtual mic
+# fed by a loopback plays a beep train, and the recording must contain it at
+# the right level and spacing. The same script also checks that an explicit
+# missing --mic fails and that a device disappearing mid-recording finalizes
+# the file. scripts/audio/integration.sh runs the cases; its harness needs the
+# PipeWire tools from the dev image.
+pipewire_harness() {
+    command -v dbus-run-session >/dev/null 2>&1 \
+        && command -v pipewire >/dev/null 2>&1 \
+        && command -v wireplumber >/dev/null 2>&1 \
+        && command -v pipewire-pulse >/dev/null 2>&1 \
+        && command -v pw-loopback >/dev/null 2>&1 \
+        && command -v pw-play >/dev/null 2>&1
+}
+run_audio_case() { # run_audio_case NAME INTEGRATION-CASE
+    name=$1; case_name=$2
+    if REC="$REC" REC_TEST_DIR="$OUT" timeout 240 dbus-run-session -- \
+           sh scripts/audio/integration.sh "$case_name" >"$OUT/$name.log" 2>&1; then
+        echo "PASS  $name  ($(grep -c '^PASS' "$OUT/$name.log") case(s): $(grep '^PASS' "$OUT/$name.log" | sed 's/^PASS  [^ ]*  //' | head -2 | paste -sd ';' -))"
+        pass=$((pass+1))
+    else
+        echo "FAIL  $name  (see $OUT/$name.log)"; fail=$((fail+1))
+    fi
+}
+if wanted pattern-mic; then
+    if pipewire_harness; then
+        run_audio_case pattern-mic mic
+    else
+        echo "SKIP  pattern-mic  (no PipeWire test harness: dbus-run-session/pipewire/pw-loopback)"; skip=$((skip+1))
+    fi
+fi
+
+# Real system audio: a null sink is the default output and the test plays a
+# known beep train into it while `rec-rs record --test-pattern` records it
+# (REC_PATTERN_SYSTEM_AUDIO=pipewire takes the system track from PipeWire
+# instead of the pattern's own beeps). A 44.1 kHz sink exercises the mixer's
+# resampling. Level, pitch and beep spacing come from tonecheck.py.
+if wanted pattern-system-audio; then
+    if pipewire_harness; then
+        if REC="$REC" REC_TEST_DIR="$OUT" timeout 300 dbus-run-session -- \
+               sh scripts/audio/integration.sh system >"$OUT/pattern-system-audio.log" 2>&1 \
+           && REC="$REC" REC_TEST_DIR="$OUT" timeout 300 dbus-run-session -- \
+               sh scripts/audio/integration.sh resample >>"$OUT/pattern-system-audio.log" 2>&1; then
+            echo "PASS  pattern-system-audio  (48 kHz and 44.1 kHz sinks: $(grep '^PASS' "$OUT/pattern-system-audio.log" | sed 's/^PASS  [^ ]*  //' | paste -sd ';' -))"
+            pass=$((pass+1))
+        else
+            echo "FAIL  pattern-system-audio  (see $OUT/pattern-system-audio.log)"; fail=$((fail+1))
+        fi
+    else
+        echo "SKIP  pattern-system-audio  (no PipeWire test harness)"; skip=$((skip+1))
+    fi
+fi
+
+
 # The GPU compositor: every shape against the mask geometry, borders, the drop
 # shadow, mirroring, placement, the camera scene, the Lanczos scaler against a
 # CPU reference, against ffmpeg's Lanczos (PSNR) and on a 1-px pattern
@@ -656,9 +710,8 @@ later() {
     wanted "$1" || return 0
     echo "SKIP  $1  ($2)"; skip=$((skip+1))
 }
-later pattern-webcam  "needs a real desktop: a V4L2 camera (the synthetic one is covered by 'camera')"
-later device-mic      "needs a real desktop: a PipeWire microphone (the synthetic one is covered by 'tracks')"
-later scene-webcam    "needs a real desktop: a V4L2 camera over the screen (the synthetic one is covered by 'camera')"
+later pattern-webcam  "no camera on the CI host (needs a real desktop; PARITY.md has the checklist)"
+later scene-webcam    "needs a real desktop: a camera over the screen (the synthetic one is covered by 'camera')"
 later replay          "phase 1D: replay buffer"
 later stream-rtmp     "phase 1D: RTMP"
 later stream-whip     "phase 1D: WHIP"
