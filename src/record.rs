@@ -603,6 +603,7 @@ pub fn run(o: Options) -> Result<Stats> {
 
     let mut last_status = Instant::now();
     let mut warned_no_frames = false;
+    let mut warned_no_live_frames = false;
     let mut saves: Vec<std::thread::JoinHandle<Result<PathBuf>>> = vec![];
     while !STOP.load(Ordering::SeqCst) && !sess.failed() {
         std::thread::sleep(Duration::from_millis(20));
@@ -655,6 +656,18 @@ pub fn run(o: Options) -> Result<Stats> {
         if !warned_no_frames && elapsed > 3.0 && !sess.has_frames() {
             warned_no_frames = true;
             eprintln!("rec: warning: no screen frames after 3s");
+        }
+        // The live encode is fed by the writer's tap: if it is running but has
+        // received nothing, say so once (a capture that never starts, or a
+        // writer that does not feed the tap).
+        if let Some(l) = &o.live
+            && elapsed > 5.0
+            && l.active()
+            && l.encode_stats().0 == 0
+            && !warned_no_live_frames
+        {
+            warned_no_live_frames = true;
+            eprintln!("rec: warning: no frames have reached the live encode yet");
         }
         if !o.quiet && last_status.elapsed() >= Duration::from_secs(1) {
             last_status = Instant::now();

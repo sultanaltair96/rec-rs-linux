@@ -200,7 +200,11 @@ impl AudioEncoder {
             .is_live(false)
             .do_timestamp(false)
             .block(false)
-            .property("max-buffers", 32u64)
+            // Room for a second or two of audio: an encoder that falls behind
+            // for a moment must not punch a hole in the stream (the tap in
+            // front of it is the queue that drops under real pressure).
+            .max_bytes(4 << 20)
+            .property("max-buffers", 256u64)
             .build();
         let convert = gst::ElementFactory::make("audioconvert")
             .build()
