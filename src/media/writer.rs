@@ -146,6 +146,33 @@ pub struct Stats {
     pub fragments: usize,
 }
 
+/// What to do with one grid slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotAction {
+    /// The encoder took the frame.
+    Write,
+    /// The encoder is busy: the slot is dropped (counted), never retried. A
+    /// retry would leave `next_slot` behind while the source keeps sending,
+    /// and the frame queue would then discard those frames as future content;
+    /// on agent-amd's VA encoder (slightly below 60 fps) that spiralled into
+    /// hundreds of duplicates.
+    Drop,
+    /// Paused or past `--duration`: nothing is written.
+    Skip,
+}
+
+/// The action for a slot, from whether the encoder is ready and the timeline
+/// state. A busy encoder drops the slot; it is not retried.
+fn slot_action(ready: bool, paused: bool, past_limit: bool) -> SlotAction {
+    if paused || past_limit {
+        SlotAction::Skip
+    } else if ready {
+        SlotAction::Write
+    } else {
+        SlotAction::Drop
+    }
+}
+
 /// How far behind real time emission runs, so late-arriving frames still land
 /// in their own slot.
 pub const LAG_SECS: f64 = 0.05;
@@ -161,20 +188,17 @@ const QUEUE_MAX: usize = 7;
 /// Frames the GStreamer video appsrc and its queue may hold. Two frames cover
 /// one encoder frame plus one in flight; anything more is memory a slow
 /// software encoder (a 4K BGRA frame is 33 MB) must not spend.
-const VIDEO_QUEUE_FRAMES: u64 = 2;
+const VIDEO_QUEUE_FRAMES: u64 = 8;
 
-/// Bytes an audio appsrc may hold: about 0.7 s of 10 ms stereo f32 buffers.
-/// Large enough that a busy muxer rides out a stall without dropping a chunk
-/// in the middle of a beep (a dropped buffer ends the previous one abruptly,
-/// which is a quiet click), still a hard memory bound per track.
-const AUDIO_QUEUE_BYTES: u64 = 256 * 1024;
+/// Bytes an audio appsrc may hold: about 2.5 s of 10 ms stereo f32 buffers.
+/// The muxer does not consume audio until the video branch is ready, and a VA
+/// encoder's first frame takes ~0.7 s to configure; a 0.32 s queue dropped the
+/// first 72 audio buffers (0.72 s) at startup on agent-amd, which broke A/V
+/// sync. Still a hard memory bound per track.
+const AUDIO_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Buffers an audio appsrc/queue may hold.
-const AUDIO_QUEUE_BUFFERS: u32 = 32;
-
-/// How far behind its time a slot may fall while the encoder is busy before it
-/// is dropped instead of retried (upstream's `MAX_BACKLOG_SECS`).
-pub const MAX_BACKLOG_SECS: f64 = 0.5;
+const AUDIO_QUEUE_BUFFERS: u32 = 256;
 
 /// Audio timestamp jitter tolerated before a track is padded or trimmed.
 pub const SNAP_SECS: f64 = 0.0015;
@@ -212,6 +236,22 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Video PTS of output slot `slot` in nanoseconds (every allowed fps divides a
 /// second, so the grid alternates 16666666/16666667 ns and never drifts).
+/// The PTS and duration for a buffer at `out_slot`. The PTS is the slot's own
+/// time on the output timeline, never the written-sample index: when the
+/// encoder was busy the slot is refused, the next frame belongs to a later
+/// slot, and stamping it with the written index put its content earlier than
+/// its timestamp (agent-amd's VA encoder drifted 25 frames in 10 s). The
+/// duration is the delta from the previous written slot, so the refused slots
+/// stay a gap in the timeline instead of being hidden.
+fn buffer_timing(out_slot: i64, prev_ns: Option<u64>, fps: u32) -> (u64, u64) {
+    let ns = slot_ns(out_slot, fps);
+    let dur = match prev_ns {
+        Some(p) if ns > p => ((ns - p) as f64 / 1e9).min(1.0),
+        _ => 1.0 / fps as f64,
+    };
+    (ns, gst::ClockTime::from_seconds_f64(dur).nseconds())
+}
+
 fn slot_ns(slot: i64, fps: u32) -> u64 {
     ((slot as i128 * 1_000_000_000i128) / fps as i128).max(0) as u64
 }
@@ -260,6 +300,9 @@ struct Sink {
     tracks: Vec<AudioTrack>,
     path: PathBuf,
     encoder: String,
+    /// Debug counters: buffers into and out of the video encoder.
+    enc_in: Arc<std::sync::atomic::AtomicU64>,
+    enc_out: Arc<std::sync::atomic::AtomicU64>,
     /// Track layout to apply when the file is finalised.
     layout: mp4::Layout,
     /// Bytes the video appsrc may hold (2 frames): the drop policy matches
@@ -290,6 +333,8 @@ pub struct Writer {
     next_slot: i64,
     /// Next slot on the output timeline (real slots minus paused ones).
     out_slot: i64,
+    /// PTS (ns) of the last buffer pushed to the encoder, for its duration.
+    last_video_ns: Option<u64>,
     pauses: Pauses,
     /// Stop writing after this many output slots (exact `--duration`).
     limit: Option<i64>,
@@ -401,6 +446,7 @@ impl Writer {
             t0: None,
             next_slot: 0,
             out_slot: 0,
+            last_video_ns: None,
             pauses: Pauses::default(),
             limit: None,
             screen_q: VecDeque::new(),
@@ -1150,8 +1196,13 @@ impl Writer {
         level < VIDEO_QUEUE_FRAMES && bytes < sink.video_max_bytes
     }
 
-    /// Emit every grid slot whose time is at or before `until` (host seconds).
-    pub fn emit_until(&mut self, until: f64) {
+    /// Emit grid slots whose time is at or before `until` (host seconds), at
+    /// most `max_slots` of them. The live pacer passes a small cap so it
+    /// releases the writer lock between passes: at 4K the CPU compose and copy
+    /// of one frame take long enough that emitting a whole backlog in one call
+    /// starved the capture thread (its frames arrived 6.4 s late on agent-amd).
+    /// Flushing at the end passes `usize::MAX`.
+    pub fn emit_until(&mut self, until: f64, max_slots: usize) {
         let Some(t0) = self.t0 else { return };
         self.check_bus();
         if self.failed.is_some() {
@@ -1159,28 +1210,38 @@ impl Writer {
         }
         let half = 0.5 / self.spec.fps as f64;
         let fps = self.spec.fps as f64;
+        let mut emitted = 0usize;
         loop {
             let slot = self.next_slot;
             let slot_t = t0 + slot as f64 / fps;
-            if slot_t > until {
+            if slot_t > until || emitted >= max_slots {
                 break;
             }
-            // Encoder busy (a GPU spike, a slow software encode): retry this
-            // slot on the next pacer pass unless it is already too far behind.
-            if !self.video_ready() && slot_t > until - MAX_BACKLOG_SECS {
-                self.stats.video_retries += 1;
-                break;
-            }
+            emitted += 1;
+            // Encoder busy: this slot is dropped (counted), not retried, so
+            // the pacer stays current and the next slot gets a fresh frame
+            // (see `SlotAction`).
+            let ready = self.video_ready();
             let paused = self.pauses.offset_at(slot as f64).is_none();
             let past_limit = self.limit.is_some_and(|l| self.out_slot >= l);
+            let action = slot_action(ready, paused, past_limit);
             self.next_slot += 1;
             let before = self.screen_q.len();
             Self::pick(&mut self.screen_q, &mut self.screen_last, slot_t + half);
             let fresh = self.screen_q.len() != before;
             Self::pick(&mut self.cam_q, &mut self.cam_last, slot_t + half);
-            let write = !paused && !past_limit;
-            if !write {
+            let write = action == SlotAction::Write;
+            if action == SlotAction::Skip {
                 self.stats.paused_slots += 1;
+            } else if action == SlotAction::Drop {
+                // The encoder was busy: the frame is lost, and the summary has
+                // to say so (it used to report 0 dropped while the file had a
+                // gap of several frames). The slot still consumes a place on
+                // the output timeline, so the next written frame keeps its own
+                // slot time and the gap stays in the file; this runs even when
+                // there is no preview or live tap to compose for.
+                self.stats.video_drops += 1;
+                self.out_slot += 1;
             }
             // The preview (as a texture, a CPU frame, or both) and the live
             // encode get every frame, paused or not.
@@ -1193,11 +1254,10 @@ impl Writer {
             let Some(frame) = self.compose(slot_t) else {
                 continue;
             };
+            let out_slot = self.out_slot;
             if write {
-                let out_slot = self.out_slot;
-                let refused = !self.video_ready();
                 self.out_slot += 1;
-                if !refused && self.push_video_buffer(out_slot, &frame) {
+                if self.push_video_buffer(out_slot, &frame) {
                     self.stats.video_frames_out += 1;
                     if !fresh {
                         self.stats.video_dups += 1;
@@ -1362,12 +1422,11 @@ impl Writer {
         let Some(bytes) = bytes else { return false };
         let mut buffer = gst::Buffer::from_mut_slice(bytes);
         {
+            let (pts_ns, dur_ns) = buffer_timing(out_slot, self.last_video_ns, self.spec.fps);
+            self.last_video_ns = Some(pts_ns);
             let b = buffer.get_mut().unwrap();
-            let ns = slot_ns(out_slot, self.spec.fps);
-            b.set_pts(gst::ClockTime::from_nseconds(ns));
-            b.set_duration(gst::ClockTime::from_nseconds(
-                slot_ns(out_slot + 1, self.spec.fps) - ns,
-            ));
+            b.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+            b.set_duration(gst::ClockTime::from_nseconds(dur_ns));
         }
         let sink = self.sink.as_ref().unwrap();
         match sink.video_src.push_buffer(buffer) {
@@ -1416,7 +1475,7 @@ impl Writer {
             self.abort();
             bail!("no video frames were captured, nothing written");
         }
-        self.emit_until(end);
+        self.emit_until(end, usize::MAX);
         // Frames still in flight on the compositor's GPU pipeline (depth 1
         // keeps none, but the API must be drained).
         if let Some(r) = self.renderer.as_mut() {
@@ -1429,6 +1488,13 @@ impl Writer {
             // Preview-only session.
             return Ok(self.stats.clone());
         };
+        if std::env::var_os("REC_DEBUG").is_some() {
+            eprintln!(
+                "rec: debug: encoder buffers in {} out {}",
+                sink.enc_in.load(std::sync::atomic::Ordering::Relaxed),
+                sink.enc_out.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
         // A track that never got audio would make an empty track: qtmux only
         // writes a trak once it has a sample, so a short clip with a slow
         // source lost it silently. Give every requested track a moment of
@@ -1789,6 +1855,116 @@ fn choose_format(preferred: &[String], accepted: &[String]) -> Option<String> {
         .find_map(|p| accepted.iter().find(|a| a.eq_ignore_ascii_case(p)).cloned())
 }
 
+/// Create an encoder element and set the properties the writer wants.
+fn configured_encoder(
+    name: &str,
+    bitrate_bps: u64,
+    fps: Option<u32>,
+    wide: bool,
+) -> Result<gst::Element> {
+    let el = gst::ElementFactory::make(name)
+        .build()
+        .with_context(|| format!("creating {name}"))?;
+    // Bitrate: kbit/s for x264enc/x265enc and the VA-API encoders, bits per
+    // second for the rest (a long-standing GStreamer inconsistency).
+    let kbps = matches!(
+        name,
+        "x264enc" | "x265enc" | "vah264enc" | "vah265enc" | "vaapih264enc" | "vaapih265enc"
+    );
+    let value = if kbps {
+        (bitrate_bps / 1000).max(1)
+    } else {
+        bitrate_bps.max(1000)
+    };
+    set(&el, "bitrate", value);
+    if let Some(fps) = fps {
+        // A keyframe every 2 s, like upstream (also the fragment interval).
+        for prop in ["key-int-max", "gop-size", "keyframe-period"] {
+            if el.find_property(prop).is_some() {
+                set(&el, prop, fps * 2);
+                break;
+            }
+        }
+        set(&el, "bframes", 0);
+        set(&el, "bf", 0);
+        // VA-API names it differently; a B-frame delays the encoder's output
+        // and the writer's bounded queue then repeats frames.
+        set(&el, "b-frames", 0);
+        set(&el, "b_pyramid", 0);
+        set(&el, "ref-frames", 1);
+    }
+    match name {
+        // Software screen-content tuning; also what keeps openh264enc's
+        // rate control on the requested bitrate.
+        "openh264enc" => {
+            el.set_property_from_str("rate-control", "bitrate");
+            if el.find_property("usage-type").is_some() {
+                el.set_property_from_str("usage-type", "screen");
+            }
+            if el.find_property("complexity").is_some() {
+                el.set_property_from_str("complexity", "medium");
+            }
+        }
+        "x264enc" => {
+            if el.find_property("tune").is_some() {
+                el.set_property_from_str("tune", "zerolatency");
+            }
+            if el.find_property("speed-preset").is_some() {
+                // Real-time screen recording: a 4K frame gets the faster
+                // preset, 1080p the better-looking one.
+                let preset = if wide { "superfast" } else { "veryfast" };
+                el.set_property_from_str("speed-preset", preset);
+            }
+        }
+        "x265enc" => {
+            // x265's zerolatency tune also disables B-frames and the
+            // lookahead, which keeps the frame grid simple and the encoder
+            // real-time (a CPU cannot do 4K60 any slower); ultrafast is what a
+            // software screen recorder needs.
+            set(&el, "tune", "zerolatency");
+            set(&el, "speed-preset", "ultrafast");
+            // ABR alone lets x265 run away on very noisy frames (83 Mb/s for a
+            // requested 8 Mb/s was measured); a half-second VBV pins it to the
+            // budget (8.7-9.7 Mb/s, dev/ELEMENTS.md).
+            let kbps = (bitrate_bps / 1000).max(1);
+            set(
+                &el,
+                "option-string",
+                format!(
+                    "vbv-maxrate={kbps}:vbv-bufsize={}:rc-lookahead=0:bframes=0",
+                    (kbps / 2).max(1)
+                ),
+            );
+        }
+        "vah264enc" | "vah265enc" => {
+            if el.find_property("rate-control").is_some() {
+                el.set_property_from_str("rate-control", "cbr");
+            }
+            // A screen recorder wants the fastest path: no quality presets,
+            // low-power mode off (the default on AMD), and the encoder should
+            // not hold a pool of surfaces.
+            if el.find_property("target-usage").is_some() {
+                set(&el, "target-usage", 7);
+            }
+        }
+        // ffmpeg's ProRes encoders default to 422 HQ; upstream writes plain 422
+        // ("standard"), and editors expect that. ProRes is intra-only and a
+        // 1080p60 frame needs all the parallelism it can get: prores_ks goes
+        // from 3.5 to 15 fps with slice threads.
+        "avenc_prores_ks" | "avenc_prores_aw" | "avenc_prores" => {
+            set(&el, "profile", "standard");
+            if el.find_property("threads").is_some() {
+                set(&el, "threads", "auto");
+            }
+            if el.find_property("slices").is_some() {
+                set(&el, "slices", 8);
+            }
+        }
+        _ => {}
+    }
+    Ok(el)
+}
+
 /// Build the first installed encoder from `candidates` and set its properties.
 fn make_encoder(
     candidates: &[&str],
@@ -1836,103 +2012,21 @@ fn make_encoder(
                 }
             }
         };
-        let el = gst::ElementFactory::make(name)
-            .build()
-            .with_context(|| format!("creating {name}"))?;
-        // Bitrate: kbit/s for x264enc/x265enc and the VA-API encoders, bits per
-        // second for the rest (a long-standing GStreamer inconsistency).
-        let kbps = matches!(
-            *name,
-            "x264enc" | "x265enc" | "vah264enc" | "vah265enc" | "vaapih264enc" | "vaapih265enc"
-        );
-        let value = if kbps {
-            (bitrate_bps / 1000).max(1)
-        } else {
-            bitrate_bps.max(1000)
-        };
-        set(&el, "bitrate", value);
-        if let Some(fps) = fps {
-            // A keyframe every 2 s, like upstream (also the fragment interval).
-            for prop in ["key-int-max", "gop-size", "keyframe-period"] {
-                if el.find_property(prop).is_some() {
-                    set(&el, prop, fps * 2);
-                    break;
+        let mut el = configured_encoder(name, bitrate_bps, fps, wide)?;
+        if is_va(name) {
+            if let Err(e) = trial_encode(&el, &format) {
+                if debug {
+                    eprintln!("rec: debug: encoder {name}: trial encode failed: {e}");
                 }
+                continue;
             }
-            set(&el, "bframes", 0);
-            set(&el, "bf", 0);
-        }
-        match *name {
-            // Software screen-content tuning; also what keeps openh264enc's
-            // rate control on the requested bitrate.
-            "openh264enc" => {
-                el.set_property_from_str("rate-control", "bitrate");
-                if el.find_property("usage-type").is_some() {
-                    el.set_property_from_str("usage-type", "screen");
-                }
-                if el.find_property("complexity").is_some() {
-                    el.set_property_from_str("complexity", "medium");
-                }
-            }
-            "x264enc" => {
-                if el.find_property("tune").is_some() {
-                    el.set_property_from_str("tune", "zerolatency");
-                }
-                if el.find_property("speed-preset").is_some() {
-                    // Real-time screen recording: a 4K frame gets the faster
-                    // preset, 1080p the better-looking one.
-                    let preset = if wide { "superfast" } else { "veryfast" };
-                    el.set_property_from_str("speed-preset", preset);
-                }
-            }
-            "x265enc" => {
-                // x265's zerolatency tune also disables B-frames and the
-                // lookahead, which keeps the frame grid simple and the encoder
-                // real-time (a CPU cannot do 4K60 any slower); ultrafast is
-                // what a software screen recorder needs.
-                set(&el, "tune", "zerolatency");
-                set(&el, "speed-preset", "ultrafast");
-                // ABR alone lets x265 run away on very noisy frames (83 Mb/s
-                // for a requested 8 Mb/s was measured); a half-second VBV pins
-                // it to the budget (8.7-9.7 Mb/s, dev/ELEMENTS.md).
-                let kbps = (bitrate_bps / 1000).max(1);
-                set(
-                    &el,
-                    "option-string",
-                    format!(
-                        "vbv-maxrate={kbps}:vbv-bufsize={}:rc-lookahead=0:bframes=0",
-                        (kbps / 2).max(1)
-                    ),
-                );
-            }
-            "vah264enc" | "vah265enc" if el.find_property("rate-control").is_some() => {
-                el.set_property_from_str("rate-control", "cbr");
-            }
-            // ffmpeg's ProRes encoders default to 422 HQ; upstream writes
-            // plain 422 ("standard"), and editors expect that. ProRes is
-            // intra-only and a 1080p60 frame needs all the parallelism it can
-            // get: prores_ks goes from 3.5 to 15 fps with slice threads.
-            "avenc_prores_ks" | "avenc_prores_aw" | "avenc_prores" => {
-                set(&el, "profile", "standard");
-                // ffmpeg's ProRes encoders only use slice threading when a
-                // slice count is set; with threads=auto alone the encoder is
-                // 3.5 fps at 1080p60, with slices it is far above real time.
-                if el.find_property("threads").is_some() {
-                    set(&el, "threads", "auto");
-                }
-                if el.find_property("slices").is_some() {
-                    set(&el, "slices", 8);
-                }
-            }
-            _ => {}
-        }
-        if is_va(name)
-            && let Err(e) = trial_encode(&el, &format)
-        {
-            if debug {
-                eprintln!("rec: debug: encoder {name}: trial encode failed: {e}");
-            }
-            continue;
+            // The trial gave the element a VA display, a surface pool and a
+            // running streaming thread. Re-parenting that element into the real
+            // pipeline stalled the writer on agent-amd (only ~11 distinct frames
+            // in 10 s, the rest repeated); a fresh element is the same encoder
+            // with none of the trial's state.
+            drop(el);
+            el = configured_encoder(name, bitrate_bps, fps, wide)?;
         }
         if debug {
             eprintln!("rec: debug: encoder {name}: chosen ({format})");
@@ -1948,6 +2042,10 @@ fn make_encoder(
                 "key-int-max",
                 "gop-size",
                 "qp",
+                "b-frames",
+                "ref-frames",
+                "target-usage",
+                "rate-control",
             ] {
                 if el.find_property(prop).is_some() {
                     dump.push(format!("{prop}={:?}", el.property_value(prop)));
@@ -2071,6 +2169,24 @@ fn open_sink(
 
     // The appsrc announces the source's own size (a display's native 1440p for
     // a 1080p recording, the camera's size); the capsfilter pins the output.
+    let enc_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let enc_out = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if std::env::var_os("REC_DEBUG").is_some() {
+        if let Some(pad) = venc.static_pad("sink") {
+            let c = enc_in.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        if let Some(pad) = venc.static_pad("src") {
+            let c = enc_out.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
     let video_caps = gst::Caps::builder("video/x-raw")
         .field("format", "BGRA")
         .field("width", spec.width as i32)
@@ -2271,6 +2387,8 @@ fn open_sink(
         tracks,
         path: path.to_path_buf(),
         encoder,
+        enc_in,
+        enc_out,
         layout: mp4_layout,
         video_max_bytes,
     })
@@ -2497,7 +2615,7 @@ mod tests {
         assert!(w.set_scene(Scene::Cam));
         w.push_cam(frame(1.0));
         assert!(w.started(), "the camera frame started the clock");
-        w.emit_until(1.0);
+        w.emit_until(1.0, usize::MAX);
         // No sink (preview-only), so emission counts slots: the run works and
         // the camera frame became the current one.
         assert!(w.cam_last.is_some());
@@ -2669,7 +2787,7 @@ mod tests {
                     &AudioChunk::stereo(at, 48_000, vec![0.001; 960]),
                 );
             }
-            w.emit_until(t - w.lag());
+            w.emit_until(t - w.lag(), usize::MAX);
         }
         let after = vm_rss_kb();
         let growth = after.saturating_sub(before);
@@ -2740,7 +2858,7 @@ mod tests {
                 AudioKind::Mic,
                 &AudioChunk::stereo(t0 + 1000.0 + i as f64 * 0.01, 48_000, vec![0.05; 960]),
             );
-            w.emit_until(t);
+            w.emit_until(t, usize::MAX);
         }
         // Give the encoder time to take the last slots.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -2748,7 +2866,7 @@ mod tests {
             // Always call emit_until: even when the video queue is full it
             // tops up the audio tracks with silence, which is what unblocks a
             // muxer waiting for a stream that never delivered.
-            w.emit_until(end);
+            w.emit_until(end, usize::MAX);
             std::thread::sleep(Duration::from_millis(2));
         }
         let stats = w.finish(end).unwrap();
@@ -2834,7 +2952,7 @@ mod tests {
                 next_audio += n as f64 / 48_000.0;
                 audio_count += 1;
             }
-            w.emit_until(t);
+            w.emit_until(t, usize::MAX);
         }
         let stats = w.finish(t0 + 1.0).unwrap();
         assert!(audio_count > 0);
@@ -2956,5 +3074,40 @@ mod tests {
             .field("format", "I420")
             .build();
         assert_eq!(caps_formats(&single), vec!["I420".to_string()]);
+    }
+    #[test]
+    fn a_busy_encoder_drops_the_slot_instead_of_retrying_it() {
+        // agent-amd: the VA encoder ran slightly below 60 fps; retrying the
+        // slot left the pacer behind, the source's frames were discarded as
+        // future content and the output repeated the last frame 572 times in
+        // 10 s. A busy encoder now drops the slot and keeps the grid current.
+        assert_eq!(slot_action(true, false, false), SlotAction::Write);
+        assert_eq!(slot_action(false, false, false), SlotAction::Drop);
+        assert_eq!(slot_action(true, true, false), SlotAction::Skip);
+        assert_eq!(slot_action(false, false, true), SlotAction::Skip);
+        assert_eq!(slot_action(true, true, true), SlotAction::Skip);
+    }
+    #[test]
+    fn a_refused_slot_leaves_a_gap_in_the_timeline() {
+        // Slots 115..119 were refused by the encoder and 120 was written: the
+        // PTS must be slot 120's time and the duration five frames, not one.
+        // Stamping the frame with the written index (115) played its content
+        // 83 ms early and made a synced VA recording fail synccheck.
+        let (pts, dur) = buffer_timing(120, Some(slot_ns(115, 60)), 60);
+        assert_eq!(pts, slot_ns(120, 60));
+        let five = gst::ClockTime::from_seconds_f64(5.0 / 60.0).nseconds();
+        assert!(dur.abs_diff(five) <= 2, "{dur} vs {five}");
+        let (pts0, dur0) = buffer_timing(0, None, 60);
+        assert_eq!(pts0, 0);
+        assert_eq!(
+            dur0,
+            gst::ClockTime::from_seconds_f64(1.0 / 60.0).nseconds()
+        );
+        // Backwards or equal times (a clock glitch) keep one frame.
+        let (_, dur1) = buffer_timing(3, Some(slot_ns(3, 60)), 60);
+        assert_eq!(
+            dur1,
+            gst::ClockTime::from_seconds_f64(1.0 / 60.0).nseconds()
+        );
     }
 }
