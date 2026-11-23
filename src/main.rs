@@ -205,15 +205,13 @@ fn devices() -> Result<()> {
         }
         Err(e) => println!("  unavailable: {e}"),
     }
-    match capture::audio::output_latency() {
-        Some(l) => println!(
+    // Upstream prints this line only when the output device reports a
+    // latency; a session with no sink prints nothing here at all.
+    if let Some(l) = capture::audio::output_latency() {
+        println!(
             "Output latency (system audio is shifted by this): {:.1} ms",
             l * 1000.0
-        ),
-        None => println!(
-            "Output latency: unavailable (no PipeWire sink reported a latency; \
-             set --system-audio-offset-ms to shift system audio yourself)"
-        ),
+        );
     }
     Ok(())
 }
