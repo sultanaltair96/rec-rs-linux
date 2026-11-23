@@ -154,6 +154,9 @@ modules:
         # this is the CARGO_HOME cargo reads its source replacement from.
         CARGO_HOME: /run/build/rec-rs/cargo
     build-commands:
+      # flatpak-cargo-generator writes the source-replacement as `config`;
+      # cargo 1.9x warns that only `config.toml` is supported going forward.
+      - if [ -f cargo/config ]; then mv cargo/config cargo/config.toml; fi
       - cargo build --release --offline --locked
       - install -Dm755 target/release/rec-rs /app/bin/rec-rs
       - ln -s rec-rs /app/bin/rec
