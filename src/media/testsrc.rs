@@ -102,8 +102,13 @@ impl AudioSource for MicBeep {
         let rate = crate::mixer::RATE;
         self.handle = Some(std::thread::spawn(move || {
             let mut k = 0i64;
+            // A device never sends a timestamp earlier than one it already
+            // sent; a late thread delivers its backlog with these (monotonic,
+            // possibly past) times, which is what a real buffer queue does.
+            let mut last_sent = f64::NEG_INFINITY;
             while !stop.load(Ordering::SeqCst) {
-                let pts = origin + (k * AUDIO_CHUNK as i64) as f64 / rate;
+                let pts = (origin + (k * AUDIO_CHUNK as i64) as f64 / rate).max(last_sent);
+                last_sent = pts;
                 // Deliver each chunk once it has "played", like a device.
                 let ready = pts + AUDIO_CHUNK as f64 / rate;
                 let now = media_types::now();

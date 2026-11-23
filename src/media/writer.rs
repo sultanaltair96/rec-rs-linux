@@ -176,6 +176,11 @@ pub const MAX_BACKLOG_SECS: f64 = 0.5;
 /// Audio timestamp jitter tolerated before a track is padded or trimmed.
 pub const SNAP_SECS: f64 = 0.0015;
 
+/// Fade-in applied to real audio that follows filler silence, so the join is
+/// not a step (a click) whatever phase the signal resumes at. Short enough to
+/// leave a beep's onset and peak intact (the parent's ±5 ms / ±1 dB).
+const FILLER_FADE_SECS: f64 = 0.002;
+
 /// The longest audio gap the writer fills with silence. A longer jump is a
 /// source's clock bug or a device that connected late: the track resyncs
 /// instead of allocating (and writing) the silence for it.
@@ -227,6 +232,11 @@ struct AudioTrack {
     channels: u8,
     /// Output-timeline position (seconds) where this track continues.
     next: Option<f64>,
+    /// The last thing written to this track was filler silence (a source that
+    /// had not delivered yet, or a gap). Real audio that would overlap it is
+    /// dropped whole rather than spliced mid-chunk, and the next real write
+    /// after it is faded in, so a late burst never clicks.
+    after_filler: bool,
 }
 
 /// One audio source's stream state: resampling to 48 kHz and its fader.
@@ -882,11 +892,12 @@ impl Writer {
         let mut failed = false;
         for track in &mut sink.tracks {
             let start = track.next.unwrap_or(0.0);
-            let never = track.next.is_none();
-            if out_time <= start + SNAP_SECS {
-                continue;
-            }
-            if !never && out_time - start < STARVE_SECS {
+            // Only a track that is genuinely overdue gets filler: a source
+            // that is merely late (under load, a burst of past-pts chunks) must
+            // get its own samples into the file first, or the filler would
+            // push the whole track late (measured: 11-60 ms under load) and
+            // splicing at the filler edge clicked.
+            if out_time - start < STARVE_SECS {
                 continue;
             }
             let mut at = start;
@@ -904,6 +915,7 @@ impl Writer {
                 filled += 1;
             }
             track.next = Some(at);
+            track.after_filler = true;
         }
         self.stats.audio_gaps_filled += filled;
         if filled > 0 {
@@ -956,6 +968,14 @@ impl Writer {
             if skip >= frames.len() {
                 return false;
             }
+            if track.after_filler {
+                // The range this chunk covers was already written as filler
+                // (the source was overdue and burst afterwards). Dropping the
+                // whole chunk keeps an intact signal from the next one instead
+                // of splicing this one mid-beep, which clicked and measured
+                // 2-4 dB hot.
+                return false;
+            }
         }
         let body = &frames[skip..];
         // `--duration` cuts every track at the same output time, so the file
@@ -983,11 +1003,31 @@ impl Writer {
             ok &= push_track_samples(track, start, &vec![[0.0, 0.0]; pad], 2);
             self.stats.audio_gaps_filled += 1;
         }
+        // Fade in when the signal resumes after filler, so silence-to-audio at
+        // an arbitrary phase is not a step.
+        let after_filler = track.after_filler || pad > 0;
+        let faded;
+        let body = if after_filler && !body.is_empty() {
+            let fade = ((FILLER_FADE_SECS * rate) as usize).min(body.len()).max(1);
+            let mut f = body.to_vec();
+            for (i, s) in f.iter_mut().enumerate().take(fade) {
+                let g = i as f32 / fade as f32;
+                s[0] *= g;
+                s[1] *= g;
+            }
+            faded = f;
+            &faded[..]
+        } else {
+            body
+        };
         if !body.is_empty() {
             ok &= push_track_samples(track, body_start, body, track.channels as usize);
         }
         if ok {
             track.next = Some(body_start + body.len() as f64 / rate);
+            if !body.is_empty() {
+                track.after_filler = false;
+            }
         } else {
             self.check_bus();
         }
@@ -1720,8 +1760,14 @@ fn make_encoder(
             // get: prores_ks goes from 3.5 to 15 fps with slice threads.
             "avenc_prores_ks" | "avenc_prores_aw" | "avenc_prores" => {
                 set(&el, "profile", "standard");
+                // ffmpeg's ProRes encoders only use slice threading when a
+                // slice count is set; with threads=auto alone the encoder is
+                // 3.5 fps at 1080p60, with slices it is far above real time.
                 if el.find_property("threads").is_some() {
                     set(&el, "threads", "auto");
+                }
+                if el.find_property("slices").is_some() {
+                    set(&el, "slices", 8);
                 }
             }
             _ => {}
@@ -2053,6 +2099,7 @@ fn open_sink(
                 appsrc: src,
                 channels: *channels as u8,
                 next: None,
+                after_filler: false,
             });
         }
     }
