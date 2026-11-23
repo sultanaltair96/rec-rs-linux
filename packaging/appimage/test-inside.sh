@@ -63,7 +63,7 @@ echo "== record: prores"
 if "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -t 2 --codec prores \
         -o /tmp/prores.mov >/tmp/prores.log 2>&1; then
     grep -o 'rec: encoder [a-z0-9_]*' /tmp/prores.log | head -1
-    ok "record prores"
+    ok "record prores ($(grep -o 'rec: encoder [a-z0-9_]*' /tmp/prores.log | head -1 | sed 's/rec: encoder //'))"
 else
     cat /tmp/prores.log
     bad "record prores"
@@ -120,6 +120,8 @@ for pair in \
     voaacenc:libgstvoaacenc.so aacparse:libgstaudioparsers.so \
     opusenc:libgstopus.so opusdec:libgstopus.so \
     h264parse:libgstvideoparsersbad.so h265parse:libgstvideoparsersbad.so \
+    avenc_prores_aw:libgstlibav.so avenc_prores:libgstlibav.so \
+    avenc_prores_ks:libgstlibav.so \
     mp4mux:libgstisomp4.so videoscale:libgstvideoconvertscale.so \
     x264enc:libgstx264.so x265enc:libgstx265.so; do
     el=${pair%%:*}
@@ -135,7 +137,7 @@ echo "== live: RTMP + WHIP + replay"
 if [ -f /tmp/mediamtx/.started ]; then
     export REC_STREAM_KEY=appimage-test-key
     rc=0
-    "$APPIMAGE" record --test-pattern --no-mic --no-system-audio -r 720p --fps 30 -t 8 \
+    "$APPIMAGE" record --test-pattern --no-mic -r 720p --fps 30 -t 8 \
         --stream rtmp://127.0.0.1:1935/rtmppkg \
         --stream http://127.0.0.1:8889/whippkg/whip \
         --replay 15 -o /tmp/live.mp4 >/tmp/live.log 2>&1 &
@@ -172,11 +174,14 @@ if [ -f /tmp/mediamtx/.started ]; then
         newest=$(find "${dir:-/nonexistent}" -name '*.mp4' 2>/dev/null | head -1)
         if [ -n "$newest" ] && "$APPIMAGE" probe "$newest" >/tmp/live-$kind.probe 2>&1; then
             tracks=$(grep '^track' /tmp/live-$kind.probe | tr '\n' ' ')
-            audio=$(printf '%s' "$tracks" | grep -o 'audio [a-z0-9]*' | head -1)
-            case "$tracks" in
-                *video*h264*audio*) ok "MediaMTX recorded $kind with video and $audio" ;;
-                *) echo "  $tracks"; bad "MediaMTX $kind recording has video and audio" ;;
-            esac
+            audio=$(printf '%s' "$tracks" | grep -oE '(soun|audio) [A-Za-z0-9]+' | head -1)
+            video=$(printf '%s' "$tracks" | grep -oE '(vide|video) [A-Za-z0-9]+' | head -1)
+            if [ -n "$video" ] && [ -n "$audio" ]; then
+                ok "MediaMTX recorded $kind with $video and $audio"
+            else
+                echo "  $tracks"
+                bad "MediaMTX $kind recording has video and audio"
+            fi
         else
             cat /tmp/live-$kind.probe 2>/dev/null
             bad "MediaMTX has no $kind recording"

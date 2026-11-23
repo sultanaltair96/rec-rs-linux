@@ -25,7 +25,8 @@ flatpak list | grep "$APP" | tee "$OUT/installed.txt"
 echo "== encoders and capture elements inside the sandbox"
 {
     for el in x264enc x265enc openh264enc avenc_aac fdkaacenc fdkaacdec avdec_aac \
-              aacparse opusenc opusdec avenc_prores_ks pipewiresrc appsrc appsink \
+              aacparse opusenc opusdec avenc_prores_aw avenc_prores avenc_prores_ks \
+              pipewiresrc appsrc appsink \
               videoconvert videoscale mp4mux qtmux qtdemux h264parse h265parse \
               avdec_h264 avdec_h265; do
         if flatpak run --command=gst-inspect-1.0 "$APP" "$el" >/dev/null 2>&1; then
@@ -99,7 +100,7 @@ echo "== record: prores (the runtime's avenc_prores_ks)"
 if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
         -t 2 --codec prores -o "$HOME/Videos/prores.mov" >"$OUT/prores.log" 2>&1; then
     grep -o 'rec: encoder [a-z0-9_]*' "$OUT/prores.log" | head -1
-    ok "record prores"
+    ok "record prores ($(grep -o 'rec: encoder [a-z0-9_]*' "$OUT/prores.log" | head -1 | sed 's/rec: encoder //'))"
 else
     cat "$OUT/prores.log"
     bad "record prores"
@@ -138,7 +139,7 @@ else
 export REC_STREAM_KEY=flatpak-test-key
 live_log="$OUT/live.log"
 rc=0
-flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
+flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic \
     -r 720p --fps 30 -t 8 \
     --stream rtmp://127.0.0.1:1935/rtmppkg \
     --stream http://127.0.0.1:8889/whippkg/whip \
@@ -153,15 +154,12 @@ sleep 5
 # is a documented limitation, not a silent failure.
 save_rc=0
 flatpak run --command=rec-rs "$APP" save-replay >>"$OUT/live-save.log" 2>&1 || save_rc=$?
-case "$save_rc" in
-    0) ok "save-replay reaches the running recorder from a second flatpak run" ;;
-    163) skipping "save-replay from a second flatpak run" \
-             "PID namespaces: the pidfile pid is local to the recorder's sandbox (needs the control socket)" ;;
-    *)
-        cat "$OUT/live-save.log"
-        bad "save-replay from a second flatpak run (exit $save_rc)"
-        ;;
-esac
+if [ "$save_rc" -eq 0 ]; then
+    ok "save-replay reaches the running recorder from a second flatpak run (control socket)"
+else
+    cat "$OUT/live-save.log"
+    bad "save-replay from a second flatpak run (exit $save_rc)"
+fi
 wait "$rec" || rc=$?
 status=$(tr '\r' '\n' <"$live_log")
 if [ "$rc" -eq 0 ]; then ok "record --stream --replay finished cleanly"; else echo "$status" | tail -8; bad "record --stream --replay"; fi
@@ -176,9 +174,14 @@ if echo "$status" | grep -qE 'replay [1-9][0-9]*s [0-9.]+ MB'; then
 else
     bad "the replay buffer never filled"
 fi
-# The clip a same-process save produces is verified by test-appimage.sh, which
-# has no sandbox; inside the Flatpak the clip path is the only part blocked by
-# the PID namespace above.
+replay=$(echo "$status" | grep -o 'replay saved .*' | head -1 | sed 's/replay saved //')
+if [ -n "$replay" ] && flatpak run --command=rec-rs "$APP" probe "$replay" >"$OUT/live-replay.probe" 2>&1; then
+    grep '^track' "$OUT/live-replay.probe" | sed 's/^/  /'
+    ok "the replay clip plays ($(basename "$replay"))"
+else
+    cat "$OUT/live-replay.probe" 2>/dev/null
+    bad "the replay clip"
+fi
 
 # The server's own recordings: one from RTMP, one from WHIP. fMP4 segments are
 # finalised when the connection closes, so give the server a moment first.
@@ -196,11 +199,14 @@ for kind in rtmp whip; do
     newest=$(find "${dir:-/nonexistent}" -name '*.mp4' 2>/dev/null | head -1)
     if [ -n "$newest" ] && flatpak run --command=rec-rs "$APP" probe "$newest" >"$OUT/live-$kind.probe" 2>&1; then
         tracks=$(grep '^track' "$OUT/live-$kind.probe" | tr '\n' ' ')
-        audio=$(printf '%s' "$tracks" | grep -o 'audio [a-z0-9]*' | head -1)
-        case "$tracks" in
-            *video*h264*audio*) ok "MediaMTX recorded $kind with video and $audio" ;;
-            *) echo "  $tracks"; bad "MediaMTX $kind recording has video and audio" ;;
-        esac
+        audio=$(printf '%s' "$tracks" | grep -oE '(soun|audio) [A-Za-z0-9]+' | head -1)
+        video=$(printf '%s' "$tracks" | grep -oE '(vide|video) [A-Za-z0-9]+' | head -1)
+        if [ -n "$video" ] && [ -n "$audio" ]; then
+            ok "MediaMTX recorded $kind with $video and $audio"
+        else
+            echo "  $tracks"
+            bad "MediaMTX $kind recording has video and audio"
+        fi
     else
         cat "$OUT/live-$kind.probe" 2>/dev/null
         bad "MediaMTX has no $kind recording"
@@ -208,6 +214,60 @@ for kind in rtmp whip; do
 done
 
 fi
+
+echo "== second-instance control: the socket, not the pid"
+# Phase 1E gives the recorder a control socket next to the app's own, so
+# stop/pause/resume/save-replay work from another sandbox even though the
+# pidfile's pid is local to the recorder's PID namespace. This is the 1E
+# scenario: an idle app, a CLI recording, a pidfile whose pid is bogus, and a
+# stop that must still land.
+rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+Xvfb :99 -screen 0 1280x800x24 >"$OUT/xvfb-ctl.log" 2>&1 &
+xvfb_pid=$!
+sleep 2
+DISPLAY=:99 flatpak run "$APP" >"$OUT/app-idle.log" 2>&1 &
+app_pid=$!
+sleep 3
+flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
+    -t 30 -o /tmp/cli.mp4 >"$OUT/cli-record.log" 2>&1 &
+cli_pid=$!
+sleep 4
+
+if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
+        -t 1 -o /tmp/second.mp4 >"$OUT/cli-second.log" 2>&1; then
+    bad "a second recorder was allowed to start"
+else
+    if grep -q 'another recorder is running' "$OUT/cli-second.log"; then
+        ok "a second recorder is refused by the control socket"
+    else
+        cat "$OUT/cli-second.log"
+        bad "a second recorder's refusal"
+    fi
+fi
+
+printf '999999\n/tmp/cli.mp4\n' >"$rt/rec-rs.pid"
+stop_rc=0
+stop_out=$(flatpak run --command=rec-rs "$APP" stop 2>&1) || stop_rc=$?
+if [ "$stop_rc" -eq 0 ]; then
+    case "$stop_out" in
+        *"/tmp/cli.mp4"*) ok "stop crossed the sandbox and printed /tmp/cli.mp4" ;;
+        *) echo "  $stop_out"; bad "stop printed the wrong path" ;;
+    esac
+else
+    echo "  $stop_out"
+    bad "stop from a second instance (exit $stop_rc)"
+fi
+wait "$cli_pid" 2>/dev/null || true
+
+if kill -0 "$app_pid" 2>/dev/null; then
+    ok "the idle app is still running after the CLI recording"
+else
+    tail -5 "$OUT/app-idle.log"
+    bad "the idle app is still running"
+fi
+kill "$app_pid" "$xvfb_pid" 2>/dev/null || true
+wait "$app_pid" 2>/dev/null || true
+wait "$xvfb_pid" 2>/dev/null || true
 
 echo "== Secret Service: stream-key through the sandbox"
 # A keyring needs a session bus and an unlocked login keyring; test-flatpak.sh
