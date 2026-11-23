@@ -311,6 +311,11 @@ pub struct Writer {
     mixer: Option<Mixer>,
     /// The mix bus for the live encode (real time, keeps running while paused).
     live_mixer: Option<Mixer>,
+    /// Host time of the first frame handed to the live encode. Its timeline
+    /// starts there; audio from before it is pre-roll the RTMP/WHIP servers
+    /// discard as "received too late" (a real race: 3 packets, one run in two
+    /// under load), so the tap does not send it.
+    live_t0: Option<f64>,
     /// Wall-clock time each source last delivered a chunk. Filler silence is
     /// only for a source that is *gone* (nothing for STARVE_SECS), never for
     /// one that is alive but behind in media time (a backlog burst): filling
@@ -410,6 +415,7 @@ impl Writer {
             mixer: None,
             live_mixer: None,
             source_seen: [0.0; 2],
+            live_t0: None,
             live: None,
             preview: None,
             last_preview: 0.0,
@@ -1186,6 +1192,9 @@ impl Writer {
             if want_live && let Some(l) = self.live.clone() {
                 // The live encode places frames on the real grid, so a paused
                 // recording does not stall it.
+                if self.live_t0.is_none() {
+                    self.live_t0 = Some(slot_t);
+                }
                 let mut stamped = frame.as_ref().clone();
                 stamped.pts = slot_t;
                 l.push_video(&stamped);
@@ -2665,6 +2674,77 @@ mod tests {
             after.saturating_sub(before) < 300_000,
             "memory grew {} kB",
             after.saturating_sub(before)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+    /// A real PipeWire microphone starts after its stream reaches Streaming
+    /// and delivers 1024/2048-frame buffers, so its first chunk is late and
+    /// its sizes are not 10 ms. Such a source must still fill its track (the
+    /// 1B `pattern-mic` regression was a finalise bug, but this keeps the
+    /// writer side honest too).
+    #[test]
+    fn a_late_first_chunk_with_irregular_sizes_still_fills_the_track() {
+        let _ = gst::init();
+        let dir = std::env::temp_dir().join(format!("rec-rs-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.mov");
+        let _ = std::fs::remove_file(&path);
+        let spec = VideoSpec {
+            width: 320,
+            height: 180,
+            fps: 30,
+            codec: Codec::H264,
+            bitrate: 1_000_000,
+        };
+        let mut w = Writer::new(
+            Some(&path),
+            &spec,
+            false,
+            true,
+            AudioLayout::Stems,
+            [Volume::UNITY; 2],
+            Scene::Screen,
+            PipSpec::default(),
+        )
+        .unwrap();
+        w.limit_secs(Some(1.0));
+        let t0 = crate::media_types::now();
+        // Video on time; the microphone's first buffer only at 0.3 s, then
+        // 1024- and 2048-frame buffers (21.3 and 42.7 ms).
+        let mut next_audio = t0 + 0.3;
+        let mut sizes = [1024usize, 2048].into_iter().cycle();
+        let mut audio_count = 0;
+        for i in 0..30 {
+            let t = t0 + i as f64 / 30.0;
+            w.push_video(frame_at(t, 320, 180));
+            while next_audio <= t {
+                let n = sizes.next().unwrap();
+                let samples: Vec<f32> = vec![0.05; n * 2];
+                w.push_audio(
+                    AudioKind::Mic,
+                    &AudioChunk::stereo(next_audio, 48_000, samples),
+                );
+                next_audio += n as f64 / 48_000.0;
+                audio_count += 1;
+            }
+            w.emit_until(t);
+        }
+        let stats = w.finish(t0 + 1.0).unwrap();
+        assert!(audio_count > 0);
+        assert!(stats.audio_mic_buffers > 0, "mic buffers were written");
+        assert_eq!(stats.audio_drops, 0, "no mic buffer was dropped");
+        let info = crate::media::mp4::read(&path).expect("the file reads back");
+        let mic = info
+            .tracks
+            .iter()
+            .find(|t| t.handler == crate::media::mp4::Handler::Audio)
+            .expect("a microphone track exists");
+        assert!(mic.samples > 0, "the mic track has samples");
+        assert!(
+            mic.duration as f64 / mic.timescale.max(1) as f64 > 0.5,
+            "the mic track covers most of the second: {} samples",
+            mic.samples
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

@@ -547,38 +547,33 @@ pub fn read(path: &Path) -> Result<MovieInfo> {
         // The init moov has no sample tables; take the counts, bytes, duration
         // and presentation start from the fragment headers so `probe` reports
         // the real movie (a crash-left file is as long as its samples).
-        #[derive(Default)]
-        struct Stats {
-            samples: u64,
-            bytes: u64,
-            media: u64,
-            first: Option<u64>,
-            durations: HashMap<u32, u32>,
-        }
-        let mut stats: HashMap<u32, Stats> = HashMap::new();
+        let mut per_track: HashMap<u32, Vec<Sample>> = HashMap::new();
+        let mut firsts: HashMap<u32, u64> = HashMap::new();
         for b in boxes.iter().filter(|b| b.kind == MOOF) {
             let buf = read_at(&mut file, b.start, b.size)?;
             for (tid, decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
-                let e = stats.entry(tid).or_default();
-                e.samples += samples.len() as u64;
-                e.media += media_duration(&samples);
-                e.bytes += samples.iter().map(|s| s.size as u64).sum::<u64>();
-                e.first = Some(e.first.map_or(decode_time, |f| f.min(decode_time)));
-                for s in &samples {
-                    *e.durations.entry(s.duration).or_default() += 1;
-                }
+                per_track.entry(tid).or_default().extend(samples);
+                firsts
+                    .entry(tid)
+                    .and_modify(|f| *f = (*f).min(decode_time))
+                    .or_insert(decode_time);
             }
         }
         for t in tracks.iter_mut() {
-            let Some(st) = stats.get(&t.track_id) else {
+            let Some(samples) = per_track.get(&t.track_id) else {
                 continue;
             };
-            t.samples = st.samples;
-            t.bytes = st.bytes;
-            t.duration = st.media;
-            t.first_pts = st.first.unwrap_or(0) as f64 / t.timescale.max(1) as f64;
-            let mode = st
-                .durations
+            let samples = sane_durations(samples, t.timescale);
+            t.samples = samples.len() as u64;
+            t.bytes = samples.iter().map(|s| s.size as u64).sum();
+            t.duration = media_duration(&samples);
+            t.first_pts =
+                firsts.get(&t.track_id).copied().unwrap_or(0) as f64 / t.timescale.max(1) as f64;
+            let mut durations: HashMap<u32, u32> = HashMap::new();
+            for s in &samples {
+                *durations.entry(s.duration).or_default() += 1;
+            }
+            let mode = durations
                 .iter()
                 .max_by_key(|(d, n)| (**n, std::cmp::Reverse(**d)))
                 .map(|(d, _)| *d)
@@ -722,13 +717,13 @@ fn parse_moof(
                 let cts = if rflags & 0x800 != 0 {
                     let v = be32(trun, p)?;
                     p += 4;
-                    if version == 1 {
-                        v as i32
-                    } else {
-                        // Version 0 composition offsets are unsigned; saturate
-                        // instead of wrapping negative.
-                        v.min(i32::MAX as u32) as i32
-                    }
+                    // qtmux writes a *negative* composition offset (the
+                    // compensation for a retimed audio duration) as two's
+                    // complement even in a version-0 trun, whose offsets the
+                    // spec calls unsigned. Reading it as unsigned saturated it
+                    // to i32::MAX and put the 11th audio packet at 44739 s.
+                    let _ = version;
+                    v as i32
                 } else {
                     0
                 };
@@ -779,6 +774,50 @@ struct Tables {
     chunks: Vec<Chunk>,
     /// True when an offset does not fit 32 bits (`co64`).
     co64: bool,
+}
+
+/// Repair a fragment's sample durations.
+///
+/// qtmux re-times audio buffers whose duration it considers wrong
+/// (`max-raw-audio-drift`): a real PipeWire mic delivers 1024/2048-frame
+/// buffers, and the truns then contain duration 0 or a negative duration
+/// written as a huge `u32` (the demuxer's fragmented timeline even jumps back
+/// inside a fragment). Copying those into a regular `stts` produced a track
+/// whose 11th packet was at 44739 s, so a finalised mic track decoded 0.2 s of
+/// a 4 s recording. When any duration is implausible, rebuild a uniform
+/// timeline from the most common plausible one.
+fn sane_durations(samples: &[Sample], timescale: u32) -> Vec<Sample> {
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for s in samples
+        .iter()
+        .filter(|s| s.duration > 0 && s.duration <= timescale)
+    {
+        *counts.entry(s.duration).or_default() += 1;
+    }
+    let mode = counts
+        .iter()
+        .max_by_key(|(d, n)| (**n, std::cmp::Reverse(**d)))
+        .map(|(d, _)| *d)
+        .unwrap_or(0);
+    if mode == 0 {
+        return samples.to_vec();
+    }
+    let irregular = samples
+        .iter()
+        .any(|s| s.duration == 0 || s.duration > timescale);
+    if !irregular {
+        return samples.to_vec();
+    }
+    // The composition offsets were compensating the retimed durations; with a
+    // uniform decode timeline they would double-count, so drop them.
+    samples
+        .iter()
+        .map(|s| Sample {
+            duration: mode,
+            cts: 0,
+            ..*s
+        })
+        .collect()
 }
 
 fn build_tables(samples: &[Sample]) -> Tables {
@@ -1204,10 +1243,11 @@ pub fn finalize(
         let samples = per_track.get(&t.info.track_id);
         let media_duration = match samples {
             Some(samples) => {
+                let samples = sane_durations(samples, t.info.timescale);
                 total_samples += samples.len() as u64;
-                let tables = build_tables(samples);
+                let tables = build_tables(&samples);
                 plan.tables = Some((tables, samples.len() as u32));
-                Some(media_duration(samples))
+                Some(media_duration(&samples))
             }
             // A regular movie keeps its tables; a track with no fragments at
             // all keeps its (empty) init stbl.

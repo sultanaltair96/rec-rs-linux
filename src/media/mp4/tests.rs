@@ -876,3 +876,80 @@ fn keep_copies_the_fragmented_file_before_the_append() {
     std::fs::remove_file(&keep).ok();
     std::fs::remove_file(&path).ok();
 }
+
+/// qtmux retimes audio buffers it considers irregular and writes the
+/// compensation as a *negative* composition offset, in a version-0 trun whose
+/// offsets the spec calls unsigned. Reading it as unsigned saturated it to
+/// i32::MAX, which put a real microphone's 11th packet at 44739 s after the
+/// finalise. Parse it signed and rebuild a uniform timeline from it.
+#[test]
+fn a_version_0_trun_with_a_negative_composition_offset_parses_signed() {
+    // tfhd: default duration 1024; trun v0 with duration/size/flags/cts.
+    let mut tfhd_body = 1u32.to_be_bytes().to_vec();
+    tfhd_body.extend_from_slice(&1024u32.to_be_bytes());
+    let mut traf = full_flags(b"tfhd", 0, 0x8, &tfhd_body);
+    traf.extend_from_slice(&tfdt(0));
+    let mut trun_body = 2u32.to_be_bytes().to_vec();
+    trun_body.extend_from_slice(&332i32.to_be_bytes()); // data_offset
+    for (dur, size, cts) in [(1024u32, 21u32, 0i32), (0u32, 4u32, -3991i32)] {
+        trun_body.extend_from_slice(&dur.to_be_bytes());
+        trun_body.extend_from_slice(&size.to_be_bytes());
+        trun_body.extend_from_slice(&0u32.to_be_bytes());
+        trun_body.extend_from_slice(&cts.to_be_bytes());
+    }
+    traf.extend_from_slice(&full_flags(b"trun", 0, 0xf01, &trun_body));
+    let mut body = full_flags(b"mfhd", 0, 0, &[0; 4]);
+    let mut traf_box = vec![];
+    push_box(&mut traf_box, b"traf", &traf);
+    body.extend_from_slice(&traf_box);
+    let mut moof = vec![];
+    push_box(&mut moof, b"moof", &body);
+    let out = parse_moof(&moof, 0, &HashMap::new()).unwrap();
+    let (_, _t, samples) = &out[0];
+    assert_eq!(samples[1].cts, -3991, "signed, not saturated");
+    assert_eq!(samples[0].cts, 0);
+}
+
+#[test]
+fn a_retimed_audio_timeline_is_rebuilt_uniform_and_monotonic() {
+    let samples = vec![
+        Sample {
+            offset: 0,
+            size: 21,
+            duration: 1024,
+            cts: 0,
+            sync: true,
+        },
+        Sample {
+            offset: 21,
+            size: 4,
+            duration: 0,
+            cts: -3991,
+            sync: true,
+        },
+        // A negative duration written as a wrapped u32.
+        Sample {
+            offset: 25,
+            size: 4,
+            duration: 4_294_963_305,
+            cts: -3991,
+            sync: true,
+        },
+        Sample {
+            offset: 29,
+            size: 4,
+            duration: 1024,
+            cts: 0,
+            sync: true,
+        },
+    ];
+    let fixed = sane_durations(&samples, 48_000);
+    assert!(
+        fixed.iter().all(|s| s.duration == 1024 && s.cts == 0),
+        "{fixed:?}"
+    );
+    let tables = build_tables(&fixed);
+    assert_eq!(tables.stts, vec![(4, 1024)], "one monotonic run");
+    assert!(tables.ctts.is_none(), "the compensating cts is dropped");
+    assert_eq!(media_duration(&fixed), 4096);
+}
