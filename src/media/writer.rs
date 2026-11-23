@@ -311,8 +311,8 @@ fn restore_encoder_slot(
 }
 
 /// Install on the encoder itself: downstream parsers need the corrected PTS.
-/// A missing/invalid association is fatal and counted even if another consumer
-/// has already taken the error message from the pipeline bus.
+/// If an encoder strips metadata, keep its own timestamp and count the degraded
+/// association rather than destroying the recording or guessing a slot.
 fn install_encoder_timing(
     encoder: &gst::Element,
     enc_in: Arc<std::sync::atomic::AtomicU64>,
@@ -325,7 +325,6 @@ fn install_encoder_timing(
             .context("video encoder has no static sink/src pad")?;
         let reference = gst::Caps::builder("timestamp/x-rec-slot").build();
         let segment = std::sync::Mutex::new(None);
-        let encoder = encoder.downgrade();
         let count = if input {
             enc_in.clone()
         } else {
@@ -348,17 +347,10 @@ fn install_encoder_timing(
                     } else {
                         restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
                     };
-                    if let Err(error) = result {
-                        if errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                            if let Some(encoder) = encoder.upgrade() {
-                                gst::element_error!(
-                                    encoder,
-                                    gst::StreamError::Failed,
-                                    ("{error:#}")
-                                );
-                            }
-                        }
-                        return gst::PadProbeReturn::Drop;
+                    if let Err(error) = result
+                        && errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+                    {
+                        eprintln!("rec: warning: video encoder timestamp association unavailable ({error:#}); keeping encoder timestamps, sync may drift");
                     }
                 }
                 gst::PadProbeReturn::Ok
@@ -1669,8 +1661,8 @@ impl Writer {
             .timing_errors
             .load(std::sync::atomic::Ordering::Relaxed);
         if timing_errors != 0 {
-            bail!(
-                "video encoder timestamp association failed ({timing_errors} buffers); timestamp/x-rec-slot metadata or segment was missing/invalid"
+            eprintln!(
+                "rec: warning: {timing_errors} video encoder buffers used unverified timestamps"
             );
         }
         if let Err(e) = &result {
@@ -2632,7 +2624,12 @@ mod tests {
                         }
                         if lose_meta {
                             let mut replacement = gst::Buffer::with_size(1).unwrap();
-                            replacement.make_mut().set_pts(gst::ClockTime::ZERO);
+                            let b = replacement.make_mut();
+                            let pts = gst::ClockTime::from_seconds(3_600_000)
+                                + gst::ClockTime::from_nseconds(slot_ns(i as i64, 30));
+                            b.set_pts(pts);
+                            b.set_dts(pts);
+                            b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30)));
                             *buffer = replacement;
                         } else {
                             buffer.make_mut().set_pts(gst::ClockTime::from_seconds(i));
@@ -2692,16 +2689,12 @@ mod tests {
         let message = message.expect("pipeline must EOS or report missing metadata");
         assert_eq!(count_in.load(Ordering::Relaxed), 6);
         if lose_meta {
-            assert!(matches!(message.view(), gst::MessageView::Error(_)));
-            if let gst::MessageView::Error(error) = message.view() {
-                assert!(
-                    error
-                        .error()
-                        .to_string()
-                        .contains("lost timestamp/x-rec-slot")
-                );
-            }
-            assert!(times.is_empty());
+            assert!(matches!(message.view(), gst::MessageView::Eos(_)));
+            assert_eq!(
+                times,
+                (0..6).map(|i| slot_ns(i, 30)).collect::<Vec<_>>(),
+                "fallback retains encoder timestamps, without guessing"
+            );
             assert_eq!(errors.load(Ordering::Relaxed), 6);
             assert_eq!(count_out.load(Ordering::Relaxed), 6);
         } else {
@@ -2725,7 +2718,7 @@ mod tests {
     }
 
     #[test]
-    fn encoder_slot_missing_metadata_posts_error_and_counts() {
+    fn encoder_slot_missing_metadata_warns_counts_and_keeps_frames() {
         run_encoder_slot_pipeline("identity", true);
     }
 
