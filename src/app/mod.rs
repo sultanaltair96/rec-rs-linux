@@ -86,6 +86,9 @@ pub enum Cmd {
 }
 
 static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
+/// A camera or microphone was plugged in or removed (1B's watchers, which run
+/// on their own threads): reload in the tick (G9).
+static DEVICES_CHANGED: AtomicBool = AtomicBool::new(false);
 static PROXY: OnceLock<Mutex<EventLoopProxy<()>>> = OnceLock::new();
 
 /// Wake the event loop (from any thread).
@@ -498,10 +501,12 @@ struct App {
     main_occluded: bool,
     /// The lock watcher (G8), if a bus answered.
     lock: Option<lock::LockWatcher>,
-    /// When the device lists were last refreshed by the hotplug poll (G9).
-    last_device_poll: Instant,
-    /// The device lists as last seen, to spot a plug/unplug (G9).
+    /// The device lists as last seen, to ignore a watch event that changes
+    /// nothing (G9).
     device_fingerprint: Vec<String>,
+    /// 1B's hotplug watchers (G9); they stop when dropped.
+    _camera_watch: Option<crate::capture::camera::DeviceWatch>,
+    _audio_watch: Option<crate::capture::audio::DeviceWatch>,
     st: State,
     tray: Option<ksni::blocking::Handle<tray::Tray>>,
     /// The tray starts on a thread: registering the status item talks to D-Bus,
@@ -545,6 +550,14 @@ impl App {
         spawn_accent_fetch(accent_tx);
         let (tap, tap_sink) = preview::Tap::new(Arc::new(wake));
         let lock = lock::LockWatcher::start(Arc::new(wake));
+        // G9: 1B's watchers call back on their own thread; wake the loop and
+        // reload in the tick. An unavailable backend simply has no watch.
+        let changed = || {
+            DEVICES_CHANGED.store(true, Ordering::SeqCst);
+            wake();
+        };
+        let camera_watch = crate::capture::camera::watch_devices(changed).ok();
+        let audio_watch = crate::capture::audio::watch_devices(changed).ok();
         if settings {
             push(Cmd::ShowSettings);
         }
@@ -557,12 +570,13 @@ impl App {
             hidden_for_recording: false,
             screen_locked: false,
             main_occluded: false,
-            last_device_poll: Instant::now(),
             device_fingerprint,
             st,
             tray: None,
             tray_rx: None,
             lock,
+            _camera_watch: camera_watch,
+            _audio_watch: audio_watch,
             tap,
             tap_sink,
             last_tick: Instant::now(),
@@ -1059,6 +1073,30 @@ impl App {
         exclusion_is_done_by_capture(crate::capture::screen::backend())
     }
 
+    /// After a device was plugged in or removed (G9): refresh the lists, and
+    /// restart the preview when the saved mic now resolves to another device
+    /// (upstream's `devices_changed`).
+    fn devices_changed(&mut self) {
+        let cameras = crate::capture::camera::cameras().unwrap_or_default();
+        let mics = crate::capture::audio::microphones().unwrap_or_default();
+        let fingerprint = device_fingerprint(&cameras, &mics);
+        if fingerprint == self.device_fingerprint {
+            return;
+        }
+        self.device_fingerprint = fingerprint;
+        load_devices(&mut self.st);
+        if self.st.recording.is_none()
+            && self.st.preview.is_some()
+            && self.st.settings.mic_enabled
+            && let Some(sel) = self.st.settings.mic.as_deref()
+            && let Ok(pick) =
+                crate::capture::audio::pick_mic(sel, self.st.settings.mic_name.as_deref())
+            && mic_needs_restart(self.st.mic_in_use.as_ref(), pick.id.as_deref())
+        {
+            self.st.preview_settings = None;
+        }
+    }
+
     /// Hide the main window for the running recording, and say so (G3).
     fn hide_window_for_recording(&mut self) {
         self.hide_main();
@@ -1289,31 +1327,9 @@ impl App {
             self.st.refresh_devices = false;
             load_devices(&mut self.st);
         }
-        // G9: device hotplug. 1B has no change notification yet, so poll the
-        // two cheap lists (V4L2 nodes, PipeWire nodes) and only do the rest
-        // when they actually changed.
-        if self.last_device_poll.elapsed() >= Duration::from_secs(2) {
-            self.last_device_poll = Instant::now();
-            let cameras = crate::capture::camera::cameras().unwrap_or_default();
-            let mics = crate::capture::audio::microphones().unwrap_or_default();
-            let fingerprint = device_fingerprint(&cameras, &mics);
-            if fingerprint != self.device_fingerprint {
-                self.device_fingerprint = fingerprint;
-                load_devices(&mut self.st);
-                // A preview keeps the mic it opened: restart it when the saved
-                // selection resolves to another device now (upstream's
-                // `devices_changed`).
-                if self.st.recording.is_none()
-                    && self.st.preview.is_some()
-                    && self.st.settings.mic_enabled
-                    && let Some(sel) = self.st.settings.mic.as_deref()
-                    && let Ok(pick) =
-                        crate::capture::audio::pick_mic(sel, self.st.settings.mic_name.as_deref())
-                    && mic_needs_restart(self.st.mic_in_use.as_ref(), pick.id.as_deref())
-                {
-                    self.st.preview_settings = None;
-                }
-            }
+        // G9: a device was plugged in or removed.
+        if DEVICES_CHANGED.swap(false, Ordering::SeqCst) {
+            self.devices_changed();
         }
         for e in crate::hotkey::poll() {
             match e {
