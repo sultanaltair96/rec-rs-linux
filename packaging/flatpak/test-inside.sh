@@ -44,7 +44,7 @@ echo "== record: h264 through the CLI, output in ~/Videos"
 mkdir -p "$HOME/Videos"
 if flatpak run "$APP" record --test-pattern --no-mic --no-system-audio -t 3 \
         -o "$HOME/Videos/x.mp4" >"$OUT/h264.log" 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/h264.log" | head -1
+    grep -o 'encoder [a-z0-9_]*: chosen' "$OUT/h264.log" | head -1
     ok "record h264"
 else
     cat "$OUT/h264.log"
@@ -86,7 +86,7 @@ fi
 echo "== record: hevc (x265enc built by this manifest)"
 if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
         -t 2 --codec hevc -o "$HOME/Videos/hevc.mp4" >"$OUT/hevc.log" 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/hevc.log" | head -1
+    grep -o 'encoder [a-z0-9_]*: chosen' "$OUT/hevc.log" | head -1
     ok "record hevc"
     if flatpak run --command=rec-rs "$APP" probe "$HOME/Videos/hevc.mp4" >"$OUT/hevc.probe" 2>&1; then
         ok "probe hevc"
@@ -102,8 +102,8 @@ fi
 echo "== record: prores (the runtime's avenc_prores_ks)"
 if flatpak run --command=rec-rs "$APP" record --test-pattern --no-mic --no-system-audio \
         -t 2 --codec prores -o "$HOME/Videos/prores.mov" >"$OUT/prores.log" 2>&1; then
-    grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/prores.log" | head -1
-    ok "record prores ($(grep -o 'rec: .*encoder [a-z0-9_]*' "$OUT/prores.log" | head -1 | sed 's/.*encoder //'))"
+    grep -o 'encoder [a-z0-9_]*: chosen' "$OUT/prores.log" | head -1
+    ok "record prores ($(grep -o 'encoder [a-z0-9_]*: chosen' "$OUT/prores.log" | head -1 | sed 's/: chosen//'))"
 else
     cat "$OUT/prores.log"
     bad "record prores"
@@ -216,6 +216,21 @@ for kind in rtmp whip; do
     fi
 done
 
+fi
+
+echo "== hardware encoding: the writer picks the VA encoder"
+if [ -e /dev/dri/renderD128 ]; then
+    if flatpak run --env=REC_DEBUG=1 --command=rec-rs "$APP" record --test-pattern \
+            -r 1080p -t 3 --no-mic --codec h264 -o "$HOME/Videos/va.mp4" \
+            >"$OUT/va-encode.log" 2>&1 &&
+       grep -q 'encoder vah264enc: chosen' "$OUT/va-encode.log"; then
+        ok "the writer picks vah264enc on this GPU ($(grep -o 'encoder vah264enc: chosen ([A-Z0-9_]*)' "$OUT/va-encode.log" | head -1))"
+    else
+        tr '\r' '\n' <"$OUT/va-encode.log" | tail -10
+        bad "the writer picks vah264enc on this GPU"
+    fi
+else
+    skipping "the writer picks vah264enc on this GPU" "no /dev/dri/renderD128 in this container"
 fi
 
 echo "== second-instance control: the socket, not the pid"
