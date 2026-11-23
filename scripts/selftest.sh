@@ -302,7 +302,7 @@ screen_test screen-window xvfb.sh window 400 300 30
 # The replay buffer: 20 s with --replay 15, saved with `rec-rs save-replay`,
 # checked for length, keyframe start, playability, sync and the memory report.
 if wanted replay; then
-    if scripts/live/replay.sh >"$OUT/replay.log" 2>&1; then
+    if scripts/live/replay.sh >"$OUT/replay.log" 2>&1 && [ -s "$OUT/replay.log" ]; then
         echo "PASS  replay  ($(grep -m1 '^PASS  replay-length' "$OUT/replay.log" | sed 's/^PASS  replay-length  (//; s/)$//'))"
         pass=$((pass+1))
     else
@@ -318,7 +318,7 @@ fi
 if wanted stream-rtmp; then
     status=0
     scripts/live/streams.sh --rtmp >"$OUT/stream-rtmp.log" 2>&1 || status=$?
-    if [ "$status" -eq 0 ]; then
+    if [ "$status" -eq 0 ] && [ -s "$OUT/stream-rtmp.log" ]; then
         echo "PASS  stream-rtmp  ($(grep -m1 '^PASS  rtmp-a' "$OUT/stream-rtmp.log" | sed 's/^PASS  rtmp-a  (//; s/)$//'); $(grep -c '^PASS  rtmp\|^PASS  rtmps' "$OUT/stream-rtmp.log") recordings checked)"
         pass=$((pass+1))
     elif [ "$status" -eq 3 ]; then
@@ -333,7 +333,7 @@ fi
 if wanted stream-whip; then
     status=0
     scripts/live/streams.sh --whip >"$OUT/stream-whip.log" 2>&1 || status=$?
-    if [ "$status" -eq 0 ]; then
+    if [ "$status" -eq 0 ] && [ -s "$OUT/stream-whip.log" ]; then
         echo "PASS  stream-whip  ($(grep -m1 '^PASS  whip-sync' "$OUT/stream-whip.log" | sed 's/^PASS  whip-sync  (//; s/)$//'))"
         pass=$((pass+1))
     elif [ "$status" -eq 3 ]; then
