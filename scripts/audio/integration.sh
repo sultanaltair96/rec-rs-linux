@@ -59,18 +59,24 @@ wanted() {
     [ "$CASE" = all ] || [ "$CASE" = "$1" ]
 }
 
-# Record 0.5 s after the player starts so the file's first frames are not the
-# only ones with audio; a beep once a second still lands 3-4 times in 5 s.
+# The player starts first, so a slow capture start under load still records a
+# beep train; a beep once a second lands 3-4 times in 5 s.
 record_with_play() { # record_with_play NAME TARGET WAV ARGS...
     name=$1; target=$2; wav=$3
     shift 3
     f="$CLIPS/$name.mov"
+    # A short delay lets the recorder open the graph first, so the file starts
+    # at the beginning of the train. The WAVs are long enough (12 s) that a
+    # slow start under CPU load still records several beeps.
     ( sleep 0.5; exec pw-play --target "$target" "$wav" ) \
         >"$OUT/$name.play.log" 2>&1 &
     player=$!
     status=0
     timeout "${REC_TIMEOUT:-90}" "$REC" record -q -o "$f" "$@" \
         >"$OUT/$name.out" 2>"$OUT/$name.log" || status=$?
+    # The WAVs are longer than the clips (a slow start under load must still
+    # catch beeps); stop the player instead of waiting for the train.
+    kill "$player" 2>/dev/null || true
     wait "$player" 2>/dev/null || true
     return "$status"
 }
@@ -101,7 +107,7 @@ fi
 
 # System audio at the sink's own 48 kHz.
 if wanted system; then
-    mkwav "$OUT/beeps-48k.wav" --rate 48000 --secs 8 --level -6 --beep 0.04 >/dev/null
+    mkwav "$OUT/beeps-48k.wav" --rate 48000 --secs 12 --level -6 --beep 0.04 >/dev/null
     default_sink rec_test_sink
     name=system-48k
     if ( export REC_PATTERN_SYSTEM_AUDIO=pipewire REC_DEBUG=1; \
@@ -122,7 +128,7 @@ fi
 # System audio from a 44.1 kHz sink: the source must capture 44.1 kHz (the log
 # says so with REC_DEBUG) and the mixer must resample it without a pitch shift.
 if wanted resample; then
-    mkwav "$OUT/beeps-44k.wav" --rate 44100 --secs 8 --level -6 --beep 0.04 >/dev/null
+    mkwav "$OUT/beeps-44k.wav" --rate 44100 --secs 12 --level -6 --beep 0.04 >/dev/null
     default_sink rec_test_sink_44k
     name=system-44k
     ( export REC_PATTERN_SYSTEM_AUDIO=pipewire REC_DEBUG=1; \
@@ -143,7 +149,7 @@ fi
 
 # The default microphone (the harness sets rec_test_mic as the default source).
 if wanted mic; then
-    mkwav "$OUT/beeps-48k.wav" --rate 48000 --secs 8 --level -6 --beep 0.04 >/dev/null
+    mkwav "$OUT/beeps-48k.wav" --rate 48000 --secs 12 --level -6 --beep 0.04 >/dev/null
     name=mic-default
     if REC_DEBUG=1 record_with_play "$name" rec_test_mic_play "$OUT/beeps-48k.wav" \
            --test-pattern --no-system-audio -t 4; then
@@ -191,10 +197,43 @@ if wanted missing; then
     status=0
     timeout 20 env XDG_RUNTIME_DIR=/nonexistent PIPEWIRE_RUNTIME_DIR=/nonexistent \
         "$REC" devices >"$OUT/$name.out" 2>"$OUT/$name.log" || status=$?
-    if [ "$status" -eq 0 ] && grep -q 'unavailable' "$OUT/$name.out"; then
-        ok "$name" "devices reports PipeWire as unavailable without failing"
+    if [ "$status" -eq 0 ] && grep -q 'unavailable' "$OUT/$name.out" \
+       && ! grep -q 'Output latency' "$OUT/$name.out"; then
+        ok "$name" "devices reports PipeWire as unavailable, no latency line, exit 0"
     else
         bad "$name" "devices did not report a missing session (status $status)" "$OUT/$name.out"
+    fi
+fi
+
+# The audio hotplug watch 1E consumes: a new sink must notify within 5 s.
+if wanted watch; then
+    name=watch
+    if cargo test --quiet the_device_watch_reports_a_new_sink -- --ignored --nocapture \
+           >"$OUT/$name.check" 2>&1; then
+        ok "$name" "$(grep -E 'test result' "$OUT/$name.check" | tail -1)"
+    else
+        bad "$name" "the PipeWire registry watch did not report the new sink" "$OUT/$name.check"
+    fi
+fi
+
+# Under CPU load: the PipeWire mic must still deliver continuous, correctly
+# stamped chunks (the G15 flakiness investigation). Opt-in because it saturates
+# the container's CPUs.
+if wanted stress; then
+    name=stress
+    burners=""
+    for i in 1 2 3 4 5 6 7 8; do (while :; do :; done) & burners="$burners $!"; done
+    okc=0
+    cargo test --quiet live_mic_chunks_do_not_overlap -- --ignored --nocapture \
+        >"$OUT/$name.continuity" 2>&1 && \
+    cargo test --quiet live_chunk_timestamps_are_on_the_host_clock -- --ignored --nocapture \
+        >"$OUT/$name.clock" 2>&1 && okc=1
+    kill $burners 2>/dev/null || true
+    wait $burners 2>/dev/null || true
+    if [ "$okc" = 1 ]; then
+        ok "$name" "$(grep -h -E '^mic continuity|^clock' "$OUT/$name.continuity" "$OUT/$name.clock" | paste -sd ';' -)"
+    else
+        bad "$name" "the mic overlapped or drifted under load" "$OUT/$name.continuity"
     fi
 fi
 
@@ -232,7 +271,7 @@ fi
 # recording video and finalizes the file, and the warning says what happened.
 if wanted unplug; then
     name=mic-unplug
-    mkwav "$OUT/beeps-unplug.wav" --rate 48000 --secs 8 --level -6 --beep 0.04 >/dev/null
+    mkwav "$OUT/beeps-unplug.wav" --rate 48000 --secs 12 --level -6 --beep 0.04 >/dev/null
     ( sleep 0.5; exec pw-play --target rec_test_mic_play "$OUT/beeps-unplug.wav" ) \
         >"$OUT/$name.play.log" 2>&1 &
     player=$!

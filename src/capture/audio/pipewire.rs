@@ -38,6 +38,7 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -564,6 +565,28 @@ impl Stamp {
     }
 }
 
+/// Detect overlapping chunks, the one way a source can make the writer's
+/// timeline grow or double a beep: a real device may repeat a buffer's time
+/// under load. It never changes the samples; `REC_DEBUG` reports a count.
+#[derive(Debug, Default)]
+struct Continuity {
+    end: Option<f64>,
+    overlaps: u64,
+}
+
+impl Continuity {
+    /// True when this chunk starts before the previous one ended (1 ms of
+    /// timestamp jitter is not an overlap).
+    fn observe(&mut self, pts: f64, secs: f64) -> bool {
+        let overlap = self.end.is_some_and(|end| pts < end - 0.001);
+        self.end = Some(self.end.map_or(pts + secs, |end| end.max(pts + secs)));
+        if overlap {
+            self.overlaps += 1;
+        }
+        overlap
+    }
+}
+
 /// Open one capture stream. `device` is a resolved node name (see
 /// `super::pick_from`); `None` means the session's default source (mic) or sink
 /// monitor (system audio).
@@ -776,6 +799,9 @@ struct StreamState {
     error: Arc<Mutex<Option<String>>>,
     mainloop: pw::main_loop::MainLoopWeak,
     stamp: Stamp,
+    /// Overlap detector for `REC_DEBUG` (a duplicated/overlapping device
+    /// buffer would put two beeps on top of each other in the writer).
+    continuity: Continuity,
     /// First device error of this stream, reported from `stop`.
     failure: Option<String>,
 }
@@ -883,6 +909,7 @@ fn run_capture(
         error: cfg.error.clone(),
         mainloop: mainloop.downgrade(),
         stamp: Stamp::default(),
+        continuity: Continuity::default(),
         failure: None,
     }));
 
@@ -1086,6 +1113,17 @@ fn on_process(stream: &pw::stream::Stream, st: &mut Rc<RefCell<StreamState>>) {
     }
     samples.truncate(frames * ch);
     let pts = st.borrow_mut().stamp.stamp(time_ns);
+    let secs = frames as f64 / rate as f64;
+    let mut s = st.borrow_mut();
+    let overlap = s.continuity.observe(pts, secs);
+    let overlaps = s.continuity.overlaps;
+    drop(s);
+    if overlap && std::env::var_os("REC_DEBUG").is_some() {
+        eprintln!(
+            "rec: debug: {} chunk at {pts:.3}s overlaps the previous one ({overlaps} so far)",
+            kind.label()
+        );
+    }
     sink(
         kind,
         AudioChunk {
@@ -1095,6 +1133,156 @@ fn on_process(stream: &pw::stream::Stream, st: &mut Rc<RefCell<StreamState>>) {
             samples,
         },
     );
+}
+
+/// A running PipeWire registry watch. Dropping it stops the watch and joins
+/// the loop thread (at most one 200 ms tick).
+pub(super) struct Watch {
+    pub stop: Arc<AtomicBool>,
+    pub thread: Option<JoinHandle<()>>,
+}
+
+impl Watch {
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// Watch the audio graph and call `cb` when the set of `Audio/*` nodes changes.
+///
+/// A long-lived PipeWire registry watcher: a new or removed sink/source (a USB
+/// microphone, a Bluetooth headset, a monitor unplugged) marks the graph dirty
+/// and a 200 ms timer coalesces the burst into one callback. The callback runs
+/// on the watcher thread, so it must be quick (reload a device list, wake a
+/// channel); the app (phase 1E) uses this to refresh its mic list without a
+/// manual refresh button.
+///
+/// The watch lives until [`Watch`] is dropped. No PipeWire session at start is
+/// an error, so the app can decide to retry later.
+pub(super) fn watch_devices(cb: impl Fn() + Send + 'static) -> Result<Watch> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("audio-watch".into())
+        .spawn(move || watch_thread(cb, thread_stop, ready_tx))
+        .context("starting the audio device watch")?;
+    match ready_rx.recv_timeout(Duration::from_secs(4)) {
+        Ok(Ok(())) => Ok(Watch {
+            stop,
+            thread: Some(thread),
+        }),
+        Ok(Err(e)) => bail!("{e}"),
+        Err(_) => bail!("PipeWire did not answer the audio device watch within 4 s"),
+    }
+}
+
+fn watch_thread(
+    cb: impl Fn() + Send + 'static,
+    stop: Arc<AtomicBool>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    pw::init();
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = ready.send(Err(format!("creating a PipeWire main loop: {e}")));
+            return;
+        }
+    };
+    let context = match pw::context::ContextRc::new(&mainloop, None) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(format!("creating a PipeWire context: {e}")));
+            return;
+        }
+    };
+    let core = match context.connect_rc(None) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(format!(
+                "PipeWire is not available ({e}); is a PipeWire session running?"
+            )));
+            return;
+        }
+    };
+    let registry = match core.get_registry_rc() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ready.send(Err(format!("opening the PipeWire registry: {e}")));
+            return;
+        }
+    };
+    // Ids of the audio nodes currently known, so a port/client removal does
+    // not look like a device change.
+    let ids = Rc::new(RefCell::new(std::collections::HashSet::<u32>::new()));
+    let dirty = Rc::new(std::cell::Cell::new(false));
+    let _registry_listener = registry
+        .add_listener_local()
+        .global({
+            let ids = ids.clone();
+            let dirty = dirty.clone();
+            move |global| {
+                if global.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                let Some(props) = global.props else {
+                    return;
+                };
+                let class = props.get("media.class").unwrap_or("");
+                if !class.starts_with("Audio/") {
+                    return;
+                }
+                ids.borrow_mut().insert(global.id);
+                dirty.set(true);
+            }
+        })
+        .global_remove({
+            let ids = ids.clone();
+            let dirty = dirty.clone();
+            move |id| {
+                if ids.borrow_mut().remove(&id) {
+                    dirty.set(true);
+                }
+            }
+        })
+        .register();
+    // Coalesce the create/remove burst a hotplug causes into one callback.
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        let stop = stop.clone();
+        let dirty = dirty.clone();
+        move |_| {
+            if stop.load(Ordering::SeqCst) {
+                mainloop.quit();
+                return;
+            }
+            if dirty.replace(false) {
+                cb();
+            }
+        }
+    });
+    timer.update_timer(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_millis(200)),
+    );
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    mainloop.run();
 }
 
 #[cfg(test)]
@@ -1239,6 +1427,17 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_chunks_are_detected() {
+        let mut c = Continuity::default();
+        assert!(!c.observe(10.000, 0.010));
+        assert!(!c.observe(10.010, 0.010));
+        assert!(!c.observe(10.021, 0.010), "1 ms jitter is not an overlap");
+        assert!(c.observe(10.020, 0.010), "a duplicated time is an overlap");
+        assert!(!c.observe(10.040, 0.010), "a gap is not an overlap");
+        assert_eq!(c.overlaps, 1);
+    }
+
+    #[test]
     fn timestamps_from_another_clock_fall_back_to_now() {
         let mut s = Stamp::default();
         // Minutes from now, epoch nanoseconds, or a corrupted huge field: all
@@ -1261,6 +1460,42 @@ mod tests {
         let ahead = now() + 0.5;
         let t = s.stamp((ahead * 1e9) as u64);
         assert!((t - ahead).abs() < 0.01, "{t} vs {ahead}");
+    }
+
+    /// Live mic continuity: a duplicated/overlapping buffer from PipeWire would
+    /// double a beep or shift the track. Run under load (see integration.sh
+    /// stress); the check is the same one the source applies with REC_DEBUG.
+    #[test]
+    #[ignore = "needs a live PipeWire session (scripts/audio/harness.sh)"]
+    fn live_mic_chunks_do_not_overlap() {
+        let mut src = open_capture(AudioKind::Mic, None).expect("opening the microphone");
+        let chunks = Arc::new(Mutex::new(Vec::<AudioChunk>::new()));
+        let sink = {
+            let chunks = chunks.clone();
+            Arc::new(move |_kind: AudioKind, chunk: AudioChunk| {
+                chunks.lock().unwrap().push(chunk);
+            }) as AudioSink
+        };
+        src.start(sink).expect("starting the microphone");
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = src.stop();
+        let chunks = chunks.lock().unwrap();
+        assert!(chunks.len() > 50, "only {} chunks in 2 s", chunks.len());
+        let mut continuity = Continuity::default();
+        for chunk in chunks.iter() {
+            assert!(
+                !continuity.observe(chunk.pts, chunk.secs()),
+                "chunk at {:.3}s overlaps the previous one",
+                chunk.pts
+            );
+        }
+        eprintln!(
+            "mic continuity: {} chunks, no overlap ({} samples, {} Hz, {} ch)",
+            chunks.len(),
+            chunks.iter().map(|c| c.frames()).sum::<usize>(),
+            chunks[0].rate,
+            chunks[0].channels
+        );
     }
 
     /// The same check as `timestamps_from_another_clock_fall_back_to_now`, on a
@@ -1361,6 +1596,35 @@ mod tests {
             "a chunk was stamped before it was played: {play_ms} ms"
         );
         assert!(play_ms < 2000.0, "capture latency {play_ms} ms is too high");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session and pactl (scripts/audio/integration.sh watch)"]
+    fn the_device_watch_reports_a_new_sink() {
+        use std::process::Command;
+        let (tx, rx) = mpsc::channel();
+        let watch = watch_devices(move || {
+            let _ = tx.send(());
+        })
+        .expect("starting the audio device watch");
+        // Nothing must be pending from the initial list.
+        while rx.try_recv().is_ok() {}
+        let load = Command::new("pactl")
+            .args([
+                "load-module",
+                "module-null-sink",
+                "sink_name=rec_watch_sink",
+            ])
+            .output()
+            .expect("running pactl");
+        assert!(load.status.success(), "pactl load-module failed: {load:?}");
+        let notified = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let id = String::from_utf8_lossy(&load.stdout).trim().to_string();
+        if !id.is_empty() {
+            let _ = Command::new("pactl").args(["unload-module", &id]).status();
+        }
+        drop(watch);
+        assert!(notified, "no notification after a new sink appeared");
     }
 
     #[test]
