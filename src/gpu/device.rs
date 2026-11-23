@@ -19,6 +19,9 @@ pub struct Gpu {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub info: wgpu::AdapterInfo,
+    /// True when the device belongs to the caller (the app's egui-wgpu
+    /// device) rather than to the renderer.
+    shared: bool,
 }
 
 impl Gpu {
@@ -53,6 +56,7 @@ impl Gpu {
             device: Arc::new(device),
             queue: Arc::new(queue),
             info,
+            shared: false,
         })
     }
 
@@ -71,6 +75,7 @@ impl Gpu {
             device,
             queue,
             info,
+            shared: true,
         }
     }
 
@@ -109,6 +114,12 @@ impl Gpu {
             info.backend,
             info.device_type,
         )
+    }
+
+    /// True when this is the caller's device (the app's), so its textures can
+    /// be drawn in the caller's render passes.
+    pub fn is_shared(&self) -> bool {
+        self.shared
     }
 
     /// True when the device is a CPU rasteriser rather than a GPU: the tests

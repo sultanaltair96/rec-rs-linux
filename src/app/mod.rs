@@ -209,6 +209,10 @@ pub struct State {
     /// The newest composited frame, drawn by `preview_gpu` (G10): the GPU
     /// converts and scales it, so the app never touches its pixels.
     pub preview_frame: Option<Arc<crate::media_types::VideoFrame>>,
+    /// The composited frame as a GPU texture (G10): set instead of
+    /// `preview_frame` when the compositor shares this window's device, so the
+    /// preview draws it with no readback and no upload.
+    pub preview_tex: Option<Arc<crate::gpu::PreviewFrame>>,
     /// Its size in pixels.
     pub preview_px: [u32; 2],
     pub preview_aspect: f32,
@@ -266,6 +270,7 @@ impl State {
             mics: vec![],
             hotkey_ok: true,
             preview_frame: None,
+            preview_tex: None,
             preview_px: [0, 0],
             preview_aspect: 16.0 / 9.0,
             preview_target: (0, 0),
@@ -514,6 +519,10 @@ struct App {
     tray_rx: Option<Receiver<Option<ksni::blocking::Handle<tray::Tray>>>>,
     tap: preview::Tap,
     tap_sink: FrameSink,
+    /// Where the writer's compositor publishes its texture (G10), and the sink
+    /// it calls. The slot holds only the newest frame, like the tap.
+    gpu_preview: Arc<Mutex<Option<crate::gpu::PreviewFrame>>>,
+    gpu_preview_sink: crate::gpu::PreviewSink,
     last_tick: Instant,
     last_meter: Instant,
     control_rx: Receiver<Control>,
@@ -554,6 +563,20 @@ impl App {
         let (accent_tx, accent_rx) = std::sync::mpsc::channel();
         spawn_accent_fetch(accent_tx);
         let (tap, tap_sink) = preview::Tap::new(Arc::new(wake));
+        // G10: the compositor's texture, when it runs on this window's device.
+        // The writer calls this at the preview rate; the CPU tap's sink then
+        // wakes the window, so both are in place before the UI runs.
+        let gpu_preview: Arc<Mutex<Option<crate::gpu::PreviewFrame>>> = Arc::new(Mutex::new(None));
+        let gpu_preview_sink: crate::gpu::PreviewSink = {
+            let slot = gpu_preview.clone();
+            let wanted = Arc::new(wake);
+            Arc::new(move |frame| {
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(frame);
+                }
+                wanted();
+            })
+        };
         let lock = lock::LockWatcher::start(Arc::new(wake));
         // G9: 1B's watchers call back on their own thread; wake the loop and
         // reload in the tick. An unavailable backend simply has no watch.
@@ -584,6 +607,8 @@ impl App {
             _audio_watch: audio_watch,
             tap,
             tap_sink,
+            gpu_preview,
+            gpu_preview_sink,
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             control_rx,
@@ -800,13 +825,24 @@ impl App {
         // REC_TEST_PATTERN: the CLI's synthetic source, for self-tests that
         // need no capture permission.
         let pattern = self.test_pattern || std::env::var_os("REC_TEST_PATTERN").is_some();
-        let o = session::options(
+        let mut o = session::options(
             &settings,
             output,
             Some(self.st.live.clone()),
             Some(self.tap_sink.clone()),
             pattern,
         )?;
+        // G10: composite on this window's device so the preview can draw the
+        // composited texture directly. The writer falls back to a device of its
+        // own (and to CPU preview frames) if this one cannot take it.
+        if let Some(g) = &self.gpu {
+            o.gpu = Some(crate::gpu::SharedGpu {
+                device: Arc::new(g.device.clone()),
+                queue: Arc::new(g.queue.clone()),
+                info: g.adapter.get_info(),
+            });
+            o.preview_gpu = Some(self.gpu_preview_sink.clone());
+        }
         // Fallbacks never block: say so once.
         let warning = o.mic_warning.clone();
         if warning != self.st.mic_warned {
@@ -1507,7 +1543,29 @@ impl App {
                 self.st.preview_target.0.max(2),
                 self.st.preview_target.1.max(2),
             );
-            if let Some(frame) = self.tap.take() {
+            // The compositor's own texture first (G10: no readback, no
+            // upload); the CPU frame is the fallback for a device that could
+            // not be shared, and takes over again if the compositor is dropped.
+            let tex = self.gpu_preview.lock().ok().and_then(|mut s| s.take());
+            if let Some(tex) = tex {
+                let (pw, ph) = preview::target_size(
+                    tex.width as usize,
+                    tex.height as usize,
+                    self.st.preview_target,
+                    self.st.settings.preview_low_power,
+                );
+                self.st.preview_aspect = tex.width as f32 / tex.height.max(1) as f32;
+                self.st.preview_px = [pw as u32, ph as u32];
+                self.st.preview_frame = None;
+                self.st.frames_shown += 1;
+                if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
+                    eprintln!(
+                        "rec: debug: preview texture {}x{} at {:.3}s",
+                        tex.width, tex.height, tex.pts
+                    );
+                }
+                self.st.preview_tex = Some(Arc::new(tex));
+            } else if let Some(frame) = self.tap.take() {
                 // Drawn from the GPU in `ui::preview`; the size the UI shows it
                 // at is the low-power target (half resolution), the texture
                 // stays the frame's (the GPU scales without a CPU copy).
@@ -1522,6 +1580,7 @@ impl App {
                 let pts = frame.pts;
                 let (fw, fh) = (frame.width, frame.height);
                 self.st.preview_frame = Some(Arc::new(frame));
+                self.st.preview_tex = None;
                 self.st.frames_shown += 1;
                 if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
                     eprintln!("rec: debug: preview frame {fw}x{fh} at {pts:.3}s");

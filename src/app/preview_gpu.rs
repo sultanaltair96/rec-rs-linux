@@ -1,6 +1,18 @@
-//! The preview on the GPU (G10): the compositor's frame is uploaded as its own
-//! planes (BGRA/RGBA, NV12 or I420) and converted, scaled and drawn by
-//! [`preview.wgsl`](shaders/preview.wgsl) inside egui's render pass.
+//! The preview on the GPU (G10): the compositor's frame is drawn inside egui's
+//! render pass, by [`preview.wgsl`](shaders/preview.wgsl).
+//!
+//! Two sources, in order of preference:
+//!
+//! - **The compositor's texture** ([`PreviewCallback::texture`]): when the
+//!   recording composites on this window's device (`gpu::SharedGpu`), the writer
+//!   hands the composited frame over as a `wgpu::Texture` and the preview draws
+//!   it 1:1 with `fs_texture`. Nothing is read back and nothing is uploaded —
+//!   the whole per-frame cost is one bind group and one draw.
+//! - **A CPU frame** ([`PreviewCallback::new`]): the frame's planes are
+//!   uploaded (BGRA/RGBA, NV12 or I420) and converted and scaled by
+//!   `fs_bgra`/`fs_rgba`/`fs_nv12`/`fs_i420`. This is the fallback for a
+//!   compositor on its own device (the CLI, or a device that could not be
+//!   shared) and for the no-camera path, which never had a GPU frame.
 //!
 //! Upstream wraps the frame's IOSurface as a Metal texture and converts it with
 //! a VideoToolbox transfer; that is 0.25–0.39 ms per frame. The port used to
@@ -77,6 +89,13 @@ pub struct PreviewPainter {
     /// Mapped staging buffers for the plane copies (one copy, into memory the
     /// GPU reads directly; no per-frame allocation).
     belt: StagingBelt,
+    /// The composited texture drawn directly (G10): one pipeline, and the last
+    /// bind group built for it (rebuilt only when the texture changes).
+    texture_pipeline: wgpu::RenderPipeline,
+    texture_layout: wgpu::BindGroupLayout,
+    /// The bind group for the composited texture, keyed by the frame's
+    /// generation (the compositor reuses one texture per recording).
+    texture_bound: Option<(u64, wgpu::BindGroup)>,
 }
 
 impl PreviewPainter {
@@ -134,6 +153,52 @@ impl PreviewPainter {
                 })
             })
             .collect();
+        // The composited frame as it is: one texture, sampled 1:1. Its values
+        // are already gamma encoded BGRA (the compositor's output format), so
+        // no conversion and no sRGB view.
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("preview texture"),
+            entries: &[
+                texture_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let texture_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("preview texture"),
+                bind_group_layouts: &[Some(&texture_layout)],
+                immediate_size: 0,
+            });
+        let texture_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fs_texture"),
+            layout: Some(&texture_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_texture"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("preview"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -164,6 +229,9 @@ impl PreviewPainter {
             sampler,
             dummy,
             uploaded: None,
+            texture_pipeline,
+            texture_layout,
+            texture_bound: None,
             // A 4K NV12 frame fits in one chunk; the belt grows if not.
             belt: StagingBelt::new(device.clone(), 16 << 20),
         }
@@ -285,6 +353,34 @@ impl PreviewPainter {
         true
     }
 
+    /// The bind group for a composited texture, rebuilt only when the composer
+    /// replaced it (a new output size or format, or a new renderer).
+    fn texture_bind(&mut self, device: &wgpu::Device, frame: &crate::gpu::PreviewFrame) -> bool {
+        let same = self
+            .texture_bound
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == frame.generation);
+        if !same {
+            let view = frame.texture.create_view(&Default::default());
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("preview texture"),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.texture_bound = Some((frame.generation, bind));
+        }
+        true
+    }
+
     fn allocate(&self, device: &wgpu::Device, frame: &VideoFrame, mode: Mode) -> Uploaded {
         let (w, h) = (frame.width as u32, frame.height as u32);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -362,6 +458,99 @@ impl PreviewPainter {
     }
 }
 
+/// What the texture path costs per preview frame, in milliseconds: the CPU side
+/// (bind group lookup + encoding the pass) and the GPU side as a throughput
+/// (`frames` passes submitted back to back, one wait at the end, divided by
+/// `frames` — what the draw adds to egui's own pass, rather than a round trip).
+///
+/// The compositor's texture is the passed one, the preview rect `target`.
+/// `frames` iterations after one warm-up. Only the ignored cost test calls it
+/// (`cargo test --release app::preview::tests::preview_cost -- --ignored`).
+#[cfg_attr(not(test), expect(dead_code))]
+pub fn texture_path_cost(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    painter: &mut PreviewPainter,
+    texture: &wgpu::Texture,
+    target_format: wgpu::TextureFormat,
+    target: (u32, u32),
+    frames: usize,
+) -> (f64, f64) {
+    use std::time::Instant;
+    let (tw, th) = target;
+    let frame = crate::gpu::PreviewFrame {
+        texture: texture.clone(),
+        width: texture.width(),
+        height: texture.height(),
+        pts: 0.0,
+        generation: 1,
+    };
+    let target_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("preview cost target"),
+        size: wgpu::Extent3d {
+            width: tw,
+            height: th,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: target_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target_tex.create_view(&Default::default());
+    let encode = |painter: &mut PreviewPainter, enc: &mut wgpu::CommandEncoder| {
+        painter.texture_bind(device, &frame);
+        let mut pass = enc
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview cost"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime();
+        pass.set_pipeline(&painter.texture_pipeline);
+        pass.set_bind_group(0, &painter.texture_bound.as_ref().expect("bound").1, &[]);
+        pass.draw(0..3, 0..1);
+    };
+    // Warm up: the bind group and the pipeline.
+    let mut warm = device.create_command_encoder(&Default::default());
+    encode(painter, &mut warm);
+    queue.submit([warm.finish()]);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+    let started = Instant::now();
+    for _ in 0..frames {
+        let mut enc = device.create_command_encoder(&Default::default());
+        encode(painter, &mut enc);
+        std::hint::black_box(enc.finish());
+    }
+    let cpu = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+
+    // Throughput: no wait between submissions, so the number is the GPU's own
+    // per-frame cost, not a submit-to-done round trip.
+    let started = Instant::now();
+    for _ in 0..frames {
+        let mut enc = device.create_command_encoder(&Default::default());
+        encode(painter, &mut enc);
+        queue.submit([enc.finish()]);
+    }
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let gpu = started.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    (cpu, gpu)
+}
+
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -376,13 +565,30 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// One preview frame, drawn by egui in its own render pass.
+///
+/// Either the compositor's texture ([`texture`](Self::texture), no CPU work) or
+/// a CPU frame that is uploaded and converted
+/// ([`new`](Self::new), the fallback).
 pub struct PreviewCallback {
-    frame: Arc<VideoFrame>,
+    frame: Option<Arc<VideoFrame>>,
+    texture: Option<Arc<crate::gpu::PreviewFrame>>,
 }
 
 impl PreviewCallback {
     pub fn new(frame: Arc<VideoFrame>) -> PreviewCallback {
-        PreviewCallback { frame }
+        PreviewCallback {
+            frame: Some(frame),
+            texture: None,
+        }
+    }
+
+    /// Draw the compositor's own texture: no readback, no upload, no
+    /// conversion — one bound texture and one draw.
+    pub fn texture(frame: Arc<crate::gpu::PreviewFrame>) -> PreviewCallback {
+        PreviewCallback {
+            frame: None,
+            texture: Some(frame),
+        }
     }
 }
 
@@ -396,7 +602,16 @@ impl CallbackTrait for PreviewCallback {
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(painter) = resources.get_mut::<PreviewPainter>() {
-            painter.upload(device, egui_encoder, &self.frame);
+            match (&self.texture, &self.frame) {
+                // A texture needs no preparation: it is already on the GPU.
+                (Some(tex), _) => {
+                    painter.texture_bind(device, tex);
+                }
+                (None, Some(frame)) => {
+                    painter.upload(device, egui_encoder, frame);
+                }
+                (None, None) => {}
+            }
         }
         Vec::new()
     }
@@ -410,10 +625,26 @@ impl CallbackTrait for PreviewCallback {
         let Some(painter) = resources.get::<PreviewPainter>() else {
             return;
         };
+        if let Some(tex) = &self.texture {
+            let Some((_, bind)) = painter
+                .texture_bound
+                .as_ref()
+                .filter(|(generation, _)| *generation == tex.generation)
+            else {
+                return;
+            };
+            render_pass.set_pipeline(&painter.texture_pipeline);
+            render_pass.set_bind_group(0, bind, &[]);
+            render_pass.draw(0..3, 0..1);
+            return;
+        }
+        let Some(frame) = &self.frame else {
+            return;
+        };
         let Some(uploaded) = painter.uploaded.as_ref() else {
             return;
         };
-        if uploaded.key != (self.frame.width, self.frame.height, self.frame.format) {
+        if uploaded.key != (frame.width, frame.height, frame.format) {
             return;
         }
         render_pass.set_pipeline(&painter.pipelines[uploaded.mode.index()]);
@@ -428,10 +659,145 @@ mod tests {
     use crate::media_types::{PixelFormat, Plane};
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        device_with_info().map(|(d, q, _)| (d, q))
+    }
+
+    /// A device, its queue and what the adapter calls itself (the app hands all
+    /// three to the session so the compositor can share the device).
+    fn device_with_info() -> Option<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+        let info = adapter.get_info();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        Some((device, queue, info))
+    }
+
+    /// One frame of the compositor's own texture, for the texture-path tests:
+    /// BGRA with a known colour (bytes are B,G,R,A).
+    fn composited_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        bgra: [u8; 4],
+    ) -> wgpu::Texture {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("composited frame"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let row = (w * 4).next_multiple_of(256) as usize;
+        let mut data = vec![0u8; row * h as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                data[y * row + x * 4..y * row + x * 4 + 4].copy_from_slice(&bgra);
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        texture
+    }
+
+    /// The frame drawn into `target` through one preview pass, as RGBA bytes.
+    fn draw_and_read(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        painter: &mut PreviewPainter,
+        frame: &crate::gpu::PreviewFrame,
+        target: &wgpu::Texture,
+        (w, h): (u32, u32),
+    ) -> Vec<u8> {
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview readback"),
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let view = target.create_view(&Default::default());
+        let mut enc = device.create_command_encoder(&Default::default());
+        assert!(painter.texture_bind(device, frame), "bound the texture");
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("preview texture test"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            pass.set_pipeline(&painter.texture_pipeline);
+            pass.set_bind_group(0, &painter.texture_bound.as_ref().expect("bound").1, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([enc.finish()]);
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        slice.get_mapped_range().expect("mapped").to_vec()
     }
 
     fn nv12(w: usize, h: usize, y: u8, u: u8, v: u8) -> VideoFrame {
@@ -592,6 +958,55 @@ mod tests {
             &[255, 64, 0, 255],
             "the clear colour reads back"
         );
+    }
+
+    /// The compositor's texture drawn as it is (G10): no upload, no conversion,
+    /// the BGRA bytes swapped to RGBA by the shader, and the bind group built
+    /// once for a texture that is reused frame after frame.
+    #[test]
+    fn the_texture_path_draws_the_composited_frame() {
+        let Some((device, queue)) = gpu() else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
+        let mut painter = PreviewPainter::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        // BGRA (30, 20, 10) is RGB (10, 20, 30).
+        let texture = composited_texture(&device, &queue, 1920, 1080, [30, 20, 10, 255]);
+        let (w, h) = (704u32, 396u32);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let frame = crate::gpu::PreviewFrame {
+            texture: texture.clone(),
+            width: 1920,
+            height: 1080,
+            pts: 1.0,
+            generation: 1,
+        };
+        let data = draw_and_read(&device, &queue, &mut painter, &frame, &target, (w, h));
+        let centre = (((h / 2) * w + w / 2) * 4) as usize;
+        assert_eq!(
+            &data[centre..centre + 4],
+            &[10, 20, 30, 255],
+            "the composited frame's colour, unswapped"
+        );
+        // The corner too: the pass fills the whole rect.
+        assert_eq!(&data[0..4], &[10, 20, 30, 255]);
+        // The same texture again: the cached bind group is reused (the
+        // generation did not change), and it still draws.
+        let data = draw_and_read(&device, &queue, &mut painter, &frame, &target, (w, h));
+        assert_eq!(&data[centre..centre + 4], &[10, 20, 30, 255]);
     }
 
     /// The shader, run for real: a 64×32 NV12 frame of one colour, drawn into a

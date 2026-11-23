@@ -834,6 +834,202 @@ fn the_composited_preview_moves_the_overlay_after_set_pip() {
     clear_env();
 }
 
+/// G10: on a shared device the compositor hands the preview its own texture.
+/// A preview-only session with **no** CPU frame sink (`Options::preview` is
+/// `None`) still gets frames — the texture is the whole preview path — and the
+/// content is the composited frame, overlay included.
+#[test]
+fn the_compositor_publishes_its_texture_on_a_shared_device() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("REC_SYNTH_CAM");
+            std::env::remove_var("REC_SYNTH_CAM_SIZE");
+            std::env::remove_var("REC_SYNTH_CAM_FPS");
+        }
+    }
+
+    let _gpu_guard = gpu();
+    // The "window's" device: the session shares this one instead of creating
+    // its own, which is what makes the texture usable in egui's pass.
+    let shared = {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        pollster::block_on(instance.request_adapter(&Default::default()))
+            .ok()
+            .and_then(|adapter| {
+                let info = adapter.get_info();
+                let (device, queue) =
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                        .ok()?;
+                Some((device, queue, info))
+            })
+    };
+    let Some((device, queue, info)) = shared else {
+        eprintln!("SKIP: no wgpu adapter for the shared-device preview test");
+        return;
+    };
+    gst_init();
+    unsafe {
+        std::env::set_var("REC_SYNTH_CAM", "1");
+        std::env::set_var("REC_SYNTH_CAM_SIZE", "320x180");
+        std::env::set_var("REC_SYNTH_CAM_FPS", "30");
+    }
+    let settings = Settings {
+        scene: crate::compose::Scene::ScreenCam,
+        resolution: "720p".into(),
+        fps: 30,
+        mic_enabled: false,
+        system_audio: false,
+        ..Default::default()
+    };
+    let slot: Arc<Mutex<Option<crate::gpu::PreviewFrame>>> = Arc::new(Mutex::new(None));
+    let sink: crate::gpu::PreviewSink = {
+        let slot = slot.clone();
+        Arc::new(move |f| {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(f);
+            }
+        })
+    };
+    // No CPU preview sink: nothing but the texture can produce a frame.
+    let mut o = match super::session::options(&settings, None, None, None, true) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("SKIP: could not build the session options: {e:#}");
+            clear_env();
+            return;
+        }
+    };
+    o.gpu = Some(crate::gpu::SharedGpu {
+        device: Arc::new(device.clone()),
+        queue: Arc::new(queue.clone()),
+        info: info.clone(),
+    });
+    o.preview_gpu = Some(sink);
+    let sess = match super::Session::start(&o) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SKIP: could not start the session for the preview test: {e:#}");
+            clear_env();
+            return;
+        }
+    };
+
+    // The preview starts before the camera's first frame (it does not wait for
+    // the camera to settle), so keep taking textures until the overlay shows.
+    let (w, h) = (1280usize, 720usize);
+    let pitch = (w * 4).next_multiple_of(256);
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("composited readback"),
+        size: (pitch * h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let read_texture = |texture: &wgpu::Texture| -> Vec<u8> {
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(pitch as u32),
+                    rows_per_image: Some(h as u32),
+                },
+            },
+            wgpu::Extent3d {
+                width: w as u32,
+                height: h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([enc.finish()]);
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = slice.get_mapped_range().expect("mapped").to_vec();
+        readback.unmap();
+        data
+    };
+    // Share of camera-red pixels inside a rect (the test pattern never has
+    // R > 160 with G and B below 100; the synthetic camera is solid red).
+    let red_share = |data: &[u8], rect: [f64; 4]| -> f64 {
+        let (mut red, mut total) = (0, 0);
+        for iy in 1..8 {
+            for ix in 1..8 {
+                let x = (rect[0] + rect[2] * ix as f64 / 8.0) as usize;
+                let y = (rect[1] + rect[3] * iy as f64 / 8.0) as usize;
+                if x >= w || y >= h {
+                    continue;
+                }
+                total += 1;
+                let o = y * pitch + x * 4;
+                let (r, g, b) = (data[o + 2], data[o + 1], data[o]); // BGRA -> RGB
+                if r > 160 && g < 100 && b < 100 {
+                    red += 1;
+                }
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            red as f64 / total as f64
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut shown: Option<(crate::gpu::PreviewFrame, Vec<u8>, f64)> = None;
+    while Instant::now() < deadline {
+        let Some(frame) = slot.lock().unwrap().take() else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        assert_eq!((frame.width, frame.height), (1280, 720), "720p output");
+        assert_eq!(
+            frame.texture.format(),
+            wgpu::TextureFormat::Bgra8Unorm,
+            "the compositor's own output format"
+        );
+        let aspect = sess.cam_aspect().unwrap_or(16.0 / 9.0);
+        let rect = crate::compose::overlay_rect(&settings.pip_spec(), 1280.0, 720.0, aspect);
+        let data = read_texture(&frame.texture);
+        let share = red_share(&data, rect);
+        if share > 0.6 {
+            shown = Some((frame, data, share));
+            break;
+        }
+    }
+    let Some((_frame, data, share)) = shown else {
+        let _ = sess.finish();
+        clear_env();
+        panic!("no preview texture with the camera overlay arrived");
+    };
+    assert!(
+        share > 0.6,
+        "the composited texture shows the camera overlay: {share:.2}"
+    );
+    // Away from the overlay it is the screen: the composited frame, not a
+    // camera-only one.
+    let far = [0.0, 0.0, 1280.0 * 0.4, 720.0 * 0.4];
+    let far_share = red_share(&data, far);
+    assert!(
+        far_share < 0.2,
+        "the far corner is the screen, not the camera: {far_share:.2}"
+    );
+    let _ = sess.finish();
+    clear_env();
+}
+
 /// G1: the app's camera hand-over. A preview opens the camera once; the
 /// recording takes that running camera (no second open, no 2 s dark settle)
 /// and hands it back to the preview afterwards. A cold start is measured too,
