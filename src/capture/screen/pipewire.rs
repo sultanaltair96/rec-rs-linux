@@ -697,8 +697,8 @@ fn format_pods() -> Vec<Vec<u8>> {
 ///
 /// This is what makes `resolve()` return the *pixel* size on Wayland, where the
 /// portal's own `size` field is in the compositor's (logical) coordinate space
-/// and can be half the pixels on a HiDPI desktop. The caller passes a duplicate
-/// of the portal's fd, so the same remote is used again for the real capture.
+/// and can be half the pixels on a HiDPI desktop. The caller passes a dedicated
+/// portal remote, which closes when the probe ends; capture uses another.
 pub fn probe_size(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize)> {
     probe_once(fd, node_id, wait)
 }

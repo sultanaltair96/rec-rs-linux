@@ -255,6 +255,8 @@ pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Pr
 /// never negotiated a format (see `a_session_without_a_format_is_replaced`).
 #[cfg(test)]
 static FORCE_UNPROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PROBE_SOCKET_INODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn prepare_session(
     want: Want,
@@ -374,15 +376,32 @@ fn prepare_session(
             .await
             .map_err(portal_error)
             .context("opening the portal's PipeWire remote")?;
+        // A dup shares the underlying socket, not just the portal session.
+        // The probe stops its loop on Format, before teardown is flushed; a
+        // retained duplicate keeps its half-negotiated server-side link alive,
+        // blocking other graph links (including the camera). Close a separate
+        // portal connection completely before starting any capture streams.
+        let probe_fd = screencast
+            .open_pipe_wire_remote(&session)
+            .await
+            .map_err(portal_error)
+            .context("opening the portal's PipeWire probe remote")?;
         let owner = PortalOwner {
             screencast: Some(screencast),
             session: Some(session),
         };
-        Ok::<_, anyhow::Error>((owner, streams, stream, fd, cursor_note))
+        Ok::<_, anyhow::Error>((owner, streams, stream, fd, probe_fd, cursor_note))
     });
     // The owner guards the session and proxy immediately upon leaving the
     // runtime, including if probing or constructing Prepared unwinds.
-    let (owner, streams, stream, fd, cursor_note) = result?;
+    let (owner, streams, stream, fd, probe_fd, cursor_note) = result?;
+    #[cfg(test)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(format!("/proc/self/fd/{}", probe_fd.as_raw_fd()))?;
+        PROBE_SOCKET_INODE.store(metadata.ino(), std::sync::atomic::Ordering::SeqCst);
+    }
     if let Some(t) = streams.restore_token()
         && let Err(e) = token::store(t)
     {
@@ -398,7 +417,7 @@ fn prepare_session(
     let probed_by_hook = probed_hook(forced_unprobed);
     #[cfg(not(test))]
     let probed_by_hook = true;
-    let (pixels, probed) = match stream_size(&fd, node_id, probe_wait) {
+    let (pixels, probed) = match pipewire::probe_size(probe_fd, node_id, probe_wait) {
         Ok(size) => (size, true),
         Err(e) => {
             if super::debug() {
@@ -492,14 +511,6 @@ fn shown_mode(available: &BitFlags<CursorMode>) -> CursorMode {
     } else {
         CursorMode::Hidden
     }
-}
-
-/// The pixel size the compositor will send.
-fn stream_size(fd: &OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize)> {
-    let dup = fd
-        .try_clone()
-        .context("duplicating the PipeWire remote fd")?;
-    pipewire::probe_size(dup, node_id, wait)
 }
 
 /// The stream's logical size, and the display number it matches when the
@@ -653,6 +664,34 @@ mod tests {
 
     // The portal tests share the forced-probe hook and drop observations.
     static PORTAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn probe_and_capture_use_distinct_portal_connections() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // run inside scripts/screen/headless.sh
+        }
+        let prepared = prepare(
+            Want::Monitor,
+            CaptureOptions::default(),
+            Duration::from_secs(20),
+        )
+        .expect("a portal session");
+        assert!(prepared.probed, "the probe must negotiate a format");
+        let capture_inode = std::fs::metadata(format!("/proc/self/fd/{}", prepared.fd.as_raw_fd()))
+            .unwrap()
+            .ino();
+        let probe_inode = PROBE_SOCKET_INODE.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(probe_inode, 0);
+        assert_ne!(
+            probe_inode, capture_inode,
+            "dup shares a socket and leaves the probe link alive"
+        );
+        prepared.close();
+    }
 
     /// A portal session whose stream never negotiated a format is replaced,
     /// not used: no consumer of such a node ever gets a format, so the session
