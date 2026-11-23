@@ -59,6 +59,18 @@ fi
 if [ -n "$ORIG_LD_LIBRARY_PATH" ]; then
     LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$ORIG_LD_LIBRARY_PATH"
 fi
+# Unlike the GPU fallbacks above, never put Wayland on the path merely because
+# an unrelated library is missing: a host driver may require newer symbols.
+wayland_found=
+if LD_LIBRARY_PATH="$ORIG_LD_LIBRARY_PATH" ldconfig -p 2>/dev/null | grep -q 'libwayland-client\.so\.0 '; then
+    wayland_found=1
+fi
+for dir in $(printf '%s' "$ORIG_LD_LIBRARY_PATH" | tr ':' ' ') /lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib /usr/lib; do
+    if [ -e "$dir/libwayland-client.so.0" ]; then wayland_found=1; break; fi
+done
+if [ -z "$wayland_found" ]; then
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$APPDIR/usr/lib/wayland-fallback"
+fi
 export LD_LIBRARY_PATH
 
 # Only the bundled plugins (see the header).

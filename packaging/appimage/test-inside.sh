@@ -114,6 +114,27 @@ fi
 # so unpack it once.
 ( cd /tmp && rm -rf squashfs-root && env -u APPIMAGE_EXTRACT_AND_RUN "$APPIMAGE" --appimage-extract >/dev/null 2>&1 ) || true
 
+echo "== Wayland dlopen: host first and bundled fallback"
+if cc /repo/packaging/check-wayland.c -ldl -o /tmp/squashfs-root/usr/bin/check-wayland &&
+   REC_APPIMAGE_EXEC=check-wayland /tmp/squashfs-root/AppRun > /tmp/wayland-host.log 2>&1 &&
+   ! grep -q '/wayland-fallback/' /tmp/wayland-host.log; then
+    echo "  host: $(cat /tmp/wayland-host.log)"
+    ok "Wayland dlopen uses the host through AppRun"
+else
+    cat /tmp/wayland-host.log 2>/dev/null || true
+    bad "Wayland dlopen uses the host through AppRun"
+fi
+if [ -f /tmp/squashfs-root/usr/lib/wayland-fallback/libwayland-client.so.0 ] &&
+   LD_LIBRARY_PATH=/tmp/squashfs-root/usr/lib/wayland-fallback \
+       /tmp/squashfs-root/usr/bin/check-wayland >/tmp/wayland-fallback.log 2>&1 &&
+   grep -q '/wayland-fallback/' /tmp/wayland-fallback.log; then
+    echo "  fallback: $(cat /tmp/wayland-fallback.log)"
+    ok "bundled Wayland fallback dlopen and barrier symbols resolve"
+else
+    cat /tmp/wayland-fallback.log 2>/dev/null || true
+    bad "bundled Wayland fallback dlopen and barrier symbols resolve"
+fi
+
 # Run a binary from the extracted bundle with AppRun's environment, so the
 # checks below see exactly what the AppImage sees when it starts.
 bundle_run() {

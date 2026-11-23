@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 11.4 MB bundle (runtime shared) | 104.4 MiB AppImage (GStreamer inside) |
+| Size | 11,442,008 bytes (runtime shared) | 109,947,384 bytes (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -195,7 +195,7 @@ WHIP; the test pattern synthesizes the system-audio beeps, so no device is
 needed), the replay buffer fills, and `stream-key` stores and deletes a key
 through `org.freedesktop.secrets`.
 
-Bundle size: **11.4 MB** (`rec.flatpak`, 11,420,464 bytes) — the runtime is shared. The manifest
+Bundle size: **11.4 MB** (`rec.flatpak`, 11,442,008 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -290,6 +290,15 @@ the host can force a driver. A host with no VA driver does not break anything:
 the plugin registers no elements and the writer picks `x264enc`/`x265enc`,
 exactly as on the Flatpak without a GPU.
 
+**Wayland client:** the hide-before-capture barrier dlopens
+`libwayland-client.so.0`. The AppImage keeps a copy separately in
+`usr/lib/wayland-fallback/`; AppRun adds it only when the host copy is absent,
+independently of the GPU fallbacks. The Flatpak uses its runtime's copy. The
+container suites use a small `dlopen`/`dlsym` helper for the barrier's symbols:
+they check the Flatpak sandbox, AppRun's host selection and the bundled
+fallback directly. The latter is forced via `LD_LIBRARY_PATH`; it does not
+simulate a host with no Wayland library.
+
 ### What deliberately comes from the host
 
 | Library | Why not bundled |
@@ -301,7 +310,7 @@ exactly as on the Flatpak without a GPU.
 | libdbus-1 | must match the running session bus |
 | **libpipewire-0.3 / libspa-0.2** | the client ABI has to match the *daemon* it talks to; a bundled client against the host's PipeWire is the classic AppImage failure. Every desktop ships it. If it is missing, the recorder fails to start; screen/audio capture would not work without a PipeWire daemon anyway |
 | the Vulkan ICDs and the GL drivers | `libvulkan.so.1` (the loader) is bundled because ffmpeg's libavcodec links it; the ICD JSON files and the drivers behind it are the host's |
-| **libxcb, libwayland, libdrm, libgbm** | the host's Vulkan/GL driver is linked against *its* libxcb and libwayland; shadowing them with the build container's older copies stops every ICD from loading (Fedora 43's lavapipe needs `xcb_dri3_import_syncobj_checked` and `wl_display_dispatch_queue_timeout`, which Ubuntu 24.04's libraries do not export). libavcodec links libxcb too, so a host without it loses gst-libav (AAC, ProRes, the HEVC decoder) — every desktop with an X11 or Wayland session has it |
+| **libxcb, libwayland, libdrm, libgbm** | libwayland-client has a separate host-first fallback as described above; the host's Vulkan/GL driver is linked against *its* libxcb and libwayland; shadowing them with the build container's older copies stops every ICD from loading (Fedora 43's lavapipe needs `xcb_dri3_import_syncobj_checked` and `wl_display_dispatch_queue_timeout`, which Ubuntu 24.04's libraries do not export). libavcodec links libxcb too, so a host without it loses gst-libav (AAC, ProRes, the HEVC decoder) — every desktop with an X11 or Wayland session has it |
 | the Xlib family (`libX11`, `libXext`, `libXrender`, `libXcursor`, `libXrandr`, `libXi`, `libXinerama`, `libXxf86vm`, `libXfixes`) and `libxkbcommon(-x11)` | **bundled**: they are ABI-stable, do not talk to the GPU driver, and winit/xkbcommon-dl `dlopen` them by soname, so a host without an X stack would have no window |
 
 `AppRun` narrows `GST_PLUGIN_SYSTEM_PATH_1_0` to the bundled plugins only, so a
@@ -336,12 +345,12 @@ The build container has the Ubuntu GStreamer packages whose plugins are bundled,
 `rec-rs-appimage-cache` caches the toolchain and the target directory.
 
 The test runs the AppImage on **Fedora 43 and Debian 13 containers with no
-GStreamer installed** (the only host package added is the PipeWire client
-library, see the table above). It records H.264, HEVC and ProRes with the test
+GStreamer installed** (the setup also installs the PipeWire client, graphics
+libraries, Xvfb and a C compiler for the dlopen helper). It records H.264, HEVC and ProRes with the test
 pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
-Result: **Debian 13 16/16 pass + 1 skip** and **Fedora 43 15/15 pass + 2
+Result: **Debian 13 18 pass + 1 skip** and **Fedora 43 17 pass + 2
 skips**. The encoders are `x264enc`, `x265enc` and `avenc_prores_aw`
 (`avenc_prores_ks` and `avenc_prores` are bundled too), `probe` reports
 `video h264 1920x1080 @ 60.000 fps` and HEVC, 29 plugins are bundled (the VA
@@ -359,7 +368,7 @@ The skips are the checks that need hardware this container does not have: the
 GUI on Fedora (below) and `vah264enc` (no `/dev/dri/renderD128`). Without a
 render node the test still asserts that the `va` plugin *loads* through AppRun
 (so libva resolved, from the host or the bundled fallback); with one it asserts
-`vah264enc` registers — that is the check agent-amd passes.
+`vah264enc` registers and the writer chooses it.
 
 On Fedora 43's container the GUI check **skips**: the host's software Vulkan
 (lavapipe over Xvfb) refuses to enumerate a device
@@ -388,7 +397,7 @@ which package provides it:
 | Need | Flatpak | AppImage |
 |---|---|---|
 | Vulkan/GL for wgpu | the runtime's Mesa (`org.freedesktop.Platform.GL.default`, installed with the runtime) plus `--device=dri` | the host's Mesa/GL/Vulkan drivers; the `libvulkan.so.1` loader is bundled, the ICDs are the host's |
-| Window: Wayland/X11 client stack | the runtime's libwayland, libxkbcommon, libX11 | the Xlib family and `libxkbcommon(-x11)` are bundled; `libxcb`/`libwayland` are the host's (see the table above) |
+| Window: Wayland/X11 client stack | the runtime's libwayland, libxkbcommon, libX11 | the Xlib family and `libxkbcommon(-x11)` are bundled; `libxcb` is host-provided and `libwayland-client` is host-first with a separate fallback |
 | Tray (StatusNotifierItem through ksni, D-Bus session) | `--talk-name=org.kde.StatusNotifierWatcher` | host session bus; without a watcher the app warns and keeps the window |
 | Global hotkeys (XDG GlobalShortcuts portal) | the portal is reachable in the sandbox by default; a missing portal falls back to X11 grabs and otherwise says "unavailable" | host portal over D-Bus, same fallback |
 | Secret Service (stream keys, phase 1D) | `--talk-name=org.freedesktop.secrets` | host Secret Service |
