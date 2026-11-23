@@ -96,6 +96,10 @@ pub struct Settings {
     /// cannot exclude it (phase 1E, upstream's ScreenCaptureKit content
     /// filter). Off = the window stays, and is in the picture.
     pub hide_window_when_recording: bool,
+    /// The "Rec is still running in the background" note has been shown once
+    /// (the first time the window is closed to the tray); later closes are
+    /// quiet.
+    pub notifies_when_hidden: bool,
     /// Keep the last `replay_secs` of the live encode in memory.
     pub replay_enabled: bool,
     pub replay_secs: u32,
@@ -151,6 +155,7 @@ impl Default for Settings {
             clicks: false,
             preview_low_power: false,
             hide_window_when_recording: true,
+            notifies_when_hidden: false,
             replay_enabled: false,
             replay_secs: 60,
             stream_dests: live::SERVICES

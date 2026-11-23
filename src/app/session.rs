@@ -221,22 +221,39 @@ pub fn options(
     Ok(o)
 }
 
-/// The banner for a preview that did not start. The CLI's errors already name
-/// the phase that owes the feature, so they are shown as they are.
+/// The banner for a preview that did not start. Keep the whole source error
+/// chain: camera negotiation, permission and first-frame failures contain the
+/// actionable cause below the device/session context. Do not replace these
+/// with a generic "camera is not delivering" warning.
 pub fn preview_error(e: &anyhow::Error) -> String {
-    let msg = format!("{e:#}");
-    if msg.contains("not implemented yet") {
-        // The stub modules say "…not implemented yet (phase 1X); use `rec-rs
-        // record`…". The app is the window on the same pipeline.
-        format!("Preview unavailable: {msg}")
-    } else {
-        format!("Preview unavailable: {msg}")
-    }
+    format!("Preview unavailable: {e:#}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_banner_preserves_camera_source_errors() {
+        let error = anyhow::anyhow!("Permission denied (os error 13)")
+            .context("opening /dev/video0")
+            .context("camera USB Camera (/dev/video0)");
+        assert_eq!(
+            preview_error(&error),
+            "Preview unavailable: camera USB Camera (/dev/video0): opening /dev/video0: Permission denied (os error 13)"
+        );
+        for cause in [
+            "camera “USB Camera” is not connected (see `rec-rs devices`)",
+            "camera USB Camera did not deliver a frame within 5 s",
+            "camera portal permission denied",
+            "camera capture is not implemented yet (phase 1B)",
+        ] {
+            assert_eq!(
+                preview_error(&anyhow::anyhow!(cause)),
+                format!("Preview unavailable: {cause}")
+            );
+        }
+    }
 
     /// The seam drives the real `Live`: a key from the environment or the store,
     /// destinations added and removed by id, statuses keyed by that id, and the

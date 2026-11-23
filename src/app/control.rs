@@ -40,6 +40,9 @@ pub enum Control {
     StartRecording,
     /// Toggle recording (the tray/hotkey command, also usable from scripts).
     ToggleRecording,
+    /// Hide the main window to the tray (a scripted close; on Wayland the
+    /// window is destroyed and recreated by `show`).
+    Hide,
     /// Stop a running recording and finalize the file.
     Stop,
     Pause,
@@ -56,6 +59,7 @@ impl Control {
             Control::Settings => "settings",
             Control::StartRecording => "start-recording",
             Control::ToggleRecording => "toggle-recording",
+            Control::Hide => "hide",
             Control::Stop => "stop",
             Control::Pause => "pause",
             Control::Resume => "resume",
@@ -70,6 +74,7 @@ impl Control {
             "settings" => Control::Settings,
             "start-recording" => Control::StartRecording,
             "toggle-recording" => Control::ToggleRecording,
+            "hide" => Control::Hide,
             "stop" => Control::Stop,
             "pause" => Control::Pause,
             "resume" => Control::Resume,
@@ -292,6 +297,7 @@ mod tests {
             Control::Settings,
             Control::StartRecording,
             Control::ToggleRecording,
+            Control::Hide,
             Control::Stop,
             Control::Pause,
             Control::Resume,

@@ -41,9 +41,13 @@ pub fn reveal_args(file: &Path) -> Vec<String> {
     ]
 }
 
-/// A desktop notification (the freedesktop notification service on the session
-/// bus), fire-and-forget: a session without one keeps the message in the tray
-/// area instead. Used when the app hides its own window for a recording.
+/// A desktop notification, fire-and-forget. Used when the app hides its own
+/// window for a recording, and the first time it is closed to the tray.
+///
+/// The **notification portal** is tried first: inside a Flatpak the session bus
+/// policy does not allow `org.freedesktop.Notifications`, while the portal is
+/// granted to every app. Outside a sandbox the freedesktop service directly is
+/// the fallback for a desktop without the portal.
 pub fn notify(summary: &str, body: &str) {
     let (summary, body) = (summary.to_string(), body.to_string());
     std::thread::Builder::new()
@@ -54,6 +58,33 @@ pub fn notify(summary: &str, body: &str) {
                 .build();
             let Ok(rt) = rt else { return };
             rt.block_on(async move {
+                // 1. The portal (Flatpak-safe).
+                let portal = ashpd::desktop::notification::NotificationProxy::new().await;
+                if let Err(e) = &portal
+                    && std::env::var_os("REC_DEBUG").is_some()
+                {
+                    eprintln!("rec: debug: no notification portal: {e}");
+                }
+                if let Ok(proxy) = portal {
+                    let n = ashpd::desktop::notification::Notification::new(&summary)
+                        .body(Some(body.as_str()));
+                    match proxy.add_notification("rec-rs", n).await {
+                        Ok(()) => {
+                            if std::env::var_os("REC_DEBUG").is_some() {
+                                eprintln!(
+                                    "rec: debug: notification sent (portal): {summary} — {body}"
+                                );
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            if std::env::var_os("REC_DEBUG").is_some() {
+                                eprintln!("rec: debug: the notification portal refused: {e}");
+                            }
+                        }
+                    }
+                }
+                // 2. The freedesktop notification service directly.
                 let Ok(conn) = zbus::Connection::session().await else {
                     return;
                 };

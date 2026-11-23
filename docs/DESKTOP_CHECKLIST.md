@@ -117,9 +117,10 @@ enabled for the tray, and PipeWire (default on GNOME).
 - Do: start the app (`REC_DEBUG=1 rec-rs gui 2>"$EV/app-gnome.log"`), leave it open and idle, then
   press **Record** on the screen scene.
 - Command: watch `"$EV/app-gnome.log"` while you do it.
-- Expect: Rec's window disappears, a desktop notification says it was hidden because a screen
-  capture would film it, the recording runs, and the window comes back when you stop. The file must
-  **not** contain Rec.
+- Expect: Rec's window disappears **before the first captured frame** (on Wayland the window is
+  destroyed and recreated on stop, because `set_visible` is a no-op there; on X11 it is painted out),
+  a desktop notification says it was hidden because a screen capture would film it, the recording
+  runs, and the window comes back when you stop. The file must **not** contain Rec.
 - Evidence: the notification (screenshot), the log lines, and a frame of the file.
 - **G3 — this is the hide/notification/restore path that only a portal desktop can prove.**
 
@@ -138,7 +139,10 @@ enabled for the tray, and PipeWire (default on GNOME).
 - Do: start a recording, close the window (Ctrl+W), reopen from the tray, pause/resume from the tray,
   Save Replay from the tray (with the replay buffer on), stop from the tray.
 - Command: none beyond the tray; keep `"$EV/app-gnome.log"` open.
-- Expect: closing the window keeps the recording and the tray (red dot + `mm:ss`); "Show Rec Window"
+- Expect: closing the window keeps the recording and the tray (red dot + `mm:ss`) — on Wayland the
+  window is destroyed and "Show Rec Window" recreates it; the **first** close shows "Rec is still
+  running in the background; quit it from the tray" once (then never again); with no StatusNotifier
+  host (disable the AppIndicator extension) closing quits instead; "Show Rec Window"
   brings it back with no gap in the file; the tray menu has Start/Stop, Pause/Resume, Save Replay
   (only while the buffer runs), Go Live/Stop Streaming, Show Rec Window, Settings, Reveal Last
   Recording (only with a recording), Open Recordings Folder, Check for Updates…, Quit; the title
