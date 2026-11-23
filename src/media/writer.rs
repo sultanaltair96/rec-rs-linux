@@ -1728,27 +1728,114 @@ fn audio_plan(system: bool, mic: bool, layout: AudioLayout) -> Vec<(Target, u32,
     plan
 }
 
+/// True for a VA-API encoder element name.
+fn is_va(name: &str) -> bool {
+    name.starts_with("vah") || name.starts_with("vaapi")
+}
+
+/// The raw pixel formats an encoder's sink template accepts, in template
+/// order. Empty when the factory is not installed or its template has no
+/// `format` field.
+fn accepted_formats(name: &str) -> Vec<String> {
+    let Some(factory) = gst::ElementFactory::find(name) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for template in factory.static_pad_templates() {
+        if template.direction() != gst::PadDirection::Sink {
+            continue;
+        }
+        out.extend(caps_formats(&template.caps()));
+    }
+    out
+}
+
+/// The `format` values of a caps template (a single value or a list).
+fn caps_formats(caps: &gst::Caps) -> Vec<String> {
+    let mut out = vec![];
+    for s in caps.iter() {
+        if let Ok(v) = s.get::<&str>("format") {
+            out.push(v.to_string());
+            continue;
+        }
+        if let Ok(list) = s.get::<gst::List>("format") {
+            for v in list.as_slice() {
+                if let Ok(f) = v.get::<&str>() {
+                    out.push(f.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The formats to try for an encoder: NV12 first for VA-API (what a render
+/// node's encoders take, and what the compositor already produces), the
+/// software format otherwise.
+fn preferred_formats(name: &str, software: &[&str]) -> Vec<String> {
+    let mut out = vec![];
+    if is_va(name) {
+        out.push("NV12".to_string());
+    }
+    out.extend(software.iter().map(|s| s.to_string()));
+    out
+}
+
+/// The first preferred format the encoder accepts (case-insensitive), or None
+/// when the encoder cannot take any of them.
+fn choose_format(preferred: &[String], accepted: &[String]) -> Option<String> {
+    preferred
+        .iter()
+        .find_map(|p| accepted.iter().find(|a| a.eq_ignore_ascii_case(p)).cloned())
+}
+
 /// Build the first installed encoder from `candidates` and set its properties.
 fn make_encoder(
     candidates: &[&str],
     bitrate_bps: u64,
     fps: Option<u32>,
     label: &str,
-    probe_format: Option<&str>,
+    software_format: &[&str],
     wide: bool,
-) -> Result<(gst::Element, String)> {
+) -> Result<(gst::Element, String, String)> {
+    let debug = std::env::var_os("REC_DEBUG").is_some();
     for name in candidates {
         // VA-API needs a render node: without /dev/dri the plugin registers no
         // elements at all (dev/ELEMENTS.md), and with a node but a broken driver
         // the trial encode below fails and the next candidate is used.
-        if (name.starts_with("vah") || name.starts_with("vaapi"))
-            && !std::path::Path::new("/dev/dri").exists()
-        {
+        if is_va(name) && !std::path::Path::new("/dev/dri").exists() {
+            if debug {
+                eprintln!("rec: debug: encoder {name}: skipped (no /dev/dri)");
+            }
             continue;
         }
         if !has_element(name) {
+            if debug {
+                eprintln!("rec: debug: encoder {name}: not installed");
+            }
             continue;
         }
+        // The pixel format comes from what this encoder accepts, not from one
+        // pinned value: radeonsi's vah264enc takes only NV12, so trial-encoding
+        // it with I420 failed at link time and the hardware encoder was
+        // silently skipped.
+        let preferred = preferred_formats(name, software_format);
+        let accepted = accepted_formats(name);
+        let format = if preferred.is_empty() {
+            String::new()
+        } else {
+            match choose_format(&preferred, &accepted) {
+                Some(f) => f,
+                None => {
+                    if debug {
+                        eprintln!(
+                            "rec: debug: encoder {name}: skipped (accepts {accepted:?}, needs one of {preferred:?})"
+                        );
+                    }
+                    continue;
+                }
+            }
+        };
         let el = gst::ElementFactory::make(name)
             .build()
             .with_context(|| format!("creating {name}"))?;
@@ -1839,13 +1926,16 @@ fn make_encoder(
             }
             _ => {}
         }
-        if let Some(format) = probe_format
-            && (name.starts_with("vah") || name.starts_with("vaapi"))
-            && !trial_encode(&el, format)
+        if is_va(name)
+            && let Err(e) = trial_encode(&el, &format)
         {
+            if debug {
+                eprintln!("rec: debug: encoder {name}: trial encode failed: {e}");
+            }
             continue;
         }
-        if std::env::var_os("REC_DEBUG").is_some() {
+        if debug {
+            eprintln!("rec: debug: encoder {name}: chosen ({format})");
             // x265 prints its banner (rate control, bitrate) at info level.
             if *name == "x265enc" {
                 set(&el, "log-level", 4);
@@ -1865,7 +1955,7 @@ fn make_encoder(
             }
             eprintln!("rec: debug: encoder {name}: {}", dump.join(" "));
         }
-        return Ok((el, name.to_string()));
+        return Ok((el, name.to_string(), format));
     }
     bail!(
         "no {label} encoder is installed: tried {}. Install one (x264enc comes with RPM Fusion's \
@@ -1876,11 +1966,10 @@ fn make_encoder(
 }
 
 /// Encode a couple of test frames through a candidate element, to prove it can
-/// actually run. A VA-API encoder whose driver cannot open a display fails here
-/// instead of failing the recording.
-///
-/// Returns false on any error or after 3 seconds.
-fn trial_encode(el: &gst::Element, format: &str) -> bool {
+/// actually run. A VA-API encoder whose driver cannot open a display, or whose
+/// sink caps need a format we did not pick, fails here instead of failing the
+/// recording. Returns the GStreamer error so `REC_DEBUG` can say why.
+fn trial_encode(el: &gst::Element, format: &str) -> Result<(), String> {
     let caps = gst::Caps::builder("video/x-raw")
         .field("format", format)
         .field("width", 320i32)
@@ -1888,40 +1977,28 @@ fn trial_encode(el: &gst::Element, format: &str) -> bool {
         .field("framerate", gst::Fraction::new(30, 1))
         .build();
     let pipeline = gst::Pipeline::new();
-    let Ok(src) = gst::ElementFactory::make("videotestsrc").build() else {
-        return false;
-    };
+    let make = |name: &str| gst::ElementFactory::make(name).build();
+    let src = make("videotestsrc").map_err(|e| format!("videotestsrc: {e}"))?;
     set(&src, "num-buffers", 3);
-    let Ok(convert) = gst::ElementFactory::make("videoconvert").build() else {
-        return false;
-    };
-    let Ok(filter) = gst::ElementFactory::make("capsfilter").build() else {
-        return false;
-    };
+    let convert = make("videoconvert").map_err(|e| format!("videoconvert: {e}"))?;
+    let filter = make("capsfilter").map_err(|e| format!("capsfilter: {e}"))?;
     filter.set_property("caps", &caps);
-    let Ok(sink) = gst::ElementFactory::make("fakesink").build() else {
-        return false;
-    };
+    let sink = make("fakesink").map_err(|e| format!("fakesink: {e}"))?;
     set(&sink, "sync", "false");
-    if pipeline
+    pipeline
         .add_many([&src, &convert, &filter, el, &sink])
-        .is_err()
-    {
-        return false;
-    }
-    if gst::Element::link_many([&src, &convert, &filter, el, &sink]).is_err() {
-        return false;
-    }
-    if pipeline.set_state(gst::State::Playing).is_err() {
-        let _ = pipeline.set_state(gst::State::Null);
-        return false;
-    }
+        .map_err(|e| format!("adding elements: {e}"))?;
+    gst::Element::link_many([&src, &convert, &filter, el, &sink])
+        .map_err(|e| format!("linking {format} into {}: {e}", el.name()))?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| format!("starting: {e}"))?;
     let Some(bus) = pipeline.bus() else {
         let _ = pipeline.set_state(gst::State::Null);
-        return false;
+        return Err("no pipeline bus".into());
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut ok = false;
+    let mut result = Err("trial encode timed out".to_string());
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -1936,25 +2013,24 @@ fn trial_encode(el: &gst::Element, format: &str) -> bool {
         use gst::MessageView;
         match msg.view() {
             MessageView::Eos(_) => {
-                ok = true;
+                result = Ok(());
                 break;
             }
             MessageView::Error(err) => {
-                if std::env::var_os("REC_DEBUG").is_some() {
-                    eprintln!("rec: debug: {} cannot encode: {}", el.name(), err.error());
-                }
+                let debug = err.debug().map(|d| format!(" ({d})")).unwrap_or_default();
+                result = Err(format!("{}{debug}", err.error()));
                 break;
             }
             _ => {}
         }
     }
     let _ = pipeline.set_state(gst::State::Null);
-    if !ok {
+    if result.is_err() {
         // Take the element out of the pipeline it was tested in, so it can be
         // added to the real one.
         let _ = el.set_state(gst::State::Null);
     }
-    ok
+    result
 }
 
 /// Build the pipeline and the muxed output file.
@@ -1978,16 +2054,18 @@ fn open_sink(
     // Predictive" instead of upstream's 4:2:0 High, and ProRes 422 needs 4:2:2
     // 10-bit. An explicit capsfilter is what pins it, and it carries the BT.709
     // tags upstream writes (primaries, transfer, matrix, limited range).
-    let enc_format = match spec.codec {
-        Codec::H264 | Codec::Hevc => "I420",
-        Codec::Prores => "I422_10LE",
+    // The software format for the codec; a VA-API candidate gets NV12 first
+    // (what radeonsi's encoders take and what the compositor produces).
+    let software_format: &[&str] = match spec.codec {
+        Codec::H264 | Codec::Hevc => &["I420"],
+        Codec::Prores => &["I422_10LE"],
     };
-    let (venc, vename) = make_encoder(
+    let (venc, vename, enc_format) = make_encoder(
         video_encoder_candidates(spec.codec),
         spec.bitrate,
         Some(spec.fps),
         "video",
-        Some(enc_format),
+        software_format,
         spec.width * spec.height > 1920 * 1080,
     )?;
 
@@ -2033,7 +2111,7 @@ fn open_sink(
     enc_capsfilter.set_property(
         "caps",
         gst::Caps::builder("video/x-raw")
-            .field("format", enc_format)
+            .field("format", &enc_format)
             .field("width", spec.width as i32)
             .field("height", spec.height as i32)
             .field("framerate", gst::Fraction::new(spec.fps as i32, 1))
@@ -2119,8 +2197,8 @@ fn open_sink(
                 .field("channels", *channels as i32)
                 .build();
             // One encoder per track: a shared one would interleave the streams.
-            let (aenc, aname) =
-                make_encoder(AUDIO_ENCODER_CANDIDATES, *bitrate, None, "AAC", None, false)?;
+            let (aenc, aname, _) =
+                make_encoder(AUDIO_ENCODER_CANDIDATES, *bitrate, None, "AAC", &[], false)?;
             audio_names.push(aname.clone());
             let priming_override = std::env::var("REC_AAC_PRIMING")
                 .ok()
@@ -2776,5 +2854,107 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+    #[test]
+    fn the_format_choice_follows_the_encoder_template() {
+        // radeonsi's vah264enc accepts only NV12: the VA preference list must
+        // pick it, not the I420 that used to be pinned and failed to link.
+        let va = preferred_formats("vah264enc", &["I420"]);
+        assert_eq!(va, vec!["NV12".to_string(), "I420".to_string()]);
+        assert_eq!(
+            choose_format(&va, &["NV12".to_string()]).as_deref(),
+            Some("NV12")
+        );
+        // An encoder that takes I420 only (or x264/x265) keeps I420.
+        assert_eq!(
+            preferred_formats("x264enc", &["I420"]),
+            vec!["I420".to_string()]
+        );
+        assert_eq!(
+            choose_format(
+                &preferred_formats("x264enc", &["I420"]),
+                &["I420".to_string()]
+            )
+            .as_deref(),
+            Some("I420")
+        );
+        // No overlap means no choice (the candidate is skipped with a reason).
+        assert_eq!(
+            choose_format(
+                &preferred_formats("vah265enc", &["I420"]),
+                &["YV12".to_string()]
+            ),
+            None
+        );
+        // Caps are case-insensitive.
+        assert_eq!(
+            choose_format(
+                &preferred_formats("vah264enc", &["I420"]),
+                &["nv12".to_string()]
+            )
+            .as_deref(),
+            Some("nv12")
+        );
+    }
+
+    #[test]
+    fn the_real_templates_name_the_formats_we_pin() {
+        let _ = gst::init();
+        if has_element("x264enc") {
+            let accepted = accepted_formats("x264enc");
+            assert!(accepted.iter().any(|f| f == "I420"), "{accepted:?}");
+            assert_eq!(
+                choose_format(&preferred_formats("x264enc", &["I420"]), &accepted).as_deref(),
+                Some("I420")
+            );
+        }
+        if has_element("x265enc") {
+            let accepted = accepted_formats("x265enc");
+            assert!(accepted.iter().any(|f| f == "I420"), "{accepted:?}");
+        }
+        if has_element("avenc_prores_ks") {
+            let accepted = accepted_formats("avenc_prores_ks");
+            assert_eq!(
+                choose_format(
+                    &preferred_formats("avenc_prores_ks", &["I422_10LE"]),
+                    &accepted
+                )
+                .as_deref(),
+                Some("I422_10LE"),
+                "{accepted:?}"
+            );
+        }
+        // On a GPU host (agent-amd) the VA template is NV12-only; the choice
+        // must be NV12. The dev container has no /dev/dri, so this only runs
+        // where the factory exists.
+        if has_element("vah264enc") {
+            let accepted = accepted_formats("vah264enc");
+            assert!(
+                accepted.iter().any(|f| f.eq_ignore_ascii_case("NV12")),
+                "{accepted:?}"
+            );
+            assert_eq!(
+                choose_format(&preferred_formats("vah264enc", &["I420"]), &accepted)
+                    .as_deref()
+                    .map(str::to_ascii_uppercase),
+                Some("NV12".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn caps_templates_are_parsed_including_lists() {
+        let _ = gst::init();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", gst::List::new(["NV12", "I420"]))
+            .build();
+        assert_eq!(
+            caps_formats(&caps),
+            vec!["NV12".to_string(), "I420".to_string()]
+        );
+        let single = gst::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .build();
+        assert_eq!(caps_formats(&single), vec!["I420".to_string()]);
     }
 }
