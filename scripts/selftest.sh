@@ -698,8 +698,30 @@ screen_test() {
         skip=$((skip+1))
         return 0
     fi
-    if REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" "scripts/screen/$harness" \
-           scripts/screen/cases.sh "$case" >/dev/null 2>"$OUT/$name.harness.log"; then
+    # A desktop session can come up poisoned: PipeWire and the portal answer,
+    # but no screen-cast format ever reaches a consumer (measured under load -
+    # the stream reaches Paused and receives no param at all, for every node and
+    # every portal session of that instance). Only a fresh session fixes it, so
+    # the harness says so and we start one more, once.
+    attempt=0
+    while [ "$attempt" -lt 2 ]; do
+        attempt=$((attempt+1))
+        logdir="$OUT/$name-harness"
+        [ "$attempt" -gt 1 ] && logdir="$OUT/$name-harness-retry"
+        if REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$logdir" \
+               timeout "$TIMEOUT" "scripts/screen/$harness" \
+               scripts/screen/cases.sh "$case" >/dev/null 2>"$OUT/$name.harness.log"; then
+            break
+        fi
+        if [ "$attempt" -eq 1 ] &&
+           grep -q "no capture produced frames" "$OUT/$name.harness.log" 2>/dev/null; then
+            echo "note: $name: the session never produced a frame; starting a fresh one" >&2
+            continue
+        fi
+        break
+    done
+    if [ -f "$OUT/$name.mp4" ] && [ "$attempt" -le 2 ] &&
+       ! grep -q "no capture produced frames" "$OUT/$name.harness.log" 2>/dev/null; then
         screen_case "$name" "$OUT/$name.mp4" "$w" "$h" "$move"
     else
         echo "FAIL  $name  (see $OUT/$name.mp4.log and $OUT/$name.harness.log)"
@@ -726,10 +748,15 @@ if wanted screen-exclude; then
     if [ -z "$screen_harness" ]; then
         echo "SKIP  screen-exclude  (needs sway, Xvfb and dbus-run-session: run under scripts/dev.sh)"
         skip=$((skip+1))
-    elif REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" scripts/screen/xvfb.sh \
+    elif REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$OUT/screen-exclude-harness" \
+             timeout "$TIMEOUT" scripts/screen/xvfb.sh \
              scripts/screen/cases.sh exclude-x11 >/dev/null 2>"$OUT/screen-exclude.harness.log" \
-         && REC_BIN="$REC_ABS" OUT_DIR="$OUT" timeout "$TIMEOUT" scripts/screen/headless.sh \
-             scripts/screen/cases.sh exclude-portal >/dev/null 2>>"$OUT/screen-exclude.harness.log"; then
+         && { REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$OUT/screen-exclude-portal-harness" \
+                  timeout "$TIMEOUT" scripts/screen/headless.sh \
+                  scripts/screen/cases.sh exclude-portal >/dev/null 2>>"$OUT/screen-exclude.harness.log" \
+              || REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$OUT/screen-exclude-portal-retry" \
+                  timeout "$TIMEOUT" scripts/screen/headless.sh \
+                  scripts/screen/cases.sh exclude-portal >/dev/null 2>>"$OUT/screen-exclude.harness.log"; }; then
         total=$(frames_total "$OUT/screen-exclude.mp4")
         distinct=$(frames_distinct "$OUT/screen-exclude.mp4")
         if [ "$total" -ge 30 ] && [ "$distinct" -eq 1 ]; then

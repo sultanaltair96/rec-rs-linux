@@ -116,6 +116,9 @@ pub struct Prepared {
     /// Why the cursor looks different from what `--no-cursor`/`--clicks` asked
     /// for, when the desktop could not do it.
     pub cursor_note: Option<String>,
+    /// The stream offered a video format when probed. `false` means the node is
+    /// not capturing, and only another session can fix it.
+    pub probed: bool,
     /// One line about what the picker chose.
     pub picked: String,
 }
@@ -139,7 +142,60 @@ impl Prepared {
 ///
 /// `timeout` bounds the dialog: a picker that is never answered must fail the
 /// recording with a message, not hang it.
+/// Run the ScreenCast handshake, and once more if the stream never negotiated.
+///
+/// A compositor can export the node before its own capture stream has a format
+/// (`xdg-desktop-portal-wlr` does this under load). No consumer of that node
+/// ever sees a format — a second connection, or six seconds of patience, does
+/// not help — so the only recovery is a fresh portal session, which the restore
+/// token makes silent. Recordings then start instead of failing with "no video
+/// frames".
 pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Prepared> {
+    let prepared = prepare_session(want, opts, timeout, pipewire::PROBE_WAIT)?;
+    if prepared.probed {
+        return Ok(prepared);
+    }
+    eprintln!(
+        "rec: the screen-cast stream offered no video format; asking the portal for a fresh session"
+    );
+    prepared.close();
+    let fresh = prepare_session(want, opts, timeout, pipewire::PROBE_RETRY_WAIT)?;
+    if !fresh.probed {
+        fresh.close();
+        // Two sessions, and not one `param` ever reached the stream: the
+        // backend's nodes exist but this client is not shown their formats
+        // (measured: the stream reaches `Paused` and stays silent, and every
+        // node of the session behaves the same). Recording would write a file
+        // with no video, three seconds later and with a vaguer message.
+        bail!(
+            "the screen-cast stream offered no video format on two sessions, so a recording \
+             would have no video. The desktop's screen-cast backend (xdg-desktop-portal-wlr, \
+             xdg-desktop-portal-gnome or xdg-desktop-portal-kde) is not delivering a stream: \
+             check that PipeWire and the portal are running, and try `rec-rs permissions`"
+        );
+    }
+    Ok(fresh)
+}
+
+/// Test hook: how many of the next sessions should look like a stream that
+/// never negotiated a format (see `a_session_without_a_format_is_replaced`).
+#[cfg(test)]
+static FORCE_UNPROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn prepare_session(
+    want: Want,
+    opts: CaptureOptions,
+    timeout: Duration,
+    probe_wait: Duration,
+) -> Result<Prepared> {
+    #[cfg(test)]
+    let forced_unprobed = FORCE_UNPROBED
+        .try_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| n.checked_sub(1),
+        )
+        .is_ok();
     let mut saved = token::load();
     let result = runtime().block_on(async {
         let screencast = Screencast::new().await.map_err(portal_error)?;
@@ -251,13 +307,17 @@ pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Pr
         .map(|(w, h)| (w.max(2) as usize, h.max(2) as usize))
         .unwrap_or((1920, 1080));
     // The compositor's coordinates, in pixels: what PipeWire will negotiate.
-    let pixels = match stream_size(&fd, node_id) {
-        Ok(size) => size,
+    #[cfg(test)]
+    let probed_by_hook = probed_hook(forced_unprobed);
+    #[cfg(not(test))]
+    let probed_by_hook = true;
+    let (pixels, probed) = match stream_size(&fd, node_id, probe_wait) {
+        Ok(size) => (size, true),
         Err(e) => {
             if super::debug() {
                 eprintln!("rec: debug: could not probe the stream size ({e}); using the portal's");
             }
-            reported
+            (reported, false)
         }
     };
     let (points, matched) = match_points(stream.position(), reported, pixels);
@@ -298,6 +358,7 @@ pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Pr
             Want::Monitor
         },
         cursor_note,
+        probed: probed && probed_by_hook,
         picked,
     })
 }
@@ -348,11 +409,11 @@ fn shown_mode(available: &BitFlags<CursorMode>) -> CursorMode {
 }
 
 /// The pixel size the compositor will send.
-fn stream_size(fd: &OwnedFd, node_id: u32) -> Result<(usize, usize)> {
+fn stream_size(fd: &OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize)> {
     let dup = fd
         .try_clone()
         .context("duplicating the PipeWire remote fd")?;
-    pipewire::probe_size(dup, node_id)
+    pipewire::probe_size(dup, node_id, wait)
 }
 
 /// The stream's logical size, and the display number it matches when the
@@ -417,6 +478,12 @@ pub fn portal_error(e: PortalError) -> anyhow::Error {
         ),
         other => anyhow!("the desktop portal failed: {other}"),
     }
+}
+
+/// Test hook: a forced session reports "no format".
+#[cfg(test)]
+fn probed_hook(forced: bool) -> bool {
+    !forced
 }
 
 #[cfg(test)]
@@ -496,6 +563,52 @@ mod tests {
             choose_cursor(BitFlags::empty(), shown).0,
             CursorMode::Hidden
         );
+    }
+
+    /// A portal session whose stream never negotiated a format is replaced,
+    /// not used: no consumer of such a node ever gets a format, so the session
+    /// (not the stream) is what has to go. The `FORCE_UNPROBED` hook makes the
+    /// first session look like that without needing a stalled compositor.
+    #[test]
+    fn a_session_without_a_format_is_replaced() {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // needs the headless harness (scripts/screen/headless.sh)
+        }
+        FORCE_UNPROBED.store(1, std::sync::atomic::Ordering::SeqCst);
+        let prepared = prepare(
+            Want::Monitor,
+            CaptureOptions::default(),
+            Duration::from_secs(20),
+        )
+        .expect("a portal session");
+        assert!(
+            prepared.probed,
+            "the second session must have negotiated a format"
+        );
+        prepared.close();
+        // The hook is spent: the next handshake is normal.
+        assert_eq!(FORCE_UNPROBED.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Two sessions without a format are a refusal, not a silent recording.
+    /// Before this check the second session was used anyway and the recording
+    /// failed three seconds later with "no video frames were captured".
+    #[test]
+    fn two_sessions_without_a_format_are_refused() {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // needs the headless harness (scripts/screen/headless.sh)
+        }
+        FORCE_UNPROBED.store(2, std::sync::atomic::Ordering::SeqCst);
+        let err = match prepare(
+            Want::Monitor,
+            CaptureOptions::default(),
+            Duration::from_secs(20),
+        ) {
+            Ok(_) => panic!("a stream that never negotiates must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("two sessions"), "{err}");
+        assert!(err.contains("no video"), "{err}");
     }
 
     #[test]
