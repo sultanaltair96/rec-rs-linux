@@ -3979,7 +3979,7 @@ dependencies = [
  "wgpu",
  "winit",
  "x11rb 0.14.0",
- "zbus",
+ "zbus 5.13.2",
  "zune-jpeg",
 ]
 
