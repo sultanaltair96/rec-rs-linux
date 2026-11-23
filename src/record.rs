@@ -1067,12 +1067,10 @@ pub fn pidfile_path() -> PathBuf {
 
 /// A running recorder's pid and output file.
 fn running() -> Result<(i32, String)> {
-    let text = std::fs::read_to_string(pidfile_path()).map_err(|_| {
-        anyhow::anyhow!(
-            "no recording in progress ({} not found)",
-            pidfile_path().display()
-        )
-    })?;
+    // Upstream's text, word for word: it does not name the pidfile, and neither
+    // do we (`record.rs:643` upstream).
+    let text = std::fs::read_to_string(pidfile_path())
+        .map_err(|_| anyhow::anyhow!("no recording in progress"))?;
     let mut lines = text.lines();
     let pid: i32 = lines
         .next()
@@ -1088,7 +1086,8 @@ fn running() -> Result<(i32, String)> {
 pub fn signal_running(sig: libc::c_int) -> Result<()> {
     let (pid, _) = running()?;
     if unsafe { libc::kill(pid, sig) } != 0 {
-        bail!("no recording in progress (pid {pid} is not running)");
+        // Upstream: "no recording in progress (pid {pid} not running)".
+        bail!("no recording in progress (pid {pid} not running)");
     }
     Ok(())
 }
@@ -1154,7 +1153,8 @@ pub fn stop_running() -> Result<()> {
     // Done when the recorder removes its pidfile (file finalized).
     while path.exists() {
         if Instant::now() > deadline {
-            bail!("the recorder did not finish within 90s");
+            // Upstream's text (it names the pid; the file is what we wait on).
+            bail!("recorder (pid {pid}) did not exit within 90s");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1224,5 +1224,44 @@ mod tests {
         // No pidfile in a fresh runtime dir: the commands must say so.
         let err = signal_running(libc::SIGUSR1).unwrap_err().to_string();
         assert!(err.contains("no recording in progress"), "{err}");
+    }
+
+    /// G19: upstream's control-error text, word for word, and without the
+    /// pidfile path it does not print (`reference/rec-rs/src/record.rs:643-660`).
+    #[test]
+    fn control_errors_match_upstream() {
+        let dir = std::env::temp_dir().join(format!("rec-ctl-text-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: this test is about the pidfile path and runs in the test
+        // binary; no other test reads the recorder's pidfile at the same time
+        // for its result (the others only check the fallback's mode).
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        // No pidfile at all.
+        assert_eq!(
+            signal_running(libc::SIGUSR1).unwrap_err().to_string(),
+            "no recording in progress"
+        );
+        assert_eq!(
+            stop_running().unwrap_err().to_string(),
+            "no recording in progress"
+        );
+        // A pidfile whose process is gone (a stale pid from another namespace
+        // looks the same to us).
+        std::fs::write(pidfile_path(), "999999\n/tmp/x.mov\n").unwrap();
+        assert_eq!(
+            signal_running(libc::SIGUSR1).unwrap_err().to_string(),
+            "no recording in progress (pid 999999 not running)"
+        );
+        assert_eq!(
+            stop_running().unwrap_err().to_string(),
+            "no recording in progress (stale pidfile removed)"
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
