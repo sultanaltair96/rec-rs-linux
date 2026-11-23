@@ -72,6 +72,9 @@ cert() {
 
 serve() {
     dir=$1
+    # 127.0.0.1 by default; REC_MEDIAMTX_BIND=0.0.0.0 is what the
+    # REC_INSECURE_TLS policy test uses to reach it by a non-loopback address.
+    bind="${REC_MEDIAMTX_BIND:-127.0.0.1}"
     mkdir -p "$dir/recordings"
     # MediaMTX writes a certificate of its own (auto.crt/auto.key) if the
     # configured ones are missing: run it in the run's own folder so it can
@@ -87,18 +90,18 @@ pprof: no
 playback: no
 rtsp: no
 rtmp: yes
-rtmpAddress: 127.0.0.1:1935
+rtmpAddress: $bind:1935
 rtmpEncryption: optional
-rtmpsAddress: 127.0.0.1:1936
+rtmpsAddress: $bind:1936
 rtmpServerKey: $dir/server.key
 rtmpServerCert: $dir/server.crt
 hls: no
 srt: no
 webrtc: yes
-webrtcAddress: 127.0.0.1:8889
+webrtcAddress: $bind:8889
 webrtcEncryption: no
 webrtcAllowOrigin: '*'
-webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcLocalUDPAddress: $bind:8189
 paths:
   all_others:
     record: yes

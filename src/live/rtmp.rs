@@ -483,14 +483,14 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-/// The TLS client configuration: the webpki roots, or no verification at all
-/// for `REC_INSECURE_TLS`.
-fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
+/// The TLS client configuration: the webpki roots, or — for a **loopback** host
+/// and `REC_INSECURE_TLS`, the self-test's local server — no verification at all.
+fn tls_config(host: &str) -> Result<Arc<rustls::ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow!("TLS: {e}"))?;
-    let config = if std::env::var_os("REC_INSECURE_TLS").is_some() {
+    let config = if super::ignore_certificate_errors(host) {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
@@ -503,7 +503,7 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
 }
 
 fn tls_connect(host: &str, tcp: TcpStream) -> Result<TlsStream> {
-    let config = tls_config()?;
+    let config = tls_config(host)?;
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| anyhow!("TLS: bad server name {host:?}: {e}"))?;
     let conn = rustls::ClientConnection::new(config, name).map_err(|e| anyhow!("TLS: {e}"))?;

@@ -1101,6 +1101,55 @@ fn report(shared: &Arc<Shared>, error: String) {
     drop(slot);
 }
 
+/// True when `host` is the local machine: `localhost`, a name under
+/// `.localhost`, `::1` or an address in `127.0.0.0/8`.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h == "::1" {
+        return true;
+    }
+    h.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Whether certificate verification is switched off for `host`.
+///
+/// `REC_INSECURE_TLS` exists for one thing: the self-test's MediaMTX, which
+/// serves RTMPS with a certificate it generated a second earlier. It applies
+/// **only to loopback hosts**; anywhere else it is ignored with a warning, so a
+/// stray `export` in a user's shell cannot hand a stream key to whoever answers
+/// on the other end.
+pub(crate) fn ignore_certificate_errors(host: &str) -> bool {
+    let requested = std::env::var_os("REC_INSECURE_TLS").is_some();
+    let allowed = insecure_verification(host, requested);
+    if requested && !allowed {
+        warn_about_insecure_tls_once(host);
+    }
+    allowed
+}
+
+/// The policy itself, without the environment: verification is only off when it
+/// was asked for *and* the host is local.
+fn insecure_verification(host: &str, requested: bool) -> bool {
+    requested && is_loopback_host(host)
+}
+
+fn warn_about_insecure_tls_once(host: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "rec: warning: REC_INSECURE_TLS is set but {host} is not a loopback host: \
+             ignoring it and verifying the certificate (it is only for a local test server)"
+        );
+    }
+}
+
 /// Redact a secret (stream key) from text meant for logs and the UI.
 pub fn redact(text: &str, secret: &str) -> String {
     if secret.len() < 4 {
@@ -1352,6 +1401,45 @@ mod tests {
         };
         let (w, h) = enc_size(&odd, 1280, 721);
         assert!(w % 2 == 0 && h % 2 == 0);
+    }
+
+    /// `REC_INSECURE_TLS` only ever applies to the local machine: a stream key
+    /// must not be sent to an unverified host because an environment variable
+    /// was exported.
+    #[test]
+    fn insecure_tls_is_loopback_only() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "[::1]",
+            "::1",
+            "127.0.0.1",
+            "127.10.20.30",
+            "rec-rs.localhost",
+        ] {
+            assert!(is_loopback_host(host), "{host} is the local machine");
+            assert!(insecure_verification(host, true), "{host}");
+            assert!(
+                !insecure_verification(host, false),
+                "{host} without the flag"
+            );
+        }
+        for host in [
+            "a.rtmps.youtube.com",
+            "live.twitch.tv",
+            "8.8.8.8",
+            "127.0.0.1.example.com",
+            "localhost.example.com",
+            "example.com",
+            "[2001:db8::1]",
+            "",
+        ] {
+            assert!(!is_loopback_host(host), "{host} is not the local machine");
+            assert!(
+                !insecure_verification(host, true),
+                "the flag must be ignored for {host}"
+            );
+        }
     }
 
     #[test]

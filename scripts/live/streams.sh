@@ -183,6 +183,53 @@ case_hevc() {
     stop_server "$dir"
 }
 
+# --- REC_INSECURE_TLS must not weaken a real stream ------------------------
+# The flag may switch certificate verification off for a loopback test server
+# only. Reach the same self-signed MediaMTX by a non-loopback address and it must
+# be ignored (with a warning), so the connection is refused; on localhost the
+# same flag lets the self-signed certificate through.
+case_insecure_policy() {
+    dir="$OUT/insecure"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    REC_MEDIAMTX_BIND=0.0.0.0 start_server "$dir" "$dir/mediamtx.log"
+    ip=$(python3 - <<'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("10.255.255.255", 1))
+    print(s.getsockname()[0])
+except OSError:
+    print("")
+EOF
+)
+    if [ -z "$ip" ] || [ "${ip#127.}" != "$ip" ]; then
+        bad insecure-policy "no non-loopback address to test with (${ip:-none})"
+        stop_server "$dir"
+        return 0
+    fi
+    # Non-loopback: the flag is ignored, verification happens, the self-signed
+    # certificate is refused, and the warning names the host.
+    REC_INSECURE_TLS=1 timeout "$TIMEOUT" "$REC" live-selftest --secs 6 --resolution 720p --fps 30 \
+        --output-dir "$OUT" --stream "rtmps://$ip:1936/policy" \
+        >"$OUT/insecure.out" 2>"$OUT/insecure.err" && status=0 || status=$?
+    if [ "$status" -ne 0 ] \
+        && grep -q "REC_INSECURE_TLS is set but $ip is not a loopback host" "$OUT/insecure.err" \
+        && grep -qi "certificate" "$OUT/insecure.err"; then
+        ok insecure-policy "ignored for $ip (certificate refused, warned)"
+    else
+        bad insecure-policy "status $status: $(tr '\r' '\n' <"$OUT/insecure.err" | grep -iE 'certificate|REC_INSECURE' | tail -1)"
+    fi
+    # Loopback: the same flag lets the self-signed test server through.
+    if run_harness insecure-loopback 6 "" rtmps://localhost:1936/loopback \
+        && grep -q 'live: stream rtmps://localhost live' "$OUT/insecure-loopback.out"; then
+        ok insecure-loopback "accepted on localhost, as the self-test needs"
+    else
+        bad insecure-loopback "the loopback stream did not go live"
+    fi
+    stop_server "$dir"
+}
+
 # --- a server restart mid-stream -------------------------------------------
 case_reconnect() {
     dir="$OUT/reconnect"
@@ -221,13 +268,14 @@ scripts/live/mediamtx.sh ensure >/dev/null 2>&1 || exit 3
 # and logs behind for inspection.
 mkdir -p "$OUT"
 case "$mode" in
-    --all) case_multi && case_whip && case_hevc && case_reconnect ;;
+    --all) case_multi && case_whip && case_hevc && case_reconnect && case_insecure_policy ;;
+    --insecure) case_insecure_policy ;;
     --rtmp) case_multi && case_reconnect ;;
     --whip) case_whip ;;
     --hevc) case_hevc ;;
     --reconnect) case_reconnect ;;
     *)
-        echo "usage: $0 [--rtmp|--whip|--hevc|--reconnect]" >&2
+        echo "usage: $0 [--rtmp|--whip|--hevc|--reconnect|--insecure]" >&2
         exit 2
         ;;
 esac

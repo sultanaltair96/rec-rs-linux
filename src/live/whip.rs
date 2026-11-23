@@ -290,8 +290,11 @@ fn resource_url(endpoint: &HttpUrl, location: &str) -> String {
     }
 }
 
-fn agent() -> ureq::Agent {
-    let insecure = std::env::var_os("REC_INSECURE_TLS").is_some();
+fn agent(host: &str) -> ureq::Agent {
+    // REC_INSECURE_TLS only applies to a loopback server (see
+    // `live::ignore_certificate_errors`): a stream key must never go to an
+    // unverified host.
+    let insecure = super::ignore_certificate_errors(host);
     ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -308,7 +311,9 @@ fn agent() -> ureq::Agent {
 /// POST the offer; returns the answer and the session resource URL.
 fn post_offer(url: &str, key: &str, offer: &str) -> Result<(String, Option<String>)> {
     let endpoint = parse_http_url(url)?;
-    let mut req = agent().post(url).header("Content-Type", "application/sdp");
+    let mut req = agent(&endpoint.host)
+        .post(url)
+        .header("Content-Type", "application/sdp");
     if !key.is_empty() {
         req = req.header("Authorization", &format!("Bearer {key}"));
     }
@@ -331,7 +336,8 @@ fn post_offer(url: &str, key: &str, offer: &str) -> Result<(String, Option<Strin
 }
 
 fn delete_resource(url: &str, key: &str) {
-    let mut req = agent().delete(url);
+    let host = parse_http_url(url).map(|u| u.host).unwrap_or_default();
+    let mut req = agent(&host).delete(url);
     if !key.is_empty() {
         req = req.header("Authorization", &format!("Bearer {key}"));
     }
