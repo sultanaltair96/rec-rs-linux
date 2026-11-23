@@ -277,7 +277,7 @@ fn parses_a_moof_the_way_qtmux_writes_it() {
     let moof = moof_at(1000, &trafs);
     let out = parse_moof(&moof, 1000, &HashMap::new()).unwrap();
     assert_eq!(out.len(), 1);
-    let (id, got) = &out[0];
+    let (id, _decode_time, got) = &out[0];
     assert_eq!(*id, 7);
     assert_eq!(got.len(), 3);
     // data_offset is the moof size + the mdat header, from the moof start.
@@ -314,8 +314,8 @@ fn a_traf_without_a_data_offset_continues_the_previous_one() {
     ];
     let moof = moof_at(500, &trafs);
     let out = parse_moof(&moof, 500, &HashMap::new()).unwrap();
-    let v = &out.iter().find(|(id, _)| *id == 1).unwrap().1;
-    let a = &out.iter().find(|(id, _)| *id == 2).unwrap().1;
+    let v = &out.iter().find(|(id, _, _)| *id == 1).unwrap().2;
+    let a = &out.iter().find(|(id, _, _)| *id == 2).unwrap().2;
     assert_eq!(v[0].offset, 500 + moof.len() as u64 + 8);
     // The second traf starts where the first one's data ended.
     assert_eq!(a[0].offset, v[1].offset + 10);
@@ -349,7 +349,7 @@ fn tfhd_defaults_and_trex_fill_missing_sample_fields() {
         },
     );
     let out = parse_moof(&moof, 0, &trex).unwrap();
-    let (_, samples) = &out[0];
+    let (_, _decode_time, samples) = &out[0];
     assert_eq!(samples.len(), 2);
     assert_eq!(samples[0].duration, 256, "tfhd duration wins over trex");
     assert_eq!(samples[0].size, 99, "trex size");

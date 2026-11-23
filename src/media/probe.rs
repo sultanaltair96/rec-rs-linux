@@ -26,8 +26,24 @@ struct Stream {
     media: &'static str,
     /// Codec name, e.g. "h264", "hevc", "prores", "aac".
     codec: String,
-    /// `1920x1080 @ 60.000 fps` or `48000 Hz, 2 ch`.
-    format: String,
+    width: usize,
+    height: usize,
+    /// The demuxer's frame rate, when its caps carry one.
+    fps: Option<f64>,
+}
+
+/// The four-character code upstream's `probe` prints for a codec.
+fn fourcc(codec: &str) -> &'static str {
+    match codec {
+        "h264" => "avc1",
+        "hevc" => "hvc1",
+        "prores" => "apcn",
+        "aac" => "mp4a",
+        "opus" => "Opus",
+        "vp9" => "vp09",
+        "av1" => "av01",
+        _ => "????",
+    }
 }
 
 /// Counters for one decoded pad.
@@ -79,7 +95,7 @@ pub fn probe(file: &Path) -> Result<()> {
     if std::env::var_os("REC_DEBUG").is_some() {
         eprintln!("rec: debug: mp4 boxes ok; structure");
     }
-    let (duration, mut streams) = structure(&abs)?;
+    let (duration, streams) = structure(&abs)?;
     if std::env::var_os("REC_DEBUG").is_some() {
         eprintln!("rec: debug: structure ok; decode");
     }
@@ -95,58 +111,79 @@ pub fn probe(file: &Path) -> Result<()> {
             );
         }
     }
-    // qtdemux's caps do not always carry the frame rate; the decoded timestamps
-    // show it (a constant frame rate is a guarantee of the writer).
-    for s in &mut streams {
-        if s.media == "video"
-            && !s.format.contains("fps")
-            && let Some(fps) = decoded.iter().filter(|d| d.video).find_map(|d| d.fps())
-        {
-            s.format = format!("{} @ {fps:.3} fps", s.format);
-        }
-    }
+    // The duration comes from the real samples, not the muxer's declared
+    // movie duration: a crash-left fragmented file is as long as its fragments
+    // (4.000 s, not 1.984 s), and a finalised file must not count the AAC
+    // priming that its edit list skips (2.000/2.006 s, not 2.049 s).
+    let track_span = |t: &mp4::TrackInfo| -> (f64, f64) {
+        let ts = t.timescale.max(1) as f64;
+        let priming = t
+            .edits
+            .iter()
+            .find(|e| e.media_time > 0)
+            .map(|e| e.media_time as f64 / ts)
+            .unwrap_or(0.0);
+        (t.first_pts, (t.duration as f64 / ts - priming).max(0.0))
+    };
+    // The demuxer's duration is the last resort; the mp4 tables are the truth.
+    let fallback = if movie.movie_timescale > 0 && movie.duration > 0 {
+        movie.duration as f64 / movie.movie_timescale as f64
+    } else {
+        duration.map(|d| d.seconds_f64()).unwrap_or(0.0)
+    };
+    let media_secs = movie
+        .tracks
+        .iter()
+        .find(|t| t.handler == mp4::Handler::Video)
+        .or_else(|| movie.tracks.first())
+        .map(|t| {
+            let (start, dur) = track_span(t);
+            start + dur
+        })
+        .filter(|d| *d > 0.0)
+        .unwrap_or(fallback);
     let playable = !streams.is_empty();
     println!("playable  : {playable}");
-    println!(
-        "duration  : {:.3}s",
-        duration.map(|d| d.seconds_f64()).unwrap_or(0.0)
-    );
+    println!("duration  : {media_secs:.3}s");
     // The MP4 track layout (alternate group, enabled flag, edit list) is not
     // something qtdemux exposes as caps, so it comes from the boxes themselves.
     println!(
-        "fragmented: {} (movie timescale {}, {:.3}s)",
-        if movie.fragmented { "yes" } else { "no" },
-        movie.movie_timescale,
-        movie.duration as f64 / movie.movie_timescale.max(1) as f64
+        "fragmented: {}",
+        if movie.fragmented { "yes" } else { "no" }
     );
     for (i, s) in streams.iter().enumerate() {
-        let layout = movie.tracks.get(i).map(|t| {
-            let mut l = format!(
-                "  [mp4 #{} {} alt-group {} {} samples",
-                t.track_id,
-                if t.enabled { "enabled" } else { "disabled" },
-                t.alternate_group,
-                t.samples
-            );
+        let t = movie.tracks.get(i);
+        let (start, dur) = t.map(track_span).unwrap_or((0.0, fallback));
+        let kbps = t
+            .filter(|_| dur > 0.0)
+            .map(|t| t.bytes as f64 * 8.0 / dur / 1000.0)
+            .unwrap_or(0.0);
+        let media = if s.media == "video" { "vide" } else { "soun" };
+        let mut line = format!(
+            "track {i}  : {media} {} enabled={} start={start:.3}s dur={dur:.3}s {kbps:.1} kb/s",
+            fourcc(&s.codec),
+            t.is_none_or(|t| t.enabled)
+        );
+        if s.media == "video" {
+            let fps = t
+                .and_then(|t| t.nominal_fps)
+                .or(s.fps)
+                .or_else(|| decoded.iter().filter(|d| d.video).find_map(|d| d.fps()))
+                .unwrap_or(0.0);
+            line += &format!(" {}x{} @ {fps:.3} fps", s.width, s.height);
+        }
+        if let Some(t) = t {
+            line += &format!("  [alt-group {} samples={}", t.alternate_group, t.samples);
             for e in &t.edits {
                 if e.media_time >= 0 {
-                    l += &format!(
-                        " elst media_time={} duration={}",
-                        e.media_time, e.segment_duration
-                    );
+                    line += &format!(" elst media_time={}", e.media_time);
                 } else {
-                    l += &format!(" elst empty={}", e.segment_duration);
+                    line += &format!(" elst empty={}", e.segment_duration);
                 }
             }
-            l + "]"
-        });
-        println!(
-            "track {i}  : {} {} {}{}",
-            s.media,
-            s.codec,
-            s.format,
-            layout.as_deref().unwrap_or("")
-        );
+            line += "]";
+        }
+        println!("{line}");
     }
     if movie.tracks.len() != streams.len() {
         // The demuxer and the box parser disagree (an unusual file): show the
@@ -257,26 +294,24 @@ fn describe(caps: &gst::Caps) -> Option<Stream> {
         _ if name.starts_with("audio/") => ("audio", "other"),
         _ => return None,
     };
-    let format = if media == "video" {
-        let w = s.get::<i32>("width").unwrap_or(0);
-        let h = s.get::<i32>("height").unwrap_or(0);
+    let (width, height, fps) = if media == "video" {
+        let w = s.get::<i32>("width").unwrap_or(0).max(0) as usize;
+        let h = s.get::<i32>("height").unwrap_or(0).max(0) as usize;
         let fps = s
             .get::<gst::Fraction>("framerate")
             .ok()
-            .map(|f| f.numer() as f64 / f.denom().max(1) as f64);
-        match fps {
-            Some(f) if f > 0.0 => format!("{w}x{h} @ {f:.3} fps"),
-            _ => format!("{w}x{h}"),
-        }
+            .map(|f| f.numer() as f64 / f.denom().max(1) as f64)
+            .filter(|f| *f > 0.0);
+        (w, h, fps)
     } else {
-        let rate = s.get::<i32>("rate").unwrap_or(0);
-        let ch = s.get::<i32>("channels").unwrap_or(0);
-        format!("{rate} Hz, {ch} ch")
+        (0, 0, None)
     };
     Some(Stream {
         media,
         codec: codec.to_string(),
-        format,
+        width,
+        height,
+        fps,
     })
 }
 
