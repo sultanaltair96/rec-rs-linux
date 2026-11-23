@@ -25,6 +25,18 @@ skipping() { echo "SKIP  $1 ($2)"; skip=$((skip + 1)); }
 echo "== the installed app"
 flatpak list | grep "$APP" | tee "$OUT/installed.txt"
 
+echo "== Wayland dlopen in the runtime"
+mkdir -p "$HOME/Videos"
+if cc "$(dirname "$0")/../check-wayland.c" -ldl -o "$HOME/Videos/check-wayland" &&
+   flatpak run --command="$HOME/Videos/check-wayland" "$APP" >"$OUT/wayland.log" 2>&1; then
+    cat "$OUT/wayland.log"
+    ok "Wayland dlopen and barrier symbols resolve in the sandbox"
+else
+    cat "$OUT/wayland.log" 2>/dev/null || true
+    bad "Wayland dlopen and barrier symbols resolve in the sandbox"
+fi
+rm -f "$HOME/Videos/check-wayland"
+
 echo "== encoders and capture elements inside the sandbox"
 {
     for el in x264enc x265enc openh264enc avenc_aac fdkaacenc fdkaacdec avdec_aac \

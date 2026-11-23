@@ -252,6 +252,11 @@ for soname in libva.so.2 libva-drm.so.2 libva-x11.so.2 \
     done
 done
 
+# 1E dlopens the Wayland client by soname. Keep it separate from the other
+# fallbacks so a missing libva cannot shadow a newer host Wayland library.
+install -Dm755 /usr/lib/x86_64-linux-gnu/libwayland-client.so.0 \
+    "$APPDIR/usr/lib/wayland-fallback/libwayland-client.so.0"
+
 # GStreamer's out-of-process plugin scanner; its location moved between
 # distributions/GStreamer versions, so find it instead of hard-coding one path.
 SCANNER=$(find /usr/lib /usr/libexec -type f -name 'gst-plugin-scanner*' 2>/dev/null | head -1)
