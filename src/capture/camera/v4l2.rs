@@ -521,6 +521,138 @@ fn new_stream(dev: &v4l::Device) -> Result<MmapStream<'_>> {
     Ok(stream)
 }
 
+/// A running watch on a directory's `video*` entries.
+pub(super) struct Watch {
+    pub stop: Arc<AtomicBool>,
+    pub thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watch {
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// Watch `dir` for `video*` entries appearing or disappearing and call `cb`.
+///
+/// A UVC camera is a character device: a udev rule is not needed, inotify's
+/// `IN_CREATE`/`IN_DELETE`/`IN_MOVED_*`/`IN_ATTRIB` on `/dev` is enough. A
+/// hotplug creates two nodes (`video0` and the metadata `video1`) at once, so
+/// events are coalesced over 250 ms before the callback runs once. The watch
+/// lives until the returned [`Watch`] is dropped; the callback runs on the
+/// watcher thread and must not block.
+pub(super) fn watch_dir(dir: &Path, cb: impl Fn() + Send + 'static) -> Result<Watch> {
+    let dir = dir.to_path_buf();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("camera-watch".into())
+        .spawn(move || watch_thread(&dir, cb, thread_stop, ready_tx))
+        .context("starting the camera device watch")?;
+    match ready_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => Ok(Watch {
+            stop,
+            thread: Some(thread),
+        }),
+        Ok(Err(e)) => bail!("{e}"),
+        Err(_) => bail!("the camera device watch did not start within 2 s"),
+    }
+}
+
+fn watch_thread(
+    dir: &Path,
+    cb: impl Fn() + Send + 'static,
+    stop: Arc<AtomicBool>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        let _ = ready.send(Err("the camera watch path contains a NUL byte".into()));
+        return;
+    };
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        let _ = ready.send(Err(format!(
+            "inotify is not available: {}",
+            std::io::Error::last_os_error()
+        )));
+        return;
+    }
+    let mask = libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_MOVED_TO
+        | libc::IN_MOVED_FROM
+        | libc::IN_ATTRIB;
+    let wd = unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask) };
+    if wd < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        let _ = ready.send(Err(format!("watching {} for cameras: {e}", dir.display())));
+        return;
+    }
+    if ready.send(Ok(())).is_err() {
+        unsafe { libc::close(fd) };
+        return;
+    }
+    let mut buf = [0u8; 8192];
+    while !stop.load(Ordering::SeqCst) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if r <= 0 {
+            continue;
+        }
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        let mut hit = false;
+        let mut off = 0usize;
+        let event_size = std::mem::size_of::<libc::inotify_event>();
+        while off + event_size <= n as usize {
+            let ev = unsafe { &*(buf.as_ptr().add(off) as *const libc::inotify_event) };
+            let name_at = off + event_size;
+            let name_end = name_at + ev.len as usize;
+            if ev.len > 0 && name_end <= n as usize {
+                let bytes = &buf[name_at..name_end];
+                let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+                if bytes[..len].starts_with(b"video") {
+                    hit = true;
+                }
+            }
+            off = name_end;
+        }
+        if hit {
+            // One hotplug adds and removes several nodes; let the burst settle
+            // so the app reloads the list once.
+            std::thread::sleep(Duration::from_millis(250));
+            // Drain what arrived meanwhile; the next poll sees anything new.
+            while unsafe { libc::read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, buf.len()) }
+                > 0
+            {}
+            cb();
+        }
+    }
+    unsafe { libc::close(fd) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +717,42 @@ mod tests {
         assert_eq!(fps_of(v4l::fraction::Fraction::new(1, 60)), 60.0);
         assert!((fps_of(v4l::fraction::Fraction::new(1001, 30_000)) - 29.97).abs() < 0.01);
         assert_eq!(fps_of(v4l::fraction::Fraction::new(0, 30)), 0.0);
+    }
+
+    #[test]
+    fn the_device_watch_sees_video_nodes_appear_and_disappear() {
+        let dir = std::env::temp_dir().join(format!("rec-rs-camera-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watch = watch_dir(&dir, move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        // A non-camera entry does not notify.
+        std::fs::write(dir.join("ttyFake"), b"x").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "a non-video entry notified the camera watch"
+        );
+        // A video node does, and removing it notifies again.
+        std::fs::write(dir.join("video9"), b"x").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "creating video9 did not notify"
+        );
+        std::fs::remove_file(dir.join("video9")).unwrap();
+        // The create may still be coalescing; wait for the removal.
+        let mut removed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !removed {
+            if rx.recv_timeout(Duration::from_millis(300)).is_ok() {
+                removed = true;
+            }
+        }
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(removed, "deleting video9 did not notify");
     }
 
     #[test]
