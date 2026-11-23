@@ -265,16 +265,30 @@ fell back to x264/x265). `build-inside.sh` therefore copies
 (`libgstcodecparsers-1.0`, libva). The bundle also carries `gst-inspect-1.0`
 (50 KB), the only way to answer "is `vah264enc` here?" on a real GPU host.
 
-**libva: loader bundled, driver from the host.** `libavcodec` links `libva.so.2`
-directly, so dropping it would cost AAC, ProRes and the HEVC decoder on a host
-without libva; the *driver* (`radeonsi_drv_video.so`, `iHD_drv_video.so`, …) is
-the host's, next to its Mesa stack. libva's compiled-in search path is the build
-container's (Debian layout), so `AppRun` sets `LIBVA_DRIVERS_PATH` (unless the
-user already did) to the host layouts: `/usr/lib64/dri` (Fedora, openSUSE),
-`/usr/lib/x86_64-linux-gnu/dri` (Debian, Ubuntu) and `/usr/lib/dri` (Arch).
-`LIBVA_DRIVER_NAME` is left alone so the host can force a driver. A missing
-driver does not break anything: the plugin registers no elements and the writer
-picks `x264enc`/`x265enc`, exactly as on the Flatpak without a GPU.
+**GPU-driver libraries: host first, bundled fallback.** `libavcodec` links
+`libva.so.2` directly, so the bundle carries libva, libva-drm, libva-x11,
+libstdc++, libelf, libz, libzstd and libexpat — but **not** in `usr/lib`:
+`build-inside.sh` moves them to `usr/lib/fallback/`, and `AppRun` puts that
+directory on `LD_LIBRARY_PATH` **only when the host lacks one of them**
+(`ldconfig -p` first, then the standard `lib`/`lib64`/`lib/x86_64-linux-gnu`
+directories). On a normal desktop the host's copies win.
+
+That is not cosmetic: Fedora 44's Mesa 26.2.3 `radeonsi_drv_video.so` exports
+only `__vaDriverInit_1_24`, and the build container's libva 2.20 probes no
+further than `__vaDriverInit_1_20`, so a bundled-first libva failed with
+`has no function __vaDriverInit_1_0` / `vaInitialize: unknown libva error` and
+the `va` plugin registered **zero** elements (`gst-inspect-1.0 va` empty). The
+same class of mismatch applies to the host driver's own `libstdc++`, `libelf`,
+`libz`, `libzstd` and `libexpat` links, which is why they follow the same rule.
+
+The VA *driver* itself is always the host's (it must match the GPU and the
+kernel). libva's compiled-in driver path is the build container's (Debian
+layout), so `AppRun` also sets `LIBVA_DRIVERS_PATH` (unless the user already
+did) to `/usr/lib64/dri` (Fedora, openSUSE), `/usr/lib/x86_64-linux-gnu/dri`
+(Debian, Ubuntu) and `/usr/lib/dri` (Arch); `LIBVA_DRIVER_NAME` is left alone so
+the host can force a driver. A host with no VA driver does not break anything:
+the plugin registers no elements and the writer picks `x264enc`/`x265enc`,
+exactly as on the Flatpak without a GPU.
 
 ### What deliberately comes from the host
 
@@ -282,7 +296,8 @@ picks `x264enc`/`x265enc`, exactly as on the Flatpak without a GPU.
 |---|---|
 | glibc, libm, libpthread, libdl | A bundled glibc does not work; linuxdeploy's excludelist keeps them out |
 | libGL, libEGL, libvulkan, Mesa/GPU drivers | must match the user's GPU and driver |
-| the VA-API driver (iHD/radeonsi/..., in the host's `dri` dir) | it must match the GPU and the kernel; `libva` itself *is* bundled (a thin loader `libavcodec` links directly), and `AppRun` points it at the host's driver directories with `LIBVA_DRIVERS_PATH` |
+| the VA-API driver (iHD/radeonsi/..., in the host's `dri` dir) | it must match the GPU, the kernel *and* the host's libva ABI (`__vaDriverInit_1_24` on Fedora 44 vs the bundle's libva 2.20) |
+| **libva, libstdc++, libelf, libz, libzstd, libexpat** | host-first: bundled copies live in `usr/lib/fallback/` and `AppRun` only puts that directory on the path when the host lacks one of them, so a newer host driver never meets an older bundled loader |
 | libdbus-1 | must match the running session bus |
 | **libpipewire-0.3 / libspa-0.2** | the client ABI has to match the *daemon* it talks to; a bundled client against the host's PipeWire is the classic AppImage failure. Every desktop ships it. If it is missing, the recorder fails to start; screen/audio capture would not work without a PipeWire daemon anyway |
 | the Vulkan ICDs and the GL drivers | `libvulkan.so.1` (the loader) is bundled because ffmpeg's libavcodec links it; the ICD JSON files and the drivers behind it are the host's |
@@ -326,7 +341,7 @@ library, see the table above). It records H.264, HEVC and ProRes with the test
 pattern, probes each file with the bundled GStreamer, checks that no bundled
 plugin failed to load, extracts the bundle to list its plugins and the libraries
 that still come from the host, and prints the embedded update information.
-Result: **Debian 13 15/15 pass + 1 skip** and **Fedora 43 14/14 pass + 2
+Result: **Debian 13 16/16 pass + 1 skip** and **Fedora 43 15/15 pass + 2
 skips**. The encoders are `x264enc`, `x265enc` and `avenc_prores_aw`
 (`avenc_prores_ks` and `avenc_prores` are bundled too), `probe` reports
 `video h264 1920x1080 @ 60.000 fps` and HEVC, 29 plugins are bundled (the VA
@@ -340,10 +355,11 @@ AppImage process plays. `fdkaacenc`/`fdkaacdec` are absent
 from the bundle (Ubuntu has no fdk-aac); `avenc_aac`, `avdec_aac` and `voaacenc`
 are present, so the live path's fallback is what runs.
 
-The two skips are the checks that need hardware this container does not have:
-the GUI on Fedora (below) and `vah264enc` (no `/dev/dri/renderD128`). The VA
-plugin's presence is asserted everywhere; the element itself is asserted
-whenever a render node exists, which is what the GPU hosts run.
+The skips are the checks that need hardware this container does not have: the
+GUI on Fedora (below) and `vah264enc` (no `/dev/dri/renderD128`). Without a
+render node the test still asserts that the `va` plugin *loads* through AppRun
+(so libva resolved, from the host or the bundled fallback); with one it asserts
+`vah264enc` registers — that is the check agent-amd passes.
 
 On Fedora 43's container the GUI check **skips**: the host's software Vulkan
 (lavapipe over Xvfb) refuses to enumerate a device
@@ -353,7 +369,7 @@ Mesa, opens its window in the same container — the difference is the host's
 rendering stack, not the package. A real Fedora desktop with a GPU driver is
 check 8 in the list below.
 
-Sizes: AppImage **104.7 MiB** (109,828,600 bytes), `.zsync` 184 KiB. Most of it
+Sizes: AppImage **104.7 MiB** (109,824,504 bytes), `.zsync` 184 KiB. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
 fonts. That is the price of AAC, ProRes, the app and streaming in a single file;

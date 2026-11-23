@@ -16,24 +16,71 @@ set -eu
 HERE=$(dirname "$(readlink -f "$0")")
 APPDIR=${APPDIR:-$HERE}
 export APPDIR
+ORIG_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+
+# --- host-first decision, before the bundle is on the loader path ------------
+# libva and the base libraries a GPU driver links must come from the host when
+# it has them: Fedora 44's radeonsi driver exports only __vaDriverInit_1_24,
+# which the build container's libva 2.20 cannot load ("vaInitialize: unknown
+# libva error"), and that driver also links the host's libstdc++/libelf/libz/
+# libzstd/libexpat. The bundle keeps copies in usr/lib/fallback for hosts that
+# have none; adding that directory shadows *all* of them, so it is only added
+# when something is missing.
+#
+# The lookup itself runs with the *host's* loader path: ldconfig and grep are
+# host binaries, and a bundled libpcre2 on their path prints "no version
+# information available" on Fedora.
+FALLBACK_LIBS="libva.so.2 libva-drm.so.2 libstdc++.so.6 libelf.so.1 libz.so.1 libzstd.so.1 libexpat.so.1"
+missing=
+for soname in $FALLBACK_LIBS; do
+    found=
+    if command -v ldconfig >/dev/null 2>&1; then
+        if LD_LIBRARY_PATH= ldconfig -p 2>/dev/null | LD_LIBRARY_PATH= grep -q "=> .*/$soname\$"; then
+            found=1
+        fi
+    else
+        for dir in /lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib /usr/lib; do
+            if [ -e "$dir/$soname" ]; then
+                found=1
+                break
+            fi
+        done
+    fi
+    [ -n "$found" ] || missing="$missing $soname"
+done
 
 export PATH="$APPDIR/usr/bin:$PATH"
-export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LD_LIBRARY_PATH="$APPDIR/usr/lib"
+if [ -n "$missing" ]; then
+    # A host without some of them gets the bundled copies; it has no matching
+    # GPU driver stack to break, so shadowing is the right trade there.
+    LD_LIBRARY_PATH="$APPDIR/usr/lib/fallback:$LD_LIBRARY_PATH"
+fi
+if [ -n "$ORIG_LD_LIBRARY_PATH" ]; then
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$ORIG_LD_LIBRARY_PATH"
+fi
+export LD_LIBRARY_PATH
 
 # Only the bundled plugins (see the header).
 export GST_PLUGIN_SYSTEM_PATH_1_0="$APPDIR/usr/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER_1_0="$APPDIR/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
 export GST_REGISTRY_1_0="${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-appimage/gst-registry-$(uname -m).bin"
 
-# VA-API: the *driver* (radeonsi_drv_video.so, iHD_drv_video.so, nvidia_drv_video.so)
-# is the host's, next to its Mesa/GPU drivers; the loader (libva) is bundled
-# because gst-libav links it directly. libva's compiled-in driver path is the
-# build container's (Debian layout), so point it at the host's layout unless the
-# user already did: lib64 is Fedora/openSUSE, x86_64-linux-gnu Debian/Ubuntu,
-# lib Arch.
+# VA-API: the *driver* (radeonsi_drv_video.so, iHD_drv_video.so,
+# nvidia_drv_video.so) is the host's, next to its Mesa/GPU drivers. libva's
+# compiled-in driver path is the build container's (Debian layout), so point it
+# at the host's layout unless the user already did: lib64 is Fedora/openSUSE,
+# x86_64-linux-gnu Debian/Ubuntu, lib Arch.
 if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
     LIBVA_DRIVERS_PATH="/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
     export LIBVA_DRIVERS_PATH
+fi
+
+# Debugging hook: run another binary from the bundle with this environment
+# (REC_APPIMAGE_EXEC=gst-inspect-1.0 ./Rec-*.AppImage vah264enc). The tests use
+# it to ask the bundle itself whether a plugin registers on this machine.
+if [ -n "${REC_APPIMAGE_EXEC:-}" ]; then
+    exec "$APPDIR/usr/bin/$REC_APPIMAGE_EXEC" "$@"
 fi
 
 # The app (no subcommand) opens its window; every subcommand runs headless.

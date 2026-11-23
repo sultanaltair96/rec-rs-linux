@@ -135,15 +135,25 @@ else
     bad "libgstva.so is bundled"
 fi
 if [ -e /dev/dri/renderD128 ]; then
-    if bundle_run /tmp/squashfs-root/usr/bin/gst-inspect-1.0 va >/tmp/va-plugin.log 2>&1 &&
-       bundle_run /tmp/squashfs-root/usr/bin/gst-inspect-1.0 vah264enc >/dev/null 2>&1; then
-        ok "vah264enc is present (VA-API $(bundle_run /tmp/squashfs-root/usr/bin/gst-inspect-1.0 vah264enc 2>/dev/null | sed -n 's/^  Long-name *//p' | head -1))"
+    # Through AppRun, not the extracted helper: this is what a user's process
+    # sees, including the host-first libva decision and LIBVA_DRIVERS_PATH.
+    if REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" va >/tmp/va-plugin.log 2>&1 &&
+       REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" vah264enc >/dev/null 2>&1; then
+        ok "vah264enc registers through AppRun on this GPU ($(REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" vah264enc 2>/dev/null | sed -n 's/^  Long-name *//p' | head -1))"
     else
-        cat /tmp/va-plugin.log | tail -8
-        bad "vah264enc is present with a DRI node"
+        tail -12 /tmp/va-plugin.log
+        bad "vah264enc registers through AppRun on this GPU"
     fi
 else
-    skipping "vah264enc is present with a DRI node" "no /dev/dri/renderD128 in this container"
+    # No GPU here: the plugin still has to load, which proves libva resolved
+    # (the bundled fallback copy, since these containers carry none).
+    if REC_APPIMAGE_EXEC=gst-inspect-1.0 "$APPIMAGE" va >/tmp/va-plugin.log 2>&1; then
+        ok "the va plugin loads without a DRI node (libva resolved)"
+    else
+        tail -8 /tmp/va-plugin.log
+        bad "the va plugin loads without a DRI node (libva resolved)"
+    fi
+    skipping "vah264enc registers through AppRun on this GPU" "no /dev/dri/renderD128 in this container"
 fi
 
 echo "== live elements in the bundle (elements -> plugin file)"
