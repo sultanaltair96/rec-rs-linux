@@ -484,3 +484,186 @@ Notes on the counts:
    recording.
 4. **G4** system audio should not block a session when the *default* sink is missing.
 5. **G12/G13** correct `PARITY.md` in both directions, so the next phase plans against the truth.
+
+---
+
+# Re-audit (2026-11-23, phase 3B)
+
+Read-only re-check of the same 143-item inventory against `main` at `bacdd62` ("1F final: 0.1.2
+packages, ProRes encoder check, second-instance control in the Flatpak"), with 1D and 1F merged.
+I changed `PARITY.md`, this file and the new `docs/DESKTOP_CHECKLIST.md`; no product code.
+
+Everything ran through `scripts/dev.sh` in the Fedora 43 dev container with
+`REC_TEST_DIR=/home/dev/rec-tests/audit2-*`. The host was shared with other worktrees (two other
+dev containers building at the same time), which matters for the two load-sensitive failures below.
+The 4 GB cgroup limit killed a plain `cargo build --release` (`rustc` SIGKILL on `ash`), so every
+build ran with `CARGO_BUILD_JOBS=2` inside the container; see G20d.
+
+## What ran
+
+| What | Command | Result |
+|---|---|---|
+| Unit + UI + golden tests | `cargo test --release -- --test-threads=2` | **339 passed; 0 failed; 10 ignored** (349 run, 56 s) — 3A had 286/0/6 |
+| Writer, codec, sync, crash | `scripts/selftest.sh pattern-1080-h264 pattern-prores pattern-hevc tracks audio-tracks audio-silent sync pause-resume gain crash finalize-crash defrag h264-bitrate` | 12 passed, 1 failed: `defrag` (115/120 frames under load; passed alone with 120/120 and identical hashes) — G20a |
+| Screen, app, no-sink | `scripts/selftest.sh pattern-screen screen-region screen-x11 screen-window screen-token screen-exclude no-sink app-cli-control camera gui` | 8 passed, 2 failed: `app-cli-control` (52 frames, its threshold is 60) and `screen-token`; both passed alone (`app-cli-control` 79 frames), and `pattern-screen screen-region screen-token` passed 3/3 in a batch — G20b |
+| Live | `scripts/selftest.sh replay stream-rtmp stream-whip live-e2e` | **4 passed, 0 failed** |
+| HEVC over enhanced RTMP | `scripts/live/streams.sh --hevc` | **4 passed, 0 failed** (`stream-hevc`, `hevc-sync +0.1 ms`, `hevc-main10-note`, `stream-hevc-fallback`) |
+| Mic under CPU pressure (G15a) | `scripts/selftest.sh mic-stress` | **PASS**: 20 runs under 8 burners, every beep within 1 dB, stems within 5 ms, no clicks |
+| Output latency | `dbus-run-session -- sh scripts/audio/integration.sh devices` | PASS: `Output latency (system audio is shifted by this): 5.3 ms` |
+| Device watch (G9) | `cargo test --release the_device_watch_reports_a_new_sink -- --ignored` under a PipeWire session | PASS (0.40 s); the `integration.sh watch` wrapper was OOM-killed in debug — G20c |
+| Stream keys | `dbus-run-session` + unlocked gnome-keyring: `stream-key`, `--delete`, `secret-tool`, `REC_KEYRING_TEST=1 cargo test live::keyring` | keys stored under `rec-rs stream key`, read back by `secret-tool`, per-destination delete, `secret_service_round_trip` passed against the real service |
+| Preview cost (G10) | `cargo test --release app::preview::tests::preview_cost -- --ignored` | 1080p NV12 **0.78 ms**, 4K NV12 **1.57 ms** (BGRA 2.29/6.76) per preview frame |
+| CLI, formats, controls | `--version`, `record --help`, `devices` (plain, Xvfb, audio harness), `probe` on crash/clean files, `--mic`, `--no-record`, `--replay` 5/300/301, `save-replay` with/without a buffer, `stop`/`pause`/`resume`/`save-replay` with nothing running, `stream-key` without a keyring, status lines with `--stream`/`--replay` | see the rows below |
+| Packaging (G14) | read `packaging/README.md`, `packaging/**`, `.github/workflows/release.yml` | present and complete; **not re-run** (the Flatpak/AppImage builds and their Docker tests take hours), so the package rows rest on the 1F report |
+
+Not run, and therefore not counted as verified: any real compositor (GNOME/KDE Wayland), a real
+V4L2/portal camera, the tray on a panel, the hotkey portal dialog, screen lock, VA-API on a GPU,
+the real streaming services, an actual `flatpak update` / zsync update, and external players
+(QuickTime, Final Cut, Premiere, Resolve, VLC). All of it is now in `docs/DESKTOP_CHECKLIST.md`.
+
+## Classification counts
+
+| Classification | 3A | 3B | Moved |
+|---|---|---|---|
+| verified | 89 | **108** | +19 |
+| deviates | 12 | **8** | −4 |
+| needs-real-desktop | 7 | **12** | +5 |
+| n-a-ok | 13 | **14** | +1 |
+| missing | 2 | **1** | −1 |
+| pending-merge | 19 | **0** | −19 |
+| claimed-unverified | 1 | **0** | −1 |
+| **Total** | **143** | **143** | |
+
+Where the moves came from: the 19 pending-merge rows split into 14 verified (replay, streams, live
+flags, save-replay, stream keys, the two app cards, per-destination status, one encode, the settings
+lock, the OBS replay/stream rows, HEVC-to-YouTube), 4 needs-real-desktop (the window-close clause,
+self-update, footprint, live-encode CPU) and 1 n-a-ok (the documented streaming limitations). The
+4 deviates that became verified are `devices`, `probe` ×2 and the camera hand-over. The missing
+row that became verified is own-window exclusion; the claimed-unverified row (screen lock) is
+implemented and unit-tested but only a real logind/screensaver session can prove it, so it is
+needs-real-desktop. dmabuf/zero-copy encoder input is still missing. The remaining 8 deviates are
+all justified Linux differences or a measured performance gap (see below).
+
+## G1–G15 verdicts
+
+| Gap | Verdict | Evidence | What is left |
+|---|---|---|---|
+| G1 camera hand-over | **fixed** | `app::ui_tests::the_camera_is_handed_over_without_reopening_it` (preview opens once, the recording reuses it and starts <1.5 s, the preview gets it back; a cold start waits ≥1.8 s); `Session::take_camera`/`start_with_camera`; selftest `camera` (cold CLI: 2 s settle, 102 frames in 5.4 s) | none for the hand-over; a real camera's LED/exposure is a desktop check |
+| G2 `probe` duration + format | **fixed** | crash-left fragmented file: `probe` `duration : 4.000s` vs ffprobe `4.000000` (was 1.984); clean 1/3/5 s files match ffprobe exactly; track line `vide avc1 enabled=true start=0.000s dur=2.000s 17546.4 kb/s 1920x1080 @ 60.000 fps  [alt-group 0 samples=115]` (nominal fps, upstream's fields, additions bracketed) | the overall duration is the first video track's span, not the longest track's (G18) |
+| G3 own window in the picture | **fixed** | selftest `screen-exclude`: X11 paints the excluded window out (1 distinct frame of 120) and logs `leaving 1 of rec's own windows out`; the portal path logs `a screen-cast portal cannot leave rec's own windows out`; unit `excluded_windows_are_painted_out_of_the_frame`, `the_window_is_hidden_only_where_the_capture_cannot_exclude_it`, `own_window_ids_come_from_x11_handles_only` | the portal hide + notification + tray reopen on a real compositor (checklist) |
+| G4 no default sink blocks a session | **fixed** | selftest `no-sink`: exit 0, `rec: warning: no default output device for system audio (...); recording without system audio`, a written file whose `probe` shows one video track (no empty stem) | none |
+| G5 `permissions --request` reuses a grant | **fixed** | selftest `screen-token` passes: the second request's stderr says `rec: forgetting the saved screen-capture grant so the system asks again`, the chooser log shows the picker ran again, a corrupt token is ignored and the recording still happens | the dialog itself on GNOME/KDE (checklist) |
+| G6 `--mic` optional value | **fixed** | `record --mic` → `error: a value is required for '--mic <DEVICE>' but none was supplied`, exit 2; `--help` shows `--mic <DEVICE>` | none |
+| G7 no-frames warning lacked the hint | **fixed** | `NO_FRAMES_WARNING = "rec: warning: no screen frames after 3s (was the screen-sharing request approved? see rec-rs permissions)"`; unit `record::tests::the_no_frames_warning_points_at_the_permission` | none |
+| G8 screen lock does not stop the preview | **fixed (logic), needs a desktop** | new `app/lock.rs`: logind `Session.LockedHint` on the system bus plus `org.freedesktop.ScreenSaver.ActiveChanged` on the session bus, folded into `preview::Tap::set_wanted`; units `either_source_can_lock_it`, `preview_frames_stop_when_locked_covered_or_hidden` | lock a real GNOME/KDE session and watch `REC_DEBUG=1` frames/CPU (checklist) |
+| G9 no hotplug watch | **fixed** | `capture::audio::watch_devices` (PipeWire registry) + `capture::camera::watch_devices` (inotify), started by the app; unit `the_device_watch_sees_video_nodes_appear_and_disappear`; ignored `the_device_watch_reports_a_new_sink` passes in release under the harness; `app::tests::hotplug_notices_a_changed_mic_and_device_list` | a real USB plug inside the app (checklist) |
+| G10 preview costs ~4× upstream | **partially fixed** | shader conversion + plane upload: 1080p NV12 6.6 → **0.78 ms**, 4K NV12 8.15 → **1.57 ms** (BGRA 2.29/6.76); `preview_gpu::tests::the_shader_matches_the_cpu_reference`, `every_format_uploads` | still 3–4× upstream's shipped 0.25–0.39 ms (a hardware texture from the compositor, phase 2); BGRA frames cost 3–4× the NV12 ones |
+| G11 help/devices/version | **fixed** | `--version` → `rec-rs 0.1.2`; Xvfb `devices` → `  [1] id screen  1280x800 pixels (1280x800 points)` (no `primary`), no latency line with no sink, `Output latency (system audio is shifted by this): 5.3 ms` with one (upstream's exact text); `--help` names the keyframe range, the bitrate presets and the live-size rule | the help is not upstream's text verbatim (G17) |
+| G12 PARITY understated finished work | **fixed in this commit** | the rows for Record/Stop, Pause/Resume, the mixer, the fader, Reveal, cursor settings, audio/camera settings, low-power preview and `gui` are `done` with the tests that prove them | — |
+| G13 PARITY overstated | **fixed in this commit** | the probe row is now true; the camera-settle row is true; the own-window row is true, but its two cited tests had been renamed (`the_window_is_hidden_only_where_the_capture_cannot_exclude_it`, `own_window_ids_come_from_x11_handles_only`) and its `selftest gui` claim was unsupported (`gui` does not assert the hide/restore) — both corrected; the defrag "identical framemd5" claim now says what a dropped slot does | — |
+| G14 packaging not in the tree | **fixed (per the 1F report)** | `packaging/flatpak`, `packaging/appimage`, `packaging/desktop`, `packaging/test-mediamtx.sh` and `.github/workflows/release.yml` are in `main`; `packaging/README.md` reports `test-flatpak.sh` 23/23 and `test-appimage.sh` 14/14 (Debian 13) / 13/13 + 1 skip (Fedora 43), with two-way streaming, replay and cross-sandbox control | not re-run here (hours, and they need the Flatpak toolchain); no tag has ever triggered the release workflow |
+| G15 audio flakiness at the edges | **fixed** | `mic-stress`: 20 runs under 8 burners, every beep within 1 dB, stems within 5 ms, no clicks; unit `a_late_first_chunk_with_irregular_sizes_still_fills_the_track`; the track set follows the opened sources (`audio-silent`: 4 tracks with a dead mic; `no-sink`: no empty system stem) | the original 3.4 dB observation is not reproducible with the fix in place |
+
+## New and remaining gaps
+
+### G16. Argument errors are masked by a capture error when no display is reachable
+
+- **What:** `cli::prepare` calls `screen::resolve` (which needs a display or portal) before it
+  validates `--no-record`, the ProRes/`.mp4` pair and the rest. On a headless box
+  `rec-rs record --no-record` prints `the desktop portal is not reachable over D-Bus ...` instead of
+  `--no-record needs --replay or --stream` (with a display, the right message appears). Upstream
+  validates every flag before it resolves the target.
+- **Reproduce:** `scripts/dev.sh '$CARGO_TARGET_DIR/release/rec-rs record --no-record'` (no
+  `DISPLAY`/`WAYLAND_DISPLAY`) → portal error. Same for `record --codec prores -o x.mp4`.
+- **Upstream:** `main.rs:492` (the `--no-record` check) and the ProRes guard run before
+  `screen::resolve` at the end of `prepare`.
+- **Files:** `src/cli.rs` (`prepare`: move `screen::resolve` after the flag checks; the size needs
+  `native` only after them), `src/cli.rs` tests.
+
+### G17. The `--stream` help no longer names `rec-rs stream-key`
+
+- **What:** upstream's help for `--stream` says "The key comes from $REC_STREAM_KEY or the Keychain
+  (`rec-rs stream-key URL`)". The port says only "The key comes from $REC_STREAM_KEY", although
+  `rec-rs stream-key` stores it in the Secret Service and the recorder reads it from there. The
+  `--keyframe` (0.5–4) and `--live-resolution`/`--stream-bitrate` texts are also more verbose than
+  upstream's. All are text-only; the flags, values, defaults and clamps match.
+- **Reproduce:** `rec-rs record --help | sed -n '/--stream /,/--no-record/p'`.
+- **Upstream:** `main.rs:226-243`.
+- **Files:** `src/cli.rs` (doc comments).
+
+### G18. `probe`'s overall duration is the video track's span, not the asset's
+
+- **What:** `probe` prints `start + dur` of the *first video track* as the file duration. When the
+  audio track runs past the video by a partial buffer (a 2 s recording with five dropped slots:
+  video 2.000 s, audio 2.021 s) `probe` says 2.000 s while ffprobe and AVFoundation report 2.021 s.
+  Clean files where both tracks end together match exactly (1.000/3.000/4.000/5.000 s all checked),
+  and the fragmented file's 4.000 s is right, so this is a ≤ one-buffer difference.
+- **Reproduce:** on the `defrag` output (a dropped-slot run): `rec-rs probe defrag.mov` →
+  `duration : 2.000s`; `ffprobe -show_entries format=duration` → `2.021313`.
+- **Upstream:** `probe.rs:29` prints `AVURLAsset.duration`, the asset's (max-track) duration.
+- **Files:** `src/media/probe.rs` (`probe`: take the max of the track spans, keeping the audio edit
+  list subtraction), a unit test with an audio track longer than the video.
+
+### G19. Small CLI text differences (additions, not regressions)
+
+- **What:** (a) `save-replay` against a recording without `--replay` prints `rec: save-replay: this
+  recording has no replay buffer (start it with --replay SECS)`; upstream is silent. (b)
+  `pause`/`resume`/`save-replay` with nothing running say `no recording in progress (<pidfile> not
+  found)`; upstream says just `no recording in progress` (`stop` matches). (c) the final summary
+  omits upstream's `mix N` buffer count and adds `gaps filled`. (d) a non-quiet recording prints an
+  extra `rec: encoder <name>` line.
+- **Reproduce:** the commands above; the summary line of any `-t 1` recording.
+- **Upstream:** `record.rs:552-575` and `record.rs:642-660`.
+- **Files:** `src/record.rs`, `src/main.rs`. Decide per item: (a) and (d) are useful; (b) and (c)
+  could match upstream exactly.
+
+### G20. Evidence that is load-sensitive or was blocked by the container's limits
+
+- **What:** four test-harness issues, all reproducible on a loaded 4 GB host; the product behaviour
+  behind each is correct.
+  - **(a) `defrag`** requires exactly 120 frames *and* identical ffmpeg framemd5. With a dropped
+    slot the finalise writes the true 2-tick sample duration at the hole, which is the correct
+    behaviour, so framemd5 differs while every decoded pixel is identical (115/115 frames, same
+    pixel hashes; re-ran alone: 120/120 and identical). The test's 120 and its hash claim are not
+    load-tolerant.
+  - **(b) `app-cli-control`** requires ≥ 60 frames; under load it got 52 (all the behaviours it
+    exists to prove passed: `refused`, `alive`, `stop rc=0`, `already running`, `app exit=0`). It
+    passed alone with 79. One 10-case batch also saw `screen-token` fail; it passed alone and in a
+    3-case batch.
+  - **(c) `scripts/audio/integration.sh watch|stress`** run `cargo test` in debug without
+    `CARGO_BUILD_JOBS`; on this 4 GB container the debug build was OOM-killed (`x11rb-protocol`,
+    `ash`, `vello_cpu`: `signal: 9`). The release test they wrap passes in 0.40 s.
+  - **(d) a plain `cargo build --release`** is OOM-killed by the 4 GB cgroup limit at the image's
+    default job count (`rustc` SIGKILL on `ash`); `CARGO_BUILD_JOBS=2` inside the container builds in
+    3m31s. `AGENTS.md` says `CARGO_BUILD_JOBS=4`, but `scripts/dev.sh` only forwards `REC_*`, so the
+    value has to be set inside the command.
+- **Reproduce:** the commands in the table above on a loaded host; `scripts/dev.sh sh -c 'cargo
+  build --release'` (default jobs) for (d).
+- **Upstream:** n/a — this is this repo's test harness and container; upstream's cases run on a
+  developer's Mac and do not share these thresholds or a 4 GB cgroup.
+- **Files:** `scripts/selftest.sh` (`defrag`, `app-cli-control`), `scripts/audio/integration.sh`
+  (`watch`, `stress`; add `CARGO_BUILD_JOBS`), `scripts/dev.sh` (forward `CARGO_BUILD_JOBS` if the
+  documented default is meant to apply inside the container).
+
+## What still prevents a "feature parity" claim
+
+Apart from the desktop checklist (one sitting, ~30–45 min), the honest blockers are:
+
+1. **Hardware encoding and HEVC Main10 are unproven.** The VA-API candidates and the software
+   fallback are in the writer and selected at run time, but no host with `/dev/dri` has run them;
+   the image's x265 is 8-bit, so the HEVC proof is Main, not Main10 (the live encode says so).
+2. **No zero-copy encoder input.** Frames still reach the compositor and the encoder from CPU memory;
+   upstream goes IOSurface → VideoToolbox. The preview is now 0.78/1.57 ms per NV12 frame (3–4×
+   upstream's shipped 0.25–0.39 ms), and screen capture copies every frame. This is a performance,
+   not a feature, difference, but it is the largest remaining gap to upstream's design.
+3. **A real camera has never been recorded.** V4L2 and the Camera portal are unit-tested and the
+   synthetic camera proves the wiring, but no `/dev/video*` device and no Flatpak camera portal run
+   exists in the container.
+4. **Streaming is proved against MediaMTX, not the services.** YouTube/Twitch/Kick URLs and presets
+   are unit-tested and the enhanced-RTMP HEVC negotiation is tested, but no live service account was
+   used (upstream's own testing has the same limit for HEVC).
+5. **The packages were not re-run.** The 1F report's 23/23 and 14/14 are taken as read; no tag
+   triggered the release workflow, and `flatpak update` / a zsync update have never run.
+6. **Small output differences** (G16–G19): error precedence without a display, the `--stream` help's
+   missing `stream-key`, `probe`'s overall duration, and four text additions. None is a missing
+   feature; all are cheap to align or document.
