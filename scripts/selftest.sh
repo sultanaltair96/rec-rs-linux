@@ -5,8 +5,11 @@
 # Usage: scripts/selftest.sh [case...]      (default: every case)
 #        scripts/selftest.sh --list
 #
-# Recordings go to ${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}, never into the
-# repo. Cases that need a later phase print "SKIP <name> (phase 1X)".
+# Recordings go to ${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/selftest-<hash>,
+# never into the repo. The hash is of the worktree path (like dev.sh's target
+# dir): inside the dev container every worktree shares $HOME, so a fixed name
+# would make parallel runs collide ("already exists" on every case). Cases that
+# need a later phase print "SKIP <name> (phase 1X)".
 #
 # The writer cases check the file's track layout (video, mix, system stem, mic
 # stem; alternate group and enabled flags; AAC priming edit lists), the codec
@@ -30,7 +33,8 @@ else
     exit 1
 fi
 
-OUT="${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/selftest"
+repo_hash=$(printf '%s' "$(pwd -P)" | sha256sum | cut -c1-12)
+OUT="${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/selftest-$repo_hash"
 # Every recorder run is bounded: a hung capture device or encoder must fail the
 # case, not the whole run (the dev container also has a ceiling, see dev.sh).
 TIMEOUT="${REC_TIMEOUT:-120}"
