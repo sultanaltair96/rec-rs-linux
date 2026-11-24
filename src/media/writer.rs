@@ -310,15 +310,49 @@ fn restore_encoder_slot(
     Ok(())
 }
 
+/// Bounded set of input running times still eligible for matching. This is not
+/// FIFO association: an output is accepted only if its own timestamp matches.
+#[derive(Default)]
+struct PendingSlots(std::collections::BTreeSet<u64>);
+
+impl PendingSlots {
+    fn insert(&mut self, time: u64) {
+        self.0.insert(time);
+        while self.0.len() > 4096 {
+            self.0.pop_first();
+        }
+    }
+
+    fn take(&mut self, time: u64) -> bool {
+        if !self.0.contains(&time) {
+            return false;
+        }
+        // B frames are disabled. Older inputs may have been dropped.
+        self.0 = self.0.split_off(&time);
+        self.0.remove(&time);
+        true
+    }
+}
+
+fn running_time(
+    buffer: &gst::BufferRef,
+    segment: Option<&gst::FormattedSegment<gst::ClockTime>>,
+) -> Option<u64> {
+    segment?
+        .to_running_time(buffer.pts()?)
+        .map(|t| t.nseconds())
+}
+
 /// Install on the encoder itself: downstream parsers need the corrected PTS.
-/// If an encoder strips metadata, keep its own timestamp and count the degraded
-/// association rather than destroying the recording or guessing a slot.
+/// Untagged output is accepted only if its running time matches an in-flight
+/// input; otherwise retain the encoder's PTS and warn rather than guess.
 fn install_encoder_timing(
     encoder: &gst::Element,
     enc_in: Arc<std::sync::atomic::AtomicU64>,
     enc_out: Arc<std::sync::atomic::AtomicU64>,
     errors: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
+    let pending = Arc::new(std::sync::Mutex::new(PendingSlots::default()));
     for input in [true, false] {
         let pad = encoder
             .static_pad(if input { "sink" } else { "src" })
@@ -331,6 +365,7 @@ fn install_encoder_timing(
             enc_out.clone()
         };
         let errors = errors.clone();
+        let pending = pending.clone();
         pad.add_probe(
             gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
             move |_, info| {
@@ -343,9 +378,16 @@ fn install_encoder_timing(
                 if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let result = if input {
-                        stamp_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
+                        let result = stamp_encoder_slot(buffer.make_mut(), &reference, segment.as_ref());
+                        if result.is_ok() && let Some(time) = running_time(buffer, segment.as_ref()) {
+                            pending.lock().unwrap().insert(time);
+                        }
+                        result
                     } else {
-                        restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
+                        let result = restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref());
+                        let time = running_time(buffer, segment.as_ref());
+                        let matched = time.is_some_and(|t| pending.lock().unwrap().take(t));
+                        if result.is_err() && matched { Ok(()) } else { result }
                     };
                     if let Err(error) = result
                         && errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
@@ -2567,7 +2609,7 @@ mod tests {
     /// Exercise the real pad probes and streaming threads, not just helpers.
     /// identity models an encoder rewriting timestamps and losing one frame;
     /// software encoders also exercise GstVideoEncoder's metadata copying.
-    fn run_encoder_slot_pipeline(name: &str, lose_meta: bool) {
+    fn run_encoder_slot_pipeline(name: &str, lose_meta: bool, preserve_pts: bool) {
         use std::sync::atomic::{AtomicU64, Ordering};
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
@@ -2618,8 +2660,13 @@ mod tests {
                         if lose_meta {
                             let mut replacement = gst::Buffer::with_size(1).unwrap();
                             let b = replacement.make_mut();
-                            let pts = gst::ClockTime::from_seconds(3_600_000)
-                                + gst::ClockTime::from_nseconds(slot_ns(i as i64, 30));
+                            let original = buffer.pts().unwrap();
+                            let pts = if preserve_pts {
+                                gst::ClockTime::from_seconds(3_600_000) + original
+                            } else {
+                                gst::ClockTime::from_seconds(3_600_001)
+                                    + gst::ClockTime::from_nseconds(slot_ns(i as i64, 30))
+                            };
                             b.set_pts(pts);
                             b.set_dts(pts);
                             b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30)));
@@ -2683,12 +2730,16 @@ mod tests {
         assert_eq!(count_in.load(Ordering::Relaxed), 6);
         if lose_meta {
             assert!(matches!(message.view(), gst::MessageView::Eos(_)));
+            let expected: Vec<_> = if preserve_pts {
+                slots.into_iter().map(|i| slot_ns(i, 30)).collect()
+            } else {
+                (0..6).map(|i| 1_000_000_000 + slot_ns(i, 30)).collect()
+            };
+            assert_eq!(times, expected, "fallback retains encoder timestamps");
             assert_eq!(
-                times,
-                (0..6).map(|i| slot_ns(i, 30)).collect::<Vec<_>>(),
-                "fallback retains encoder timestamps, without guessing"
+                errors.load(Ordering::Relaxed),
+                if preserve_pts { 0 } else { 6 }
             );
-            assert_eq!(errors.load(Ordering::Relaxed), 6);
             assert_eq!(count_out.load(Ordering::Relaxed), 6);
         } else {
             if let gst::MessageView::Error(error) = message.view() {
@@ -2706,13 +2757,35 @@ mod tests {
     }
 
     #[test]
+    fn pending_slots_match_only_submitted_unconsumed_pts_and_bound_memory() {
+        let mut pending = PendingSlots::default();
+        pending.insert(10);
+        pending.insert(30);
+        assert!(!pending.take(20));
+        assert!(pending.take(30));
+        assert!(!pending.take(10));
+        assert!(!pending.take(30));
+        for i in 0..5000 {
+            pending.insert(i);
+        }
+        assert_eq!(pending.0.len(), 4096);
+        assert!(!pending.take(0));
+        assert!(pending.take(4999));
+    }
+
+    #[test]
     fn encoder_slot_identity_retimestamp_and_lost_frame() {
-        run_encoder_slot_pipeline("identity", false);
+        run_encoder_slot_pipeline("identity", false, false);
     }
 
     #[test]
     fn encoder_slot_missing_metadata_warns_counts_and_keeps_frames() {
-        run_encoder_slot_pipeline("identity", true);
+        run_encoder_slot_pipeline("identity", true, false);
+    }
+
+    #[test]
+    fn encoder_slot_untagged_matching_pts_is_accepted() {
+        run_encoder_slot_pipeline("identity", true, true);
     }
 
     #[test]
@@ -2724,7 +2797,7 @@ mod tests {
             "avenc_prores_aw",
             "avenc_prores_ks",
         ] {
-            run_encoder_slot_pipeline(name, false);
+            run_encoder_slot_pipeline(name, false, false);
         }
     }
 
