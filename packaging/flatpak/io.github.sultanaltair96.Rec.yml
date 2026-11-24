@@ -66,6 +66,8 @@ finish-args:
   # The tray icon is a StatusNotifierItem (ksni); without the watcher it would
   # silently disappear on GNOME-with-extension and KDE.
   - --talk-name=org.kde.StatusNotifierWatcher
+  # Observe logind's PrepareForSleep to stop and finalize before suspend.
+  - --system-talk-name=org.freedesktop.login1
   # Cameras deliberately use the Camera portal, so --device=all is NOT granted.
   # A V4L2 camera opened directly (phase 1B's fallback) needs
   #   flatpak override --user --device=all io.github.sultanaltair96.Rec
