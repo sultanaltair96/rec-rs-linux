@@ -1301,7 +1301,8 @@ fn kill_now() -> ! {
 ///
 /// `layout.audio_priming` and `layout.default_audio` are in moov audio order.
 /// A track's priming is given in samples at 48 kHz and scaled to the track's
-/// own timescale here.
+/// own timescale here. `video_end` caps audio presentation (after priming),
+/// without trimming AAC samples or extending audio tracks that end earlier.
 ///
 /// `keep` copies the file before the append, so a test can compare the
 /// fragmented and finalised forms of the same recording.
@@ -1382,7 +1383,6 @@ pub fn finalize(
         plan.media_duration = Some(media_duration);
         let tkhd_duration = scale(media_duration, t.info.timescale, init.movie_timescale);
         plan.tkhd_duration = Some(tkhd_duration);
-        track_durations.push(tkhd_duration);
 
         if t.info.handler == Handler::Audio {
             let index = audio_seen;
@@ -1396,21 +1396,29 @@ pub fn finalize(
                 plan.tkhd_flags = Some(if index == default { 0x7 } else { 0x6 });
             }
             let priming_48k = layout.audio_priming.get(index).copied().unwrap_or(0);
-            if priming_48k > 0 && t.info.timescale > 0 {
-                let priming = scale(priming_48k, 48_000, t.info.timescale);
-                if priming < media_duration {
-                    let shown = scale(
-                        media_duration - priming,
-                        t.info.timescale,
-                        init.movie_timescale,
-                    );
-                    plan.edits = Some(vec![Edit {
-                        segment_duration: shown,
-                        media_time: priming as i64,
-                    }]);
-                }
+            let priming = scale(priming_48k, 48_000, t.info.timescale);
+            // Keep the existing priming policy for empty/too-short media.
+            let priming = if priming < media_duration { priming } else { 0 };
+            let shown = scale(
+                media_duration - priming,
+                t.info.timescale,
+                init.movie_timescale,
+            );
+            let capped = video_end
+                .map(|end| (end.max(0.0) * init.movie_timescale as f64).round() as u64)
+                .map_or(shown, |end| shown.min(end));
+            // Even with zero priming an edit is needed to hide the tail of
+            // the AAC frame crossing the take end. Leave media duration and
+            // sample tables intact so that frame remains decodable.
+            if priming > 0 || capped < shown {
+                plan.edits = Some(vec![Edit {
+                    segment_duration: capped,
+                    media_time: priming as i64,
+                }]);
+                plan.tkhd_duration = Some(capped);
             }
         }
+        track_durations.push(plan.tkhd_duration.unwrap_or(tkhd_duration));
         plans.push(plan);
     }
     let movie_duration = track_durations.iter().copied().max().unwrap_or(0);

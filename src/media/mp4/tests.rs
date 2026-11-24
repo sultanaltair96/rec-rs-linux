@@ -737,6 +737,169 @@ fn finalize_builds_a_regular_movie_and_keeps_the_media_bytes() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Read a direct child of a finalised track, including its box header.
+fn final_track_box(path: &Path, index: usize, kind: &[u8; 4]) -> Vec<u8> {
+    let (mut file, boxes, _) = scan(path).unwrap();
+    let moov_ref = boxes.iter().rfind(|b| b.kind == MOOV).unwrap();
+    let moov = read_at(&mut file, moov_ref.start, moov_ref.size).unwrap();
+    let kids = children(&moov, 8, moov.len()).unwrap();
+    let trak = kids
+        .iter()
+        .filter(|b| &b.kind == b"trak")
+        .nth(index)
+        .unwrap();
+    let trak = slice(&moov, trak);
+    let kids = children(trak, 8, trak.len()).unwrap();
+    slice(trak, find(&kids, kind).unwrap()).to_vec()
+}
+
+fn final_track_duration(path: &Path, index: usize) -> u64 {
+    let tkhd = final_track_box(path, index, b"tkhd");
+    let (at, wide) = tkhd_duration_offset(&tkhd);
+    if wide {
+        be64(&tkhd, at).unwrap()
+    } else {
+        be32(&tkhd, at).unwrap() as u64
+    }
+}
+
+#[test]
+fn audio_end_trim_preserves_media_and_priming_in_fragmented_and_regular_movies() {
+    for regular in [false, true] {
+        for priming in [0, 2048] {
+            for end in [None, Some(0.2054), Some(0.5), Some(0.0)] {
+                let name = format!("audio-end-{regular}-{priming}-{end:?}");
+                let tracks = [TrackFixture {
+                    id: 1,
+                    handler: *b"soun",
+                    timescale: 48_000,
+                    duration: 0,
+                    flags: 0x7,
+                    tables: empty_tables(),
+                }];
+                let mut bytes = [ftyp(), init_moov(1000, &tracks)].concat();
+                let samples = [(1024, 5, 0, 0); 12];
+                bytes.extend_from_slice(&moof_at(
+                    bytes.len() as u64,
+                    &[TrafSpec {
+                        track_id: 1,
+                        defaults: None,
+                        samples: &samples,
+                        data_offset: true,
+                    }],
+                ));
+                bytes.extend_from_slice(&mdat(&[0xab; 60]));
+                let path = write_temp(&name, &bytes);
+                if regular {
+                    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+                    bytes = std::fs::read(&path).unwrap();
+                }
+                let baseline = write_temp(&format!("{name}-baseline"), &bytes);
+                let layout = Layout {
+                    audio_priming: vec![priming],
+                    ..Layout::default()
+                };
+                finalize(&baseline, &layout, CrashAt::None, None, None).unwrap();
+                let report = finalize(&path, &layout, CrashAt::None, None, end).unwrap();
+                assert_eq!(report.defragmented, !regular);
+
+                let shown = scale(12 * 1024 - priming, 48_000, 1000);
+                let expected = end.map_or(shown, |end| shown.min((end * 1000.0).round() as u64));
+                let info = read(&path).unwrap();
+                assert_eq!(info.duration, expected, "{name}: movie presentation");
+                assert_eq!(final_track_duration(&path, 0), expected, "{name}: tkhd");
+                let audio = &info.tracks[0];
+                assert_eq!(audio.duration, 12 * 1024, "{name}: media duration");
+                assert_eq!(audio.samples, 12, "{name}: keep crossing AAC frame");
+                let edits = if priming > 0 || expected < shown {
+                    vec![Edit {
+                        segment_duration: expected,
+                        media_time: priming as i64,
+                    }]
+                } else {
+                    vec![]
+                };
+                assert_eq!(audio.edits, edits, "{name}");
+                // mdhd, codec configuration, all sample tables and offsets are
+                // identical to finalising without a presentation end cap.
+                assert_eq!(
+                    final_track_box(&path, 0, b"mdia"),
+                    final_track_box(&baseline, 0, b"mdia")
+                );
+                let after = std::fs::read(&path).unwrap();
+                for b in scan(&baseline)
+                    .unwrap()
+                    .1
+                    .iter()
+                    .filter(|b| &b.kind == b"mdat")
+                {
+                    let range = b.start as usize..(b.start + b.size) as usize;
+                    assert_eq!(&after[range.clone()], &bytes[range], "{name}: payload");
+                }
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_file(baseline).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn take_end_caps_mix_and_crossing_mic_but_does_not_extend_short_system_track() {
+    let tracks: Vec<_> = (1..=4)
+        .map(|id| TrackFixture {
+            id,
+            handler: if id == 1 { *b"vide" } else { *b"soun" },
+            timescale: if id == 1 { 1000 } else { 48_000 },
+            duration: 0,
+            flags: 0x7,
+            tables: empty_tables(),
+        })
+        .collect();
+    let mut bytes = [ftyp(), init_moov(1000, &tracks)].concat();
+    let samples = [
+        vec![(100, 5, 0, 0); 2],
+        vec![(1024, 5, 0, 0); 12],
+        vec![(1024, 5, 0, 0); 8],
+        vec![(1024, 5, 0, 0); 13],
+    ];
+    let trafs: Vec<_> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, samples)| TrafSpec {
+            track_id: i as u32 + 1,
+            defaults: None,
+            samples,
+            data_offset: i == 0,
+        })
+        .collect();
+    bytes.extend_from_slice(&moof_at(bytes.len() as u64, &trafs));
+    bytes.extend_from_slice(&mdat(&[0xab; 175]));
+    let path = write_temp("take-end-multitrack", &bytes);
+    let baseline = write_temp("take-end-multitrack-baseline", &bytes);
+    finalize(&baseline, &layout(), CrashAt::None, None, None).unwrap();
+    finalize(&path, &layout(), CrashAt::None, None, Some(0.2054)).unwrap();
+    let info = read(&path).unwrap();
+    assert_eq!(info.duration, 205);
+    for (i, expected) in [205, 205, 128, 205].into_iter().enumerate() {
+        assert_eq!(final_track_duration(&path, i), expected, "track {i}");
+        if i > 0 {
+            assert_eq!(
+                info.tracks[i].edits,
+                vec![Edit {
+                    segment_duration: expected,
+                    media_time: 2048
+                }]
+            );
+            assert_eq!(
+                final_track_box(&path, i, b"mdia"),
+                final_track_box(&baseline, i, b"mdia")
+            );
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(baseline).unwrap();
+}
+
 #[test]
 fn a_two_moov_file_still_reads_as_a_movie() {
     // The state between the append and the flip: the appended regular moov is

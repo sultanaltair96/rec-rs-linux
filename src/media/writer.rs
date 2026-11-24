@@ -1107,7 +1107,7 @@ impl Writer {
                 if n == 0 {
                     break;
                 }
-                if !push_track_samples(track, at, &vec![[0.0, 0.0]; n], track.channels as usize) {
+                if !push_track_samples(track, at, &vec![[0.0, 0.0]; n]) {
                     failed = true;
                     break;
                 }
@@ -1186,9 +1186,6 @@ impl Writer {
             }
             pad = pad.min(((limit - start) * rate).floor().max(0.0) as usize);
             let body_start = start + pad as f64 / rate;
-            if body_start >= limit {
-                return false;
-            }
             let room = ((limit - body_start) * rate).floor().max(0.0) as usize;
             &body[..body.len().min(room)]
         } else {
@@ -1200,7 +1197,7 @@ impl Writer {
         let body_start = start + pad as f64 / rate;
         let mut ok = true;
         if pad > 0 {
-            ok &= push_track_samples(track, start, &vec![[0.0, 0.0]; pad], 2);
+            ok &= push_track_samples(track, start, &vec![[0.0, 0.0]; pad]);
             self.stats.audio_gaps_filled += 1;
         }
         // Fade in when the signal resumes after filler, so silence-to-audio at
@@ -1221,7 +1218,7 @@ impl Writer {
             body
         };
         if !body.is_empty() {
-            ok &= push_track_samples(track, body_start, body, track.channels as usize);
+            ok &= push_track_samples(track, body_start, body);
         }
         if ok {
             track.next = Some(body_start + body.len() as f64 / rate);
@@ -1613,7 +1610,7 @@ impl Writer {
                 eprintln!(
                     "rec: warning: no {what} arrived; writing a silent {what} track so the layout is intact"
                 );
-                let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480], t.channels as usize);
+                let _ = push_track_samples(t, 0.0, &[[0.0, 0.0]; 480]);
             }
         }
         for t in &sink.tracks {
@@ -1792,14 +1789,10 @@ fn tight_bytes(frame: &VideoFrame) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Push 48 kHz frames to one track, interleaved with `channels` channels.
+/// Push 48 kHz frames interleaved using the track's channel count.
 /// A mono track keeps the first channel only (the microphone's own sample).
-fn push_track_samples(
-    track: &mut AudioTrack,
-    pts: f64,
-    frames: &[[f32; 2]],
-    channels: usize,
-) -> bool {
+fn push_track_samples(track: &mut AudioTrack, pts: f64, frames: &[[f32; 2]]) -> bool {
+    let channels = track.channels as usize;
     let mut bytes = Vec::with_capacity(frames.len() * 4 * channels);
     for f in frames {
         bytes.extend_from_slice(&f[0].to_le_bytes());
@@ -3045,6 +3038,110 @@ mod tests {
         )
         .unwrap()
     }
+    /// Inspect real appsrc buffers before encoding: durations must agree with
+    /// the PCM byte count, including mono filler and the configured stop.
+    #[test]
+    fn track_gap_silence_uses_track_channels_and_clips_at_stop() {
+        gst::init().unwrap();
+        for channels in [1u8, 2] {
+            for gap_past_stop in [false, true] {
+                let pipeline = gst::Pipeline::new();
+                let appsrc = AppSrc::builder()
+                    .format(gst::Format::Time)
+                    .caps(
+                        &gst::Caps::builder("audio/x-raw")
+                            .field("format", "F32LE")
+                            .field("layout", "interleaved")
+                            .field("rate", 48_000i32)
+                            .field("channels", channels as i32)
+                            .build(),
+                    )
+                    .build();
+                let appsink = gstreamer_app::AppSink::builder().sync(false).build();
+                pipeline
+                    .add_many([appsrc.upcast_ref::<gst::Element>(), appsink.upcast_ref()])
+                    .unwrap();
+                appsrc.link(&appsink).unwrap();
+                let mut w = test_writer();
+                w.limit_secs(Some(1.0));
+                w.sink = Some(Sink {
+                    bus: pipeline.bus().unwrap(),
+                    pipeline: pipeline.clone(),
+                    video_src: AppSrc::builder().build(),
+                    tracks: vec![AudioTrack {
+                        target: Target::Mic,
+                        appsrc: appsrc.clone(),
+                        channels,
+                        next: None,
+                        after_filler: false,
+                    }],
+                    path: PathBuf::new(),
+                    encoder: String::new(),
+                    enc_in: Arc::default(),
+                    enc_out: Arc::default(),
+                    timing_errors: Arc::default(),
+                    layout: mp4::Layout::default(),
+                    video_max_bytes: 0,
+                });
+                pipeline.set_state(gst::State::Playing).unwrap();
+                // Late start: 12000 frames of silence, then 6000 real frames.
+                assert!(w.write_track(Target::Mic, 0.25, &vec![[0.25, -0.5]; 6_000]));
+                let mut expected = vec![(0usize, 12_000usize, true), (12_000, 6_000, false)];
+                if gap_past_stop {
+                    // Only the gap fits: retain its silence up to the stop.
+                    assert!(w.write_track(Target::Mic, 1.25, &vec![[0.25, -0.5]; 24_000]));
+                    expected.push((18_000, 30_000, true));
+                } else {
+                    // The last mic buffer crosses the stop: clip its samples,
+                    // not just its declared duration.
+                    assert!(w.write_track(Target::Mic, 0.75, &vec![[0.25, -0.5]; 24_000]));
+                    expected.extend([(18_000, 18_000, true), (36_000, 12_000, false)]);
+                }
+                assert!(!w.write_track(Target::Mic, 1.25, &[[0.25, -0.5]; 480]));
+                assert_eq!(w.sink.as_ref().unwrap().tracks[0].next, Some(1.0));
+                appsrc.end_of_stream().unwrap();
+                let mut total_frames = 0;
+                for (start, frames, silence) in expected {
+                    let sample = appsink
+                        .try_pull_sample(gst::ClockTime::from_seconds(5))
+                        .expect("audio buffer reached appsink");
+                    let buffer = sample.buffer().unwrap();
+                    let pcm = buffer.map_readable().unwrap();
+                    assert_eq!(pcm.len(), frames * channels as usize * 4);
+                    let actual_frames = pcm.len() / (channels as usize * 4);
+                    assert_eq!(
+                        buffer.pts().unwrap().nseconds(),
+                        secs_ns(start as f64 / mixer::RATE)
+                    );
+                    assert_eq!(
+                        buffer.duration().unwrap().nseconds(),
+                        secs_ns(actual_frames as f64 / mixer::RATE)
+                    );
+                    if silence {
+                        assert!(pcm.iter().all(|b| *b == 0));
+                    } else {
+                        // The unfaded tail preserves the mic's first channel,
+                        // and the second channel only on stereo tracks.
+                        let tail = &pcm[pcm.len() - channels as usize * 4..];
+                        assert_eq!(&tail[..4], &0.25f32.to_le_bytes());
+                        if channels == 2 {
+                            assert_eq!(&tail[4..], &(-0.5f32).to_le_bytes());
+                        }
+                    }
+                    total_frames += actual_frames;
+                }
+                assert_eq!(total_frames, 48_000);
+                assert!(
+                    appsink
+                        .try_pull_sample(gst::ClockTime::from_seconds(5))
+                        .is_none()
+                );
+                assert!(appsink.is_eos());
+                pipeline.set_state(gst::State::Null).unwrap();
+            }
+        }
+    }
+
     /// Resident set size in kB, from /proc (Linux only).
     fn vm_rss_kb() -> u64 {
         let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
