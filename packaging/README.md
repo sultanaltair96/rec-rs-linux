@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 11,442,008 bytes (runtime shared) | 109,947,384 bytes (GStreamer inside) |
+| Size | 11,487,072 bytes (runtime shared) | 109,885,944 bytes (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -195,7 +195,7 @@ WHIP; the test pattern synthesizes the system-audio beeps, so no device is
 needed), the replay buffer fills, and `stream-key` stores and deletes a key
 through `org.freedesktop.secrets`.
 
-Bundle size: **11.4 MB** (`rec.flatpak`, 11,442,008 bytes) — the runtime is shared. The manifest
+Bundle size: **11.5 MB** (`rec.flatpak`, 11,487,072 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.
@@ -378,7 +378,7 @@ Mesa, opens its window in the same container — the difference is the host's
 rendering stack, not the package. A real Fedora desktop with a GPU driver is
 check 8 in the list below.
 
-Sizes: AppImage **104.7 MiB** (109,824,504 bytes), `.zsync` 184 KiB. Most of it
+Sizes: AppImage **104.8 MiB** (109,885,944 bytes), `.zsync` 188,018 bytes. Most of it
 is the ffmpeg stack that `gst-libav` needs (libavcodec, libx265, libavfilter,
 libplacebo, libaom, ...) plus egui/wgpu, str0m/rustls and the embedded Inter
 fonts. That is the price of AAC, ProRes, the app and streaming in a single file;
