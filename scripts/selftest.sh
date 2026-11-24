@@ -69,6 +69,7 @@ case "${1:-}" in
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "screen-exclude no-sink app-cli-control"
         echo "opt-in: long-finalize (10 min), mic-stress (20 runs, 8 burners)"
+        echo "opt-in: gui-pending-portal (3 min), gui-disconnect (20 runs)"
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "skipped: pattern-webcam scene-webcam"
         exit 0 ;;
@@ -1012,6 +1013,29 @@ screen_test() {
         fail=$((fail+1))
     fi
 }
+
+# Long-running GUI portal regressions are explicit opt-ins, not default cases.
+if named gui-pending-portal; then
+    if [ -z "$screen_harness" ] || ! command -v grim >/dev/null 2>&1; then
+        echo "SKIP  gui-pending-portal  (needs sway, grim and dbus-run-session)"; skip=$((skip+1))
+    elif REC_BIN="$REC_ABS" REC_TEST_DIR="$OUT" timeout 300 \
+        scripts/screen/gui-pending-portal.sh >"$OUT/gui-pending-portal.log" 2>&1; then
+        echo "PASS  gui-pending-portal  (one pending request for at least 180s; tray and quit work)"; pass=$((pass+1))
+    else
+        bad gui-pending-portal "see $OUT/gui-pending-portal.log"
+    fi
+fi
+if named gui-disconnect; then
+    if [ -z "$screen_harness" ] || ! command -v pw-cli >/dev/null 2>&1; then
+        echo "SKIP  gui-disconnect  (needs the headless screen and PipeWire harness)"; skip=$((skip+1))
+    elif REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$OUT/gui-disconnect-harness" \
+        timeout 1500 scripts/screen/headless.sh scripts/screen/gui-disconnect.sh \
+        >"$OUT/gui-disconnect.log" 2>&1; then
+        echo "PASS  gui-disconnect  (node removal, retry and bounded quit; see $OUT/gui-disconnect.log)"; pass=$((pass+1))
+    else
+        bad gui-disconnect "see $OUT/gui-disconnect.log"
+    fi
+fi
 
 # G4: the same headless session has no sink; a plain recording must warn and
 # continue (see the wanted_no_sink block below, after REC_ABS is known).
