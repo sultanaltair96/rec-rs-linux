@@ -13,6 +13,20 @@ use crate::media_types::{PixelFormat, Plane, VideoFrame};
 use super::testkit::{self, Image, overlay, screen, solid};
 use super::{Options, OutputFormat, Renderer};
 
+#[test]
+fn camera_upload_is_reused_only_for_the_same_plane_buffers() {
+    let mut input = super::Input::default();
+    let first = solid(8, 8, [255, 0, 0]);
+    let same = first.clone();
+    let next = solid(8, 8, [255, 0, 0]);
+    assert!(input.camera_needs_upload(&first));
+    assert!(!input.camera_needs_upload(&same));
+    assert!(input.camera_needs_upload(&next));
+    let mut changed_stride = next.clone();
+    changed_stride.planes[0].stride += 4;
+    assert!(input.camera_needs_upload(&changed_stride));
+}
+
 /// A renderer in `width`x`height` with this overlay, or a skip.
 fn renderer(width: usize, height: usize, pip: PipSpec, scene: Scene) -> Option<Renderer> {
     testkit::renderer(width, height, pip, scene)
