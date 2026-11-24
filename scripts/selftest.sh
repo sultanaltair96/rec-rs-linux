@@ -64,7 +64,7 @@ case "${1:-}" in
         echo "pattern-1080-h264 pattern-mp4 pattern-prores pattern-hevc pattern-4k-hevc"
         echo "pattern-4k-long (20 s, RSS bound)"
         echo "tracks audio-tracks audio-silent sync audio-gaps pause-resume gain h264-bitrate"
-        echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui"
+        echo "scale camera camera-lag crash finalize-crash defrag timeout-stop compositor gui gui-x11-sigterm"
         echo "pattern-screen screen-region screen-x11 screen-window screen-token"
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "screen-exclude no-sink app-cli-control"
@@ -1222,6 +1222,87 @@ INNER
             echo "FAIL  gui  (file '$file' $frames frames, quit file '$quit_file' $quit_frames; see $d/app.log, $d/second.log, $d/controls.log, $d/session.log)"
             fail=$((fail+1))
         fi
+    fi
+fi
+
+# X11 shutdown regression: SIGTERM must wake the GUI even after its recording
+# window was destroyed, wait for finalization, and exit successfully.
+if wanted gui-x11-sigterm; then
+    if ! command -v Xvfb >/dev/null 2>&1 || ! command -v dbus-run-session >/dev/null 2>&1; then
+        echo "SKIP  gui-x11-sigterm  (needs Xvfb and dbus-run-session)"; skip=$((skip+1))
+    elif ! python3 -c 'import ctypes; ctypes.CDLL("libxkbcommon-x11.so")' >/dev/null 2>&1; then
+        echo "SKIP  gui-x11-sigterm  (needs libxkbcommon-x11.so)"; skip=$((skip+1))
+    else
+        d="$OUT/gui-x11-sigterm"
+        rm -rf "$d"; mkdir -p "$d/out"
+        # Do not put Unix sockets under the potentially very long worktree/OUT
+        # path: sockaddr_un has a small limit. Keep this isolated from other
+        # cases and desktop instances, but still under REC_TEST_DIR.
+        rt=$(mktemp -d "${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/gx.XXXXXX")
+        chmod 700 "$rt"
+        printf '{"output_dir": "%s", "resolution": "720p", "fps": 30, "mic_enabled": false, "system_audio": true}\n' \
+            "$d/out" >"$d/settings.json"
+        cat >"$d/run.sh" <<INNER
+#!/bin/sh
+set -eu
+export XDG_RUNTIME_DIR="$rt" REC_SETTINGS="$d/settings.json"
+export XDG_SESSION_TYPE=x11 REC_DEBUG=1
+unset WAYLAND_DISPLAY
+app=; xvfb=
+cleanup() {
+    [ -z "\$app" ] || { kill -KILL "\$app" 2>/dev/null || true; wait "\$app" 2>/dev/null || true; }
+    [ -z "\$xvfb" ] || { kill "\$xvfb" 2>/dev/null || true; wait "\$xvfb" 2>/dev/null || true; }
+    return 0
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+# Let Xvfb choose a free display so parallel worktrees cannot collide.
+Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3>"$d/display" >"$d/xvfb.log" 2>&1 &
+xvfb=\$!
+i=0
+while [ ! -s "$d/display" ] && [ \$i -lt 100 ]; do
+    kill -0 "\$xvfb" || exit 10
+    sleep 0.1; i=\$((i+1))
+done
+[ -s "$d/display" ] || exit 11
+export DISPLAY=":\$(cat "$d/display")"
+"$REC_ABS" gui --test-pattern --start-recording >"$d/app.log" 2>&1 &
+app=\$!
+# Wait for actual output, not just GUI startup, before sending the signal.
+i=0
+while [ \$i -lt 300 ]; do
+    kill -0 "\$app" || exit 12
+    set -- "$d/out/"*.mov
+    if [ "\$#" -eq 1 ] && [ -s "\$1" ]; then break; fi
+    sleep 0.1; i=\$((i+1))
+done
+[ \$i -lt 300 ] || exit 13
+sleep 3
+kill -TERM "\$app"
+rc=0
+wait "\$app" || rc=\$?
+app=
+printf '%s\n' "\$rc" >"$d/exit"
+exit "\$rc"
+INNER
+        session_rc=0
+        timeout -k 5 "$TIMEOUT" dbus-run-session -- sh "$d/run.sh" >"$d/session.log" 2>&1 || session_rc=$?
+        set -- "$d/out/"*.mov
+        frames=0
+        if [ "$session_rc" -eq 0 ] && grep -qx 0 "$d/exit" &&
+           ! grep -q 'panicked' "$d/app.log" && [ ! -e "$rt/rec-rs.pid" ] && [ "$#" -eq 1 ] && [ -s "$1" ] && decodes "$1"; then
+            frames=$(frame_count "$1")
+            if [ "${frames:-0}" -ge 30 ]; then
+                echo "PASS  gui-x11-sigterm  (SIGTERM, exit 0, finalized and playable, $frames frames)"
+                pass=$((pass+1))
+            else
+                bad gui-x11-sigterm "$frames frames (need >=30); see $d"
+            fi
+        else
+            bad gui-x11-sigterm "session exit=$session_rc; see $d/app.log, $d/session.log"
+        fi
+        rm -rf "$rt"
     fi
 fi
 
