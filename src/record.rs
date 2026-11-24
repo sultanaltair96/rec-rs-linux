@@ -637,7 +637,10 @@ impl Session {
                     .as_ref()
                     .and_then(|e| e.lock().unwrap().clone())
                 {
-                    pacer_shared.fail(format!("screen capture stopped: {error}"));
+                    pacer_shared.fail(format!(
+                        "screen capture stopped: the shared screen may have gone away \
+                         (display disconnected or sharing ended): {error}"
+                    ));
                     break;
                 }
                 let now = media_types::now();
