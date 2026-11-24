@@ -28,7 +28,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 # - clang/pkg-config: -sys crates (gstreamer-sys, pipewire-sys, ...)
 # - gstreamer*-devel + plugins-base-devel: gstreamer-rs
 # - pipewire-devel: capture (phase 1A/1B)
-# - wayland/xkb/x11/xcb: portals and the app window (phase 1A/1E)
+# - wayland/xkb/x11/xcb: portals and the app window (phase 1A/1E); winit
+#   dlopens libxkbcommon-x11.so for the X11 SIGTERM regression self-test
 # - dbus-devel: xdg-desktop-portal through zbus/ashpd (phase 1A)
 # - libv4l-devel: V4L2 camera (phase 1B)
 # - openssl-devel: rustls/openssl for streaming (phase 1D)
@@ -36,7 +37,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         clang gcc gcc-c++ make pkgconf-pkg-config \
         git tar gzip xz curl which findutils procps-ng binutils diffutils \
         gstreamer1-devel gstreamer1-plugins-base-devel \
-        pipewire-devel wayland-devel libxkbcommon-devel \
+        pipewire-devel wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
         libX11-devel libxcb-devel dbus-devel libv4l-devel openssl-devel \
     && dnf -y clean all
 
