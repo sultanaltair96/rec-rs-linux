@@ -43,13 +43,24 @@ pub fn target_size(fw: usize, fh: usize, area: (u32, u32), low_power: bool) -> (
     )
 }
 
-/// The preview side of the app: where preview frames go.
-///
-/// `Tap` lives on the UI side; the [`FrameSink`] returned next to it is the
-/// one the capture session calls (on its capture thread, from
-/// `record::Options::preview`).
+/// Exactly one representation of an emitted preview frame.
+pub enum Frame {
+    Cpu(VideoFrame),
+    Gpu(crate::gpu::PreviewFrame),
+}
+
+#[derive(Default)]
+struct Inbox {
+    ready: Option<Frame>,
+    pending_gpu: Option<crate::gpu::PreviewFrame>,
+}
+
+/// The preview inbox on the UI side. The session calls its sinks serially
+/// from the writer thread: optional GPU first, mandatory CPU second. The CPU
+/// callback commits one representation, so UI redraw timing cannot alternate
+/// between two representations of the same emission.
 pub struct Tap {
-    slot: Arc<Mutex<Option<VideoFrame>>>,
+    slot: Arc<Mutex<Inbox>>,
     wanted: Arc<AtomicBool>,
     low_power: Arc<AtomicBool>,
     target: Arc<Mutex<(u32, u32)>>,
@@ -61,7 +72,7 @@ pub struct Tap {
 impl Default for Tap {
     fn default() -> Self {
         Tap {
-            slot: Arc::new(Mutex::new(None)),
+            slot: Arc::new(Mutex::new(Inbox::default())),
             wanted: Arc::new(AtomicBool::new(false)),
             low_power: Arc::new(AtomicBool::new(false)),
             target: Arc::new(Mutex::new((0, 0))),
@@ -85,13 +96,20 @@ impl Tap {
         let low_power = self.low_power.clone();
         let last_wake = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
         Arc::new(move |frame: VideoFrame| {
-            // Hidden: drop the frame, don't even copy it.
-            if !wanted.load(Ordering::Relaxed) {
-                return;
-            }
-            if let Ok(mut s) = slot.lock() {
-                // Newest only: the previous frame is dropped, never queued.
-                *s = Some(frame);
+            {
+                let mut s = slot.lock().unwrap();
+                // The writer calls the GPU sink (if available), then this CPU
+                // sink, serially for each emission. Commit just ONE item here.
+                // A redraw between callbacks cannot consume half of a pair.
+                let gpu = s.pending_gpu.take();
+                if !wanted.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Do not pair by pts: pipelined readback can lag the texture.
+                s.ready = Some(match gpu {
+                    Some(tex) => Frame::Gpu(tex),
+                    None => Frame::Cpu(frame),
+                });
             }
             let interval = if low_power.load(Ordering::Relaxed) {
                 Duration::from_millis(66)
@@ -107,12 +125,26 @@ impl Tap {
         })
     }
 
+    /// The writer must call this sink before the CPU sink for the same
+    /// emission, on the same producer thread. Only the CPU sink publishes and
+    /// wakes. Absence of a GPU callback on the next emission restores CPU
+    /// fallback immediately (no sticky GPU mode).
+    pub fn gpu_sink(&self) -> crate::gpu::PreviewSink {
+        let slot = self.slot.clone();
+        Arc::new(move |frame| {
+            slot.lock().unwrap().pending_gpu = Some(frame);
+        })
+    }
+
     /// Whether frames are wanted (the main window is visible). Turning it off
     /// drops what is buffered, so nothing is drawn while hidden.
     pub fn set_wanted(&mut self, on: bool) {
+        let mut s = self.slot.lock().unwrap();
         self.wanted.store(on, Ordering::Relaxed);
         if !on {
-            self.slot.lock().unwrap().take();
+            s.ready = None;
+            // Keep the pending half-pair until its CPU callback, even if the
+            // window hides/shows between callbacks.
             self.last_wake = Instant::now();
         }
     }
@@ -137,8 +169,8 @@ impl Tap {
     }
 
     /// The newest frame, if one arrived since the last call.
-    pub fn take(&self) -> Option<VideoFrame> {
-        self.slot.lock().unwrap().take()
+    pub fn take(&self) -> Option<Frame> {
+        self.slot.lock().unwrap().ready.take()
     }
 
     /// The new frame as an egui image for the current preview area, with its
@@ -448,7 +480,9 @@ mod tests {
         tap.set_wanted(true);
         sink(bgra_frame(4, 2, [0, 0, 0, 255]));
         sink(bgra_frame(4, 2, [10, 20, 30, 255]));
-        let f = tap.take().expect("a frame");
+        let Frame::Cpu(f) = tap.take().expect("a frame") else {
+            panic!("expected CPU fallback");
+        };
         assert_eq!(f.planes[0].data[0], 10, "the newest frame wins");
         assert!(tap.take().is_none(), "and only once");
         // Hidden: frames are dropped, not buffered.
