@@ -135,6 +135,7 @@ writer's candidate order picks the same encoders everywhere.
 | `--filesystem=xdg-videos:create` | the default recording folder (`$XDG_VIDEOS_DIR`, else `~/Videos`) |
 | `--talk-name=org.freedesktop.secrets` | stream keys in the Secret Service |
 | `--talk-name=org.kde.StatusNotifierWatcher` | the tray icon (StatusNotifierItem) |
+| `--system-talk-name=org.freedesktop.login1` | receive logind's `PrepareForSleep` to stop and finalize a recording before suspend |
 
 Deliberately *not* granted: `--device=all`, the home directory, any other
 filesystem, and the session bus.
