@@ -28,9 +28,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use ashpd::Error as PortalError;
 use ashpd::desktop::ResponseError;
-use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Streams};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
 
 use super::{CaptureOptions, Want, pipewire, token};
 
@@ -225,7 +229,18 @@ impl Drop for PortalOwner {
 /// token makes silent. Recordings then start instead of failing with "no video
 /// frames".
 pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Prepared> {
-    let prepared = prepare_session(want, opts, timeout, pipewire::PROBE_WAIT)?;
+    prepare_with(want, opts, Some(timeout), &super::PortalCancel::default())
+}
+
+pub(super) fn prepare_with(
+    want: Want,
+    opts: CaptureOptions,
+    portal_wait: Option<Duration>,
+    cancel: &super::PortalCancel,
+) -> Result<Prepared> {
+    cancel.check()?;
+    let prepared = prepare_session(want, opts, portal_wait, cancel, pipewire::PROBE_WAIT)?;
+    cancel.check()?;
     if prepared.probed {
         return Ok(prepared);
     }
@@ -233,7 +248,8 @@ pub fn prepare(want: Want, opts: CaptureOptions, timeout: Duration) -> Result<Pr
         "rec: the screen-cast stream offered no video format; asking the portal for a fresh session"
     );
     prepared.close();
-    let fresh = prepare_session(want, opts, timeout, pipewire::PROBE_RETRY_WAIT)?;
+    let fresh = prepare_session(want, opts, portal_wait, cancel, pipewire::PROBE_RETRY_WAIT)?;
+    cancel.check()?;
     if !fresh.probed {
         fresh.close();
         // Two sessions, and not one `param` ever reached the stream: the
@@ -261,7 +277,8 @@ static PROBE_SOCKET_INODE: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 fn prepare_session(
     want: Want,
     opts: CaptureOptions,
-    timeout: Duration,
+    portal_wait: Option<Duration>,
+    cancel: &super::PortalCancel,
     probe_wait: Duration,
 ) -> Result<Prepared> {
     #[cfg(test)]
@@ -350,17 +367,13 @@ fn prepare_session(
                 .await;
         }
         select.map_err(portal_error)?;
-        let request = tokio::time::timeout(timeout, screencast.start(&session, None))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "the screen-capture dialog did not answer within {} s; run `rec-rs \
-                     permissions --request` or check that the desktop portal is running",
-                    timeout.as_secs()
-                )
-            })?
-            .map_err(portal_error)?;
-        let streams = request.response().map_err(portal_error)?;
+        let streams = match start_cancellable(&screencast, &session, portal_wait, cancel).await {
+            Ok(streams) => streams,
+            Err(error) => {
+                let _ = session.close().await;
+                return Err(error);
+            }
+        };
         let Some(stream) = streams.streams().first().cloned() else {
             // Drop the session here, on the runtime, before the error escapes.
             let _ = session.close().await;
@@ -466,6 +479,118 @@ fn prepare_session(
         probed: probed && probed_by_hook,
         picked,
     })
+}
+
+/// Own the pending Request even if its response future is dropped or unwinds.
+/// Cleanup is always driven by the process-lifetime portal runtime, never by a
+/// caller's (possibly shutting-down) runtime. A broken portal cannot hang drop.
+struct PendingRequest(Option<zbus::Proxy<'static>>);
+
+impl PendingRequest {
+    async fn close(&mut self) {
+        if let Some(request) = self.0.take() {
+            close_request(request).await;
+        }
+    }
+}
+
+async fn close_request(request: zbus::Proxy<'static>) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _: zbus::Result<()> = request.call("Close", &()).await;
+    })
+    .await;
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if let Some(request) = self.0.take() {
+            runtime_scope(close_request(request));
+        }
+    }
+}
+
+/// ashpd 0.12's `start` hides the Request until Response arrives. Use the
+/// documented wire protocol here so cancellation can close the *pending*
+/// Request, not merely drop its response future and leave the picker open.
+async fn start_cancellable(
+    screencast: &Screencast<'_>,
+    session: &Session<'_, Screencast<'_>>,
+    wait: Option<Duration>,
+    cancel: &super::PortalCancel,
+) -> Result<Streams> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    cancel.check()?;
+    let token = format!("rec_start_{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let connection = screencast.connection();
+    let sender = connection
+        .unique_name()
+        .context("portal connection has no unique name")?
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+    let request = zbus::Proxy::new_owned(
+        connection.clone(),
+        "org.freedesktop.portal.Desktop",
+        path,
+        "org.freedesktop.portal.Request",
+    )
+    .await?;
+    let mut pending_request = PendingRequest(Some(request.clone()));
+    let mut responses = request.receive_signal("Response").await?;
+    let mut options = std::collections::HashMap::new();
+    options.insert("handle_token", zbus::zvariant::Value::from(token.as_str()));
+    let response = async {
+        let _: zbus::zvariant::OwnedObjectPath =
+            screencast.call("Start", &(session, "", options)).await?;
+        let message = responses
+            .next()
+            .await
+            .context("screen-capture portal closed without a response")?;
+        let (code, streams): (u32, Streams) = message.body().deserialize()?;
+        match code {
+            0 => Ok(streams),
+            1 => Err(portal_error(PortalError::Response(
+                ResponseError::Cancelled,
+            ))),
+            _ => Err(portal_error(PortalError::Response(ResponseError::Other))),
+        }
+    };
+    let interrupted = async {
+        let cancelled = cancel.cancelled();
+        let deadline = async {
+            match wait {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        match select(Box::pin(cancelled), Box::pin(deadline)).await {
+            Either::Left(_) => anyhow!("screen capture startup cancelled"),
+            Either::Right(_) => anyhow!(
+                "the screen-capture dialog did not answer within {} s; run `rec-rs \
+                 permissions --request` or check that the desktop portal is running",
+                wait.unwrap().as_secs()
+            ),
+        }
+    };
+    match select(Box::pin(response), Box::pin(interrupted)).await {
+        Either::Left((result, _)) => {
+            if result.is_ok() {
+                // Response completed the Request; only the Session stays live.
+                pending_request.0.take();
+            } else {
+                pending_request.close().await;
+            }
+            result
+        }
+        Either::Right((error, pending)) => {
+            // Drop the response future and all proxies here, on the runtime.
+            drop(pending);
+            pending_request.close().await;
+            Err(error)
+        }
+    }
 }
 
 /// Pick the cursor mode the desktop can do, and explain anything it cannot.
@@ -666,6 +791,73 @@ mod tests {
     static PORTAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn app_preparation_owns_its_session_and_opens_without_a_second_picker() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return;
+        }
+        let cancel = super::super::PortalCancel::default();
+        let prepared = super::super::prepare_for_app(
+            &super::super::ScreenRequest::default(),
+            &CaptureOptions::default(),
+            None,
+            &cancel,
+        )
+        .expect("app preparation");
+        assert!(prepared.native.0 >= 2 && prepared.native.1 >= 2);
+        let _ = prepared.target.describe();
+        // The session is owned by this result, not CLI's global pending slot.
+        assert!(super::super::PENDING.lock().unwrap().is_none());
+        let (mut source, error) = prepared.open().expect("open prepared session");
+        assert!(error.is_some());
+        assert!(!source.is_running());
+        source.stop().unwrap();
+    }
+
+    #[test]
+    fn scoped_app_resolve_open_handoff_and_failed_options_cleanup() {
+        let _lock = PORTAL_TEST_LOCK.lock().unwrap();
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            return; // scripts/screen/headless.sh, with REC_SCREEN_BACKEND=portal
+        }
+        let cancel = super::super::PortalCancel::default();
+        let req = super::super::ScreenRequest::default();
+        let mut source = super::super::with_app_portal(&cancel, || {
+            let (_, native) = super::super::resolve(&req)?;
+            assert!(native.0 >= 2 && native.1 >= 2);
+            assert!(super::super::PENDING.lock().unwrap().is_none());
+            let before = DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst);
+            let (source, _) = super::super::open_with_status(&req, &CaptureOptions::default())?;
+            assert!(
+                super::super::APP_PORTAL
+                    .with(|slot| { slot.borrow().as_ref().unwrap().pending.is_none() })
+            );
+            assert_eq!(
+                DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "open must consume the prepared session, not replace it"
+            );
+            Ok(source)
+        })
+        .unwrap();
+        source.stop().unwrap();
+        let before = DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst);
+        let failed = super::super::with_app_portal::<()>(&cancel, || {
+            super::super::resolve(&req)?;
+            bail!("options failed after resolve")
+        });
+        assert_eq!(
+            failed.unwrap_err().to_string(),
+            "options failed after resolve"
+        );
+        assert!(
+            DROPS_ON_RUNTIME.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "scope must close unused resolved session"
+        );
+        assert!(super::super::PENDING.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn probe_and_capture_use_distinct_portal_connections() {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
@@ -816,6 +1008,97 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("did not answer"), "{err}");
+    }
+
+    /// Run against scripts/screen/fake-pending-portal.py on a private bus.
+    /// The fake never answers Start: None must wait for our explicit cancel,
+    /// while Some must retain the CLI timeout diagnostic.
+    #[test]
+    fn pending_picker_waits_until_cancelled_and_bounded_wait_still_times_out() {
+        if std::env::var_os("REC_TEST_PENDING_PORTAL").is_none() {
+            return;
+        }
+        let cancel = super::super::PortalCancel::default();
+        let worker_cancel = cancel.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            super::super::with_app_portal(&worker_cancel, || {
+                super::super::resolve(&super::super::ScreenRequest::default())
+            })
+            .expect_err("cancelled startup")
+        });
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(
+            !worker.is_finished(),
+            "unbounded picker returned before cancellation"
+        );
+        cancel.cancel();
+        let error = worker.join().expect("no reactor/drop panic");
+        assert_eq!(error.to_string(), "screen capture startup cancelled");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let error = prepare(
+            Want::Monitor,
+            CaptureOptions::default(),
+            Duration::from_millis(50),
+        )
+        .err()
+        .expect("bounded startup times out");
+        assert!(
+            error
+                .to_string()
+                .starts_with("the screen-capture dialog did not answer within 0 s;")
+        );
+    }
+
+    /// Abort a pending response future: its Request guard must still close on
+    /// the long-lived runtime, even when dropped by a non-runtime thread.
+    #[test]
+    fn pending_request_drop_is_safe_off_runtime() {
+        if std::env::var_os("REC_TEST_PENDING_PORTAL").is_none() {
+            return;
+        }
+        let guard = runtime().block_on(async {
+            let screencast = Screencast::new().await.unwrap();
+            let session = screencast.create_session().await.unwrap();
+            let mut options = std::collections::HashMap::new();
+            options.insert("handle_token", zbus::zvariant::Value::from("rec_drop_test"));
+            let path: zbus::zvariant::OwnedObjectPath = screencast
+                .call("Start", &(&session, "", options))
+                .await
+                .unwrap();
+            let proxy = zbus::Proxy::new_owned(
+                screencast.connection().clone(),
+                "org.freedesktop.portal.Desktop",
+                path,
+                "org.freedesktop.portal.Request",
+            )
+            .await
+            .unwrap();
+            PendingRequest(Some(proxy))
+        });
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_is_sticky_and_wakes_existing_and_late_waiters() {
+        let cancel = super::super::PortalCancel::default();
+        let clone = cancel.clone();
+        assert!(clone.check().is_ok());
+        runtime().block_on(async {
+            let waiting = clone.cancelled();
+            let trigger = async {
+                cancel.cancel();
+            };
+            futures_util::future::join(waiting, trigger).await;
+            tokio::time::timeout(Duration::from_millis(50), clone.cancelled())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            clone.check().unwrap_err().to_string(),
+            "screen capture startup cancelled"
+        );
+        assert!(prepare_with(Want::Monitor, CaptureOptions::default(), None, &clone).is_err());
     }
 
     #[test]

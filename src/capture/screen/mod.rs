@@ -39,6 +39,7 @@ mod selector;
 mod token;
 pub mod x11;
 
+use std::cell::RefCell;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -255,6 +256,180 @@ fn portal_timeout() -> Duration {
     Duration::from_secs_f64(secs)
 }
 
+/// Sticky, cloneable cancellation for app capture startup. Cancelling any clone
+/// wakes the pending portal picker; it does not stop an already returned source.
+#[derive(Clone, Debug)]
+pub struct PortalCancel(tokio::sync::watch::Sender<bool>);
+
+impl Default for PortalCancel {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl PortalCancel {
+    #[allow(dead_code)] // Phase 1E app startup consumes this cancellation seam.
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    fn check(&self) -> Result<()> {
+        if *self.0.borrow() {
+            bail!("screen capture startup cancelled");
+        }
+        Ok(())
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// App policy and handoff belong to the synchronous startup thread, not the
+    /// process: previews and CLI capture must never steal the app's session.
+    static APP_PORTAL: RefCell<Option<AppPortal>> = const { RefCell::new(None) };
+}
+
+struct AppPortal {
+    cancel: PortalCancel,
+    pending: Option<Pending>,
+}
+
+/// Run the app's entire synchronous recording startup on one blocking thread.
+///
+/// ```ignore
+/// screen::with_app_portal(&cancel, || {
+///     let options = options()?; // includes cli::prepare -> screen::resolve
+///     record::Session::start(options, /* ... */)
+/// })
+/// ```
+/// Both options preparation and `Session::start` MUST run inside this closure,
+/// on the same dedicated thread (not a Tokio runtime worker). The portal picker
+/// has no deadline here; cancelling any clone of `cancel` closes its Request.
+/// PipeWire probing remains bounded and cancellation is checked after it.
+/// A successful startup value is always returned, even if cancellation raced
+/// with startup completion. The caller must observe its cancellation state and
+/// explicitly stop/finalize that value if needed: generic `T` may own a running
+/// recording that cannot be cleaned up by dropping it.
+///
+/// The resolve/open handoff is owned by this scope, so a failed startup or panic
+/// closes any unused session on the portal runtime. Nested calls restore their
+/// caller's policy. Other threads and CLI factories keep their normal timeout
+/// and pending-session behaviour. No environment variables are changed.
+#[allow(dead_code)] // Phase 1E app startup consumes this scoped seam.
+pub fn with_app_portal<T>(cancel: &PortalCancel, startup: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Restore(Option<AppPortal>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let current = APP_PORTAL.with(|slot| slot.replace(self.0.take()));
+            // Destructors can enter the portal runtime; never hold a TLS borrow.
+            drop(current);
+        }
+    }
+    cancel.check()?;
+    let _restore = Restore(APP_PORTAL.with(|slot| {
+        slot.replace(Some(AppPortal {
+            cancel: cancel.clone(),
+            pending: None,
+        }))
+    }));
+    // Once startup succeeds, only the caller knows how to stop/finalize T.
+    // Never turn late cancellation into an error that discards that ownership.
+    startup()
+}
+
+fn app_cancel() -> Option<PortalCancel> {
+    APP_PORTAL.with(|slot| slot.borrow().as_ref().map(|app| app.cancel.clone()))
+}
+
+fn check_startup() -> Result<()> {
+    if let Some(cancel) = app_cancel() {
+        cancel.check()?;
+    }
+    Ok(())
+}
+
+fn prepare_startup(want: Want, opts: CaptureOptions) -> Result<portal::Prepared> {
+    match app_cancel() {
+        Some(cancel) => portal::prepare_with(want, opts, None, &cancel),
+        None => portal::prepare(want, opts, portal_timeout()),
+    }
+}
+
+/// App-owned startup result: no global pending-session cache is involved.
+/// Dropping this value closes its portal session safely on the portal runtime.
+#[allow(dead_code)] // Phase 1E app startup consumes this owned-session seam.
+pub struct PreparedScreen {
+    pub target: Target,
+    pub native: (usize, usize),
+    request: ScreenRequest,
+    opts: CaptureOptions,
+    portal: Option<portal::Prepared>,
+}
+
+#[allow(dead_code)] // Phase 1E app startup consumes this owned-session seam.
+impl PreparedScreen {
+    /// Consume the exact session that was prepared, without another picker.
+    pub fn open(self) -> Result<(Box<dyn VideoSource>, Option<ScreenError>)> {
+        if let Some(prepared) = self.portal {
+            let source = PortalSource::from_prepared(&self.request, self.opts, prepared)?;
+            let error = source.stream.error_handle();
+            Ok((Box::new(source), Some(error)))
+        } else {
+            open_with_status(&self.request, &self.opts)
+        }
+    }
+}
+
+/// Blocking app startup seam; call on a dedicated worker / `spawn_blocking`,
+/// never an async runtime worker. `portal_wait: None` allows an unanswered
+/// picker to remain open indefinitely. CLI factories retain REC_PORTAL_TIMEOUT
+/// (120 s by default). Cancellation is sticky and closes the pending Request.
+/// PipeWire probing is bounded but not interruptible; cancellation during it
+/// is observed before returning. No shared media contract or CLI flags change.
+#[allow(dead_code)] // Phase 1E app startup consumes this blocking worker seam.
+pub fn prepare_for_app(
+    req: &ScreenRequest,
+    opts: &CaptureOptions,
+    portal_wait: Option<Duration>,
+    cancel: &PortalCancel,
+) -> Result<PreparedScreen> {
+    cancel.check()?;
+    let (target, native, portal) = match backend()? {
+        Backend::X11 => {
+            let (target, native) = resolve_x11(req)?;
+            (target, native, None)
+        }
+        Backend::Portal => {
+            let want = if req.window.is_some() {
+                Want::Window
+            } else {
+                Want::Monitor
+            };
+            let prepared = portal::prepare_with(want, *opts, portal_wait, cancel)?;
+            let (target, native) = target_from_portal(req, &prepared)?;
+            (target, native, Some(prepared))
+        }
+    };
+    cancel.check()?;
+    Ok(PreparedScreen {
+        target,
+        native,
+        request: req.clone(),
+        opts: *opts,
+        portal,
+    })
+}
+
 /// A portal session prepared by [`resolve`], waiting for [`open`].
 ///
 /// On Wayland the pixel size is only known after the portal has started a
@@ -278,6 +453,7 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// silent; the first run shows the picker, which is also the first run's
 /// permission prompt.
 pub fn resolve(req: &ScreenRequest) -> Result<(Target, (usize, usize))> {
+    check_startup()?;
     match backend()? {
         Backend::X11 => resolve_x11(req),
         Backend::Portal => resolve_portal(req),
@@ -342,16 +518,21 @@ fn resolve_portal(req: &ScreenRequest) -> Result<(Target, (usize, usize))> {
     // before it builds the writer), so this session uses upstream's defaults.
     // `open_with` reuses it when the options match and otherwise asks again;
     // the restore token makes that second handshake silent.
-    let prepared = portal::prepare(want, CaptureOptions::default(), portal_timeout())?;
+    let prepared = prepare_startup(want, CaptureOptions::default())?;
     let (target, native) = target_from_portal(req, &prepared)?;
     let new = Pending {
         request: req.clone(),
         opts: CaptureOptions::default(),
         prepared,
     };
-    if let Some(old) = PENDING.lock().unwrap().replace(new) {
-        old.prepared.close();
-    }
+    let old = APP_PORTAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some(app) => app.pending.replace(new),
+            None => PENDING.lock().unwrap().replace(new),
+        }
+    });
+    drop(old);
     Ok((target, native))
 }
 
@@ -439,6 +620,7 @@ pub fn open_with_status(
     req: &ScreenRequest,
     opts: &CaptureOptions,
 ) -> Result<(Box<dyn VideoSource>, Option<ScreenError>)> {
+    check_startup()?;
     match backend()? {
         Backend::X11 => {
             let server = x11::Server::connect()?;
@@ -466,7 +648,14 @@ struct PortalSource {
 
 impl PortalSource {
     fn open(req: &ScreenRequest, opts: CaptureOptions) -> Result<PortalSource> {
-        let prepared = take_pending(req, opts)?;
+        Self::from_prepared(req, opts, take_pending(req, opts)?)
+    }
+
+    fn from_prepared(
+        req: &ScreenRequest,
+        opts: CaptureOptions,
+        prepared: portal::Prepared,
+    ) -> Result<Self> {
         if let Some(note) = &prepared.cursor_note {
             warn_once(note);
         }
@@ -521,7 +710,14 @@ impl PortalSource {
 
 /// The pending session for `req` and `opts`, or a fresh handshake.
 fn take_pending(req: &ScreenRequest, opts: CaptureOptions) -> Result<portal::Prepared> {
-    let pending = PENDING.lock().unwrap().take();
+    check_startup()?;
+    let pending = APP_PORTAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some(app) => app.pending.take(),
+            None => PENDING.lock().unwrap().take(),
+        }
+    });
     if let Some(p) = pending {
         if p.request == *req && p.opts == opts {
             return Ok(p.prepared);
@@ -533,7 +729,7 @@ fn take_pending(req: &ScreenRequest, opts: CaptureOptions) -> Result<portal::Pre
     } else {
         Want::Monitor
     };
-    portal::prepare(want, opts, portal_timeout())
+    prepare_startup(want, opts)
 }
 
 impl VideoSource for PortalSource {
@@ -718,6 +914,75 @@ pub(crate) fn warn_once(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_policy_is_scoped_nested_and_thread_local() {
+        let outer = PortalCancel::default();
+        with_app_portal(&outer, || {
+            assert!(app_cancel().is_some());
+            assert!(
+                std::thread::spawn(|| app_cancel().is_none())
+                    .join()
+                    .unwrap()
+            );
+            let inner = PortalCancel::default();
+            with_app_portal(&inner, || {
+                inner.cancel();
+                assert!(check_startup().is_err());
+                check_startup()
+            })
+            .unwrap_err();
+            assert!(check_startup().is_ok(), "outer policy restored");
+            Ok(())
+        })
+        .unwrap();
+        assert!(app_cancel().is_none());
+    }
+
+    #[test]
+    fn successful_startup_retains_ownership_when_cancelled_before_return() {
+        // Like record::Session, this resource needs explicit cleanup, not Drop.
+        struct Recording(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Recording {
+            fn stop(self) {
+                self.0.set(true);
+            }
+        }
+
+        let stopped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let cancel = PortalCancel::default();
+        let worker_cancel = cancel.clone();
+        let recording = with_app_portal(&worker_cancel, || {
+            let recording = Recording(stopped.clone());
+            cancel.cancel(); // Cancellation races with the end of Session::start.
+            Ok(recording)
+        })
+        .expect("successful startup must transfer ownership even after cancellation");
+
+        assert!(app_cancel().is_none(), "startup scope restored");
+        assert!(cancel.check().is_err(), "caller can observe cancellation");
+        assert!(!stopped.get());
+        recording.stop();
+        assert!(
+            stopped.get(),
+            "caller can explicitly finalize the recording"
+        );
+    }
+
+    #[test]
+    fn app_policy_restores_after_error_and_panic() {
+        let cancel = PortalCancel::default();
+        let error = with_app_portal::<()>(&cancel, || bail!("options failed"));
+        assert_eq!(error.unwrap_err().to_string(), "options failed");
+        assert!(app_cancel().is_none());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_app_portal::<()>(&cancel, || panic!("startup panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(app_cancel().is_none());
+        cancel.cancel();
+        assert!(with_app_portal::<()>(&cancel, || panic!("must not run")).is_err());
+    }
 
     #[test]
     fn the_default_request_is_the_primary_display() {
