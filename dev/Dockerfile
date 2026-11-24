@@ -83,6 +83,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         pipewire-gstreamer pipewire-pulseaudio pulseaudio-utils \
         ffmpeg python3 \
         sway foot xdg-desktop-portal xdg-desktop-portal-wlr \
+        mutter gnome-shell xdg-desktop-portal-gnome gsettings-desktop-schemas \
         dbus-daemon dbus-tools dbus-broker xorg-x11-server-Xvfb \
         mesa-vulkan-drivers mesa-dri-drivers vulkan-loader vulkan-tools \
         gnome-keyring libsecret v4l-utils \

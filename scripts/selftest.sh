@@ -70,6 +70,9 @@ case "${1:-}" in
         echo "screen-exclude no-sink app-cli-control"
         echo "opt-in: long-finalize (10 min), mic-stress (20 runs, 8 burners)"
         echo "opt-in: gui-pending-portal (3 min), gui-disconnect (20 runs)"
+        # BEGIN fault selftests (opt-in)
+        echo "opt-in: faults-cli faults-gui (isolated real screen/service fault matrix)"
+        # END fault selftests
         echo "pattern-mic pattern-system-audio replay stream-rtmp stream-whip live-e2e"
         echo "skipped: pattern-webcam scene-webcam"
         exit 0 ;;
@@ -1013,6 +1016,36 @@ screen_test() {
         fail=$((fail+1))
     fi
 }
+
+# BEGIN fault selftests (opt-in)
+for fault_mode in cli gui; do
+    fault_name="faults-$fault_mode"
+    if named "$fault_name"; then
+        missing=''
+        for tool in sway foot dbus-run-session pipewire wireplumber pw-cli pw-dump python3 gdbus ffmpeg ffprobe timeout; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+        done
+        for tool in /usr/libexec/xdg-desktop-portal /usr/libexec/xdg-desktop-portal-wlr; do
+            [ -x "$tool" ] || missing="$missing $tool"
+        done
+        if [ -n "$missing" ]; then
+            echo "SKIP  $fault_name (missing:$missing)"; skip=$((skip+1))
+        else
+            fault_rc=0
+            REC_BIN="$REC_ABS" OUT_DIR="$OUT" sh scripts/faults/cases.sh "$fault_mode" \
+                >"$OUT/$fault_name.log" 2>&1 || fault_rc=$?
+            # Preserve per-injection outcomes, including unsupported injections.
+            grep -E '^(PASS|FAIL|SKIP) ' "$OUT/$fault_name.log" || true
+            fault_pass=$(grep -c '^PASS ' "$OUT/$fault_name.log" || true)
+            fault_skip=$(grep -c '^SKIP ' "$OUT/$fault_name.log" || true)
+            pass=$((pass+fault_pass)); skip=$((skip+fault_skip))
+            if [ "$fault_rc" -ne 0 ]; then
+                bad "$fault_name" "matrix failed; see $OUT/$fault_name.log"
+            fi
+        fi
+    fi
+done
+# END fault selftests
 
 # Long-running GUI portal regressions are explicit opt-ins, not default cases.
 if named gui-pending-portal; then
