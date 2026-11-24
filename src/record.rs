@@ -348,6 +348,7 @@ pub struct Session {
 /// delivers keeps its track.
 struct OpenedSources {
     video: Box<dyn VideoSource>,
+    screen_error: Option<screen::ScreenError>,
     audio: Vec<Box<dyn crate::media_types::AudioSource>>,
     description: String,
 }
@@ -358,6 +359,7 @@ fn open_sources(
 ) -> Result<OpenedSources> {
     let mut audio: Vec<Box<dyn crate::media_types::AudioSource>> = vec![];
     let video: Box<dyn VideoSource>;
+    let mut screen_error = None;
     let description;
     match o.test_pattern {
         Some(noise) => {
@@ -406,7 +408,7 @@ fn open_sources(
         }
         None => {
             let req = o.screen.clone().unwrap_or_default();
-            let src = screen::open_with(
+            let (src, error) = screen::open_with_status(
                 &req,
                 &screen::CaptureOptions {
                     cursor: o.cursor,
@@ -414,6 +416,7 @@ fn open_sources(
                 },
             )?;
             description = src.describe();
+            screen_error = error;
             video = src;
             if o.system_audio {
                 match audio_capture::open_system() {
@@ -428,6 +431,7 @@ fn open_sources(
     }
     Ok(OpenedSources {
         video,
+        screen_error,
         audio,
         description,
     })
@@ -622,9 +626,23 @@ impl Session {
         let pacer_shared = shared.clone();
         let pacer_stop = sess.stop.clone();
         let fps = o.fps;
+        // Upstream's ScreenCaptureKit didStopWithError calls shared.fail
+        // (reference/rec-rs/src/screen.rs:165-170), stopping the session while
+        // finish still finalizes the file (reference/rec-rs/src/record.rs:459-479).
+        let screen_error = opened.screen_error;
         sess.pacer = Some(std::thread::spawn(move || {
             let period = Duration::from_secs_f64(1.0 / fps as f64 / 2.0);
             while !pacer_stop.load(Ordering::SeqCst) {
+                if let Some(error) = screen_error
+                    .as_ref()
+                    .and_then(|e| e.lock().unwrap().clone())
+                {
+                    pacer_shared.fail(format!(
+                        "screen capture stopped: the shared screen may have gone away \
+                         (display disconnected or sharing ended): {error}"
+                    ));
+                    break;
+                }
                 let now = media_types::now();
                 let mut failure = None;
                 pacer_shared.with(|w| {
