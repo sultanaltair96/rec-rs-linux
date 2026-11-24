@@ -328,7 +328,9 @@ fn preview(ui: &mut Ui, st: &mut State) {
             _ => {
                 ui.painter()
                     .rect_filled(rect, CornerRadius::same(10), theme::pal(ui).control);
-                let msg = if st.finishing {
+                let msg = if st.starting {
+                    "waiting for screen-sharing permission"
+                } else if st.finishing {
                     "Saving…"
                 } else if live {
                     "Waiting for the first frame"

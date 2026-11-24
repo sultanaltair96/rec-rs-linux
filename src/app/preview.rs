@@ -55,6 +55,50 @@ struct Inbox {
     pending_gpu: Option<crate::gpu::PreviewFrame>,
 }
 
+/// A startup owns inactive sinks until the UI adopts its session. Revocation
+/// waits for any in-flight callback, so no producer can publish after it returns.
+#[derive(Default)]
+pub struct Publication(Arc<Mutex<bool>>);
+
+impl Publication {
+    pub fn sinks(
+        &self,
+        cpu: FrameSink,
+        gpu: crate::gpu::PreviewSink,
+    ) -> (FrameSink, crate::gpu::PreviewSink) {
+        let cpu_gate = self.0.clone();
+        let gpu_gate = self.0.clone();
+        (
+            Arc::new(move |frame| {
+                let enabled = cpu_gate.lock().unwrap();
+                if *enabled {
+                    cpu(frame);
+                }
+            }),
+            Arc::new(move |frame| {
+                let enabled = gpu_gate.lock().unwrap();
+                if *enabled {
+                    gpu(frame);
+                }
+            }),
+        )
+    }
+
+    pub fn activate(&self) {
+        *self.0.lock().unwrap() = true;
+    }
+
+    pub fn revoke(&self) {
+        *self.0.lock().unwrap() = false;
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
 /// The preview inbox on the UI side. The session calls its sinks serially
 /// from the writer thread: optional GPU first, mandatory CPU second. The CPU
 /// callback commits one representation, so UI redraw timing cannot alternate
@@ -134,6 +178,12 @@ impl Tap {
         Arc::new(move |frame| {
             slot.lock().unwrap().pending_gpu = Some(frame);
         })
+    }
+
+    pub fn clear(&self) {
+        let mut slot = self.slot.lock().unwrap();
+        slot.ready = None;
+        slot.pending_gpu = None;
     }
 
     /// Whether frames are wanted (the main window is visible). Turning it off
@@ -408,6 +458,66 @@ mod tests {
             data.extend_from_slice(&px);
         }
         VideoFrame::packed(1.0, w, h, PixelFormat::Bgra, data)
+    }
+
+    #[test]
+    fn cancelled_start_and_quit_sinks_cannot_publish() {
+        let (mut tap, sink) = Tap::new(Arc::new(|| {}));
+        tap.set_wanted(true);
+        let cancelled = Publication::default();
+        let (stale, _) = cancelled.sinks(sink.clone(), tap.gpu_sink());
+        stale(bgra_frame(4, 2, [1, 0, 0, 255]));
+        assert!(tap.take().is_none(), "unadopted startup published");
+        drop(cancelled);
+
+        let active = Publication::default();
+        let (current, _) = active.sinks(sink, tap.gpu_sink());
+        active.activate();
+        current(bgra_frame(4, 2, [2, 0, 0, 255]));
+        stale(bgra_frame(4, 2, [3, 0, 0, 255]));
+        let Frame::Cpu(frame) = tap.take().unwrap() else {
+            panic!("expected CPU frame");
+        };
+        assert_eq!(
+            frame.planes[0].data[0], 2,
+            "cancelled sink replaced current frame"
+        );
+        // Quit revokes before clearing the inbox, even if the window remains
+        // wanted and detached capture keeps delivering callbacks.
+        current(bgra_frame(4, 2, [4, 0, 0, 255]));
+        drop(active);
+        tap.clear();
+        current(bgra_frame(4, 2, [5, 0, 0, 255]));
+        assert!(tap.take().is_none(), "late callback published after quit");
+    }
+
+    #[test]
+    fn revocation_waits_for_in_flight_publication() {
+        use std::sync::mpsc;
+        let gate = Publication::default();
+        gate.activate();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (cpu, _) = gate.sinks(
+            Arc::new(move |_| {
+                entered.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }),
+            Arc::new(|_| {}),
+        );
+        let producer = std::thread::spawn(move || cpu(bgra_frame(4, 2, [0; 4])));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (revoked, revoked_rx) = mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            gate.revoke();
+            revoked.send(()).unwrap();
+        });
+        assert!(revoked_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        release.send(()).unwrap();
+        revoked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        producer.join().unwrap();
+        revoker.join().unwrap();
     }
 
     #[test]

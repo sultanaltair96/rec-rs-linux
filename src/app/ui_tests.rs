@@ -129,6 +129,47 @@ fn test_threads_env_is_set() {
 }
 
 #[test]
+fn pending_screen_permission_paints_wait_state_not_no_preview() {
+    // Inspect painter shapes: preview status is painted, not an accessibility
+    // label. No portal, renderer, or wall-clock sleeps are needed here.
+    let ctx = egui::Context::default();
+    let mut st = State::new(Settings::default());
+    st.starting = true;
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1040.0, 660.0),
+        )),
+        ..Default::default()
+    };
+    let mut fonts = ctx.run_ui(input(), |ui| crate::app::theme::apply(ui.ctx()));
+    fonts.textures_delta.clear();
+    let mut output = ctx.run_ui(input(), |ui| ui::main_window(ui, &mut st));
+    output.textures_delta.clear();
+    fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut painted = Vec::new();
+    for shape in &output.shapes {
+        texts(&shape.shape, &mut painted);
+    }
+    assert!(
+        painted
+            .iter()
+            .any(|s| s == "waiting for screen-sharing permission")
+    );
+    assert!(!painted.iter().any(|s| s == "No preview"));
+}
+
+#[test]
 fn main_window_shows_every_card() {
     let _gpu_guard = gpu();
     // Tall enough that no card is clipped: egui hides clipped widgets from the
