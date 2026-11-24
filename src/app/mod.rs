@@ -732,6 +732,7 @@ struct App {
     /// The tray starts on a thread: registering the status item talks to D-Bus,
     /// and a slow (or missing) watcher must not hold up the first frame.
     tray_rx: Option<Receiver<Option<tray::Handle>>>,
+    tray_watcher: Option<tray::Watcher>,
     tap: preview::Tap,
     tap_sink: FrameSink,
     gpu_preview_sink: crate::gpu::PreviewSink,
@@ -805,6 +806,7 @@ impl App {
             st,
             tray: None,
             tray_rx: None,
+            tray_watcher: None,
             lock,
             _camera_watch: camera_watch,
             _audio_watch: audio_watch,
@@ -1831,14 +1833,21 @@ impl App {
             updates: self.st.updates,
             hotkey_ok: self.st.hotkey_ok,
         };
-        if let Some(handle) = tray::poll_start(&mut self.tray_rx) {
-            self.tray = Some(handle);
+        if let Some(watcher) = &mut self.tray_watcher {
+            tray::poll_restart(
+                &mut self.tray,
+                &mut self.tray_rx,
+                watcher,
+                &view,
+                Arc::new(push),
+            );
         }
         if let Some(t) = &self.tray {
             if t.available() {
                 tray::update(t, view);
             } else {
-                self.tray = None;
+                // Retain the invalid handle so poll_restart can replace it
+                // after a watcher returns and registration is confirmed.
                 // A hidden app must not become unreachable when its host dies.
                 // Don't undo the deliberate capture hide (that would film Rec),
                 // or the explicit headless/background modes.
@@ -2067,23 +2076,9 @@ impl ApplicationHandler for App {
             );
             self.st.hotkey_ok = false;
         }
-        let view = tray::View {
-            has_last: false,
-            replay: self.st.replay_stats.is_some(),
-            updates: self.st.updates,
-            hotkey_ok: self.st.hotkey_ok,
-            ..Default::default()
-        };
-        // Never block the event loop on the status notifier.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("rec-tray-start".into())
-            .spawn(move || {
-                let _ = tx.send(tray::start(view, Arc::new(push)));
-                wake();
-            })
-            .ok();
-        self.tray_rx = Some(rx);
+        // The async NameOwnerChanged listener also handles a shell/extension
+        // that first appears after startup. No D-Bus work on the event loop.
+        self.tray_watcher = tray::Watcher::new();
         if std::env::var_os("REC_GUI_HIDDEN").is_some() {
             self.main_visible = false;
             self.tap.set_wanted(false);
