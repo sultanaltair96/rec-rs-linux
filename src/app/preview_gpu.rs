@@ -1018,6 +1018,62 @@ mod tests {
         assert_eq!(&data[centre..centre + 4], &[10, 20, 30, 255]);
     }
 
+    #[test]
+    fn revoked_startup_gpu_callbacks_cannot_poison_the_next_session() {
+        use super::super::preview::{Frame, Publication, Tap};
+        let Some((device, queue)) = gpu() else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
+        let texture = composited_texture(&device, &queue, 4, 2, [30, 20, 10, 255]);
+        let frame = || crate::gpu::PreviewFrame {
+            texture: texture.clone(),
+            width: 4,
+            height: 2,
+            pts: 1.0,
+            generation: 1,
+        };
+        let cpu_frame = || VideoFrame::packed(1.0, 4, 2, PixelFormat::Bgra, vec![0; 32]);
+        let (mut tap, cpu) = Tap::new(std::sync::Arc::new(|| {}));
+        tap.set_wanted(true);
+        let old = Publication::default();
+        let (old_cpu, old_gpu) = old.sinks(cpu.clone(), tap.gpu_sink());
+        old_gpu(frame());
+        old_cpu(cpu_frame());
+        assert!(tap.take().is_none(), "unadopted GPU startup published");
+        old.activate();
+        old_gpu(frame());
+        // Quit/cancellation between the two halves must clear the GPU half
+        // and reject both subsequent callbacks from the detached producer.
+        drop(old);
+        tap.clear();
+        old_cpu(cpu_frame());
+        old_gpu(frame());
+        assert!(tap.take().is_none());
+
+        let current = Publication::default();
+        let (new_cpu, new_gpu) = current.sinks(cpu, tap.gpu_sink());
+        current.activate();
+        new_cpu(cpu_frame());
+        assert!(
+            matches!(tap.take(), Some(Frame::Cpu(_))),
+            "stale GPU half survived"
+        );
+        new_gpu(frame());
+        old_cpu(cpu_frame());
+        assert!(
+            tap.take().is_none(),
+            "stale CPU committed a current GPU half"
+        );
+        new_cpu(cpu_frame());
+        assert!(matches!(tap.take(), Some(Frame::Gpu(_))));
+        drop(current);
+        tap.clear();
+        new_gpu(frame());
+        new_cpu(cpu_frame());
+        assert!(tap.take().is_none(), "GPU callback published after quit");
+    }
+
     /// An idle camera is uploaded once but painted on every preview redraw.
     /// Compare full GPU readbacks so a blank second pass cannot go unnoticed.
     #[test]

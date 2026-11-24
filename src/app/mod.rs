@@ -28,6 +28,38 @@ mod preview;
 pub(crate) use preview::{Frame as TestPreviewFrame, Tap as TestPreviewTap};
 mod preview_gpu;
 mod session;
+mod startup;
+
+type Started = Result<(Session, record::Options, Option<String>)>;
+struct Starting {
+    job: startup::Job<Started>,
+    publication: preview::Publication,
+    settings: Settings,
+    cancelled: bool,
+    portal_cancel: crate::capture::screen::PortalCancel,
+    file: Option<std::path::PathBuf>,
+}
+impl Starting {
+    fn cancel(&mut self) {
+        self.cancelled = true;
+        self.portal_cancel.cancel();
+    }
+}
+impl Drop for Starting {
+    fn drop(&mut self) {
+        self.portal_cancel.cancel();
+    }
+}
+// Recording startup may already own a file, so it has no detach deadline.
+fn detach_preview_start_on_quit(recording: bool, deadline: Option<Instant>, now: Instant) -> bool {
+    !recording && deadline.is_some_and(|deadline| now >= deadline)
+}
+
+fn discard_start(result: Started) {
+    if let Ok((session, _, _)) = result {
+        let _ = session.finish();
+    }
+}
 mod theme;
 mod tray;
 mod ui;
@@ -208,6 +240,7 @@ pub struct State {
     spare_cam: Option<crate::record::Camera>,
     /// Settings the running preview session was started with.
     preview_settings: Option<Settings>,
+    starting: bool,
     pub finishing: bool,
     pub last_file: Option<PathBuf>,
     pub error: Option<String>,
@@ -271,6 +304,7 @@ impl State {
             preview: None,
             spare_cam: None,
             preview_settings: None,
+            starting: false,
             finishing: false,
             last_file: None,
             error: None,
@@ -355,6 +389,13 @@ impl State {
             .as_ref()
             .map(|s| crate::util::clock(s.recorded_secs()))
             .unwrap_or_default()
+    }
+
+    /// Only the worker's snapshot has reached the session. UI edits made
+    /// during startup must remain dirty for the next live update.
+    fn mark_start_settings(&mut self, settings: &Settings) {
+        self.pip_applied = Some(settings.pip_spec());
+        self.volumes_applied = Some(settings.volumes());
     }
 
     /// Send the overlay settings to the running session if they changed:
@@ -702,6 +743,7 @@ struct App {
     /// Quit is in progress: dispatch teardown completions only, never touch
     /// windows or start another capture session.
     quitting: bool,
+    preview_start_quit_deadline: Option<Instant>,
     /// The main window was hidden for the running recording (G3): a capture
     /// that cannot exclude Rec's window would film it. Restored on stop.
     hidden_for_recording: bool,
@@ -736,6 +778,7 @@ struct App {
     tap: preview::Tap,
     tap_sink: FrameSink,
     gpu_preview_sink: crate::gpu::PreviewSink,
+    publication: Option<preview::Publication>,
     last_tick: Instant,
     last_meter: Instant,
     control_rx: Receiver<Control>,
@@ -751,7 +794,11 @@ struct App {
     /// Preview teardown is not recording finalization: it must not publish a
     /// file, remove the recorder pidfile/socket, or restore hidden windows.
     preview_cleanup: Option<std::thread::JoinHandle<()>>,
+    /// Cancelled recording startups can already own a file. Keep their
+    /// finalizers even after Starting has gone away, including across Quit.
+    recording_start_cleanup: Vec<std::thread::JoinHandle<()>>,
     pending_recording: bool,
+    starting: Option<Starting>,
     update_tx: Sender<std::result::Result<updater::Found, String>>,
     update_rx: Receiver<std::result::Result<updater::Found, String>>,
     accent_rx: Receiver<Option<egui::Color32>>,
@@ -799,6 +846,7 @@ impl App {
             settings_win: None,
             main_visible: true,
             quitting: false,
+            preview_start_quit_deadline: None,
             hidden_for_recording: false,
             capture_hide: None,
             screen_locked: false,
@@ -817,6 +865,7 @@ impl App {
             tap,
             tap_sink,
             gpu_preview_sink,
+            publication: None,
             last_tick: Instant::now(),
             last_meter: Instant::now(),
             control_rx,
@@ -827,6 +876,8 @@ impl App {
             test_pattern,
             finished: Arc::new(Mutex::new(None)),
             preview_cleanup: None,
+            recording_start_cleanup: Vec::new(),
+            starting: None,
             pending_recording: false,
             update_tx,
             update_rx,
@@ -1002,7 +1053,8 @@ impl App {
         }
         self.main_visible = true;
         self.update_tap_wanted();
-        self.sync_preview();
+        // Let resumed finish window/tray setup before a worker opens a picker.
+        // The periodic tick starts preview; never do capture work in show_main.
     }
 
     /// Hide the main window. On Wayland `set_visible(false)` is a no-op, so the
@@ -1089,41 +1141,60 @@ impl App {
 
     /// The capture session's options, from the settings (through the CLI, so
     /// the app and `rec-rs record` cannot drift apart).
-    fn options(&mut self, output: Option<&std::path::Path>) -> Result<record::Options> {
+    fn options(
+        &mut self,
+        output: Option<&std::path::Path>,
+        publication: &preview::Publication,
+    ) -> impl FnOnce() -> Result<(record::Options, Option<String>)> + Send + 'static {
         let mut settings = self.st.settings.clone();
-        // A display that was unplugged falls back to the main one.
-        let count = crate::capture::screen::displays()
-            .map(|d| d.len())
-            .unwrap_or(0);
-        if count > 0 && settings.window.is_none() && settings.display > count {
-            let warning = format!(
-                "Display {} not connected; using display 1",
-                settings.display
-            );
-            settings.display = 1;
-            eprintln!("rec: warning: {warning}");
-            self.st.notice = Some((warning, Instant::now()));
-        }
         // REC_TEST_PATTERN: the CLI's synthetic source, for self-tests that
         // need no capture permission.
         let pattern = self.test_pattern || std::env::var_os("REC_TEST_PATTERN").is_some();
-        let mut o = session::options(
-            &settings,
-            output,
-            Some(self.st.live.clone()),
-            Some(self.tap_sink.clone()),
-            pattern,
-        )?;
-        // G10: composite on this window's device so the preview can draw the
-        // composited texture directly. The writer falls back to a device of its
-        // own (and to CPU preview frames) if this one cannot take it.
-        if let Some(g) = &self.gpu {
-            o.gpu = Some(crate::gpu::SharedGpu {
-                device: Arc::new(g.device.clone()),
-                queue: Arc::new(g.queue.clone()),
-                info: g.adapter.get_info(),
-            });
-            o.preview_gpu = Some(self.gpu_preview_sink.clone());
+        let output = output.map(std::path::Path::to_path_buf);
+        let live = self.st.live.clone();
+        let (sink, preview_gpu) =
+            publication.sinks(self.tap_sink.clone(), self.gpu_preview_sink.clone());
+        let gpu = self.gpu.as_ref().map(|g| crate::gpu::SharedGpu {
+            device: Arc::new(g.device.clone()),
+            queue: Arc::new(g.queue.clone()),
+            info: g.adapter.get_info(),
+        });
+        move || {
+            // Device enumeration, CLI preparation (which opens the picker), and
+            // Session::start all belong to the same serialized worker transaction.
+            let count = crate::capture::screen::displays()
+                .map(|d| d.len())
+                .unwrap_or(0);
+            let warning = if count > 0 && settings.window.is_none() && settings.display > count {
+                let warning = format!(
+                    "Display {} not connected; using display 1",
+                    settings.display
+                );
+                eprintln!("rec: warning: {warning}");
+                settings.display = 1;
+                Some(warning)
+            } else {
+                None
+            };
+            let mut o = session::options(
+                &settings,
+                output.as_deref(),
+                Some(live),
+                Some(sink),
+                pattern,
+            )?;
+            // G10: composite on this window's device so the preview can draw the
+            // composited texture directly. The writer falls back to a device of its
+            // own (and to CPU preview frames) if this one cannot take it.
+            o.gpu = gpu;
+            o.preview_gpu = Some(preview_gpu);
+            Ok((o, warning))
+        }
+    }
+
+    fn apply_options(&mut self, o: &record::Options, warning: Option<String>) {
+        if let Some(warning) = warning {
+            self.st.notice = Some((warning, Instant::now()));
         }
         // Fallbacks never block: say so once.
         let warning = o.mic_warning.clone();
@@ -1134,7 +1205,6 @@ impl App {
             self.st.mic_warned = warning;
         }
         self.st.mic_in_use = o.mic.clone();
-        Ok(o)
     }
 
     /// Whether the live encode needs a capture session (replay or stream).
@@ -1260,7 +1330,11 @@ impl App {
     fn sync_preview(&mut self) {
         self.check_preview_failure();
         // A taken session still owns its capture until the worker returns.
-        if self.quitting || self.preview_cleanup.is_some() || self.pending_recording {
+        if self.quitting
+            || self.preview_cleanup.is_some()
+            || self.pending_recording
+            || self.starting.is_some()
+        {
             return;
         }
         // The replay buffer and streams keep a session running while the
@@ -1289,28 +1363,99 @@ impl App {
         if want && self.st.preview.is_none() && self.st.error.is_none() {
             self.exclude_own_windows();
             let cam = self.st.spare_cam.take();
-            let r = self
-                .options(None)
-                .and_then(|o| Session::start_with_camera(&o, cam));
-            match r {
-                Ok(s) => {
-                    self.st.pip_applied = Some(self.st.settings.pip_spec());
-                    self.st.volumes_applied = Some(self.st.settings.volumes());
-                    if let Some(a) = s.cam_aspect() {
-                        self.st.cam_aspect = a;
-                    }
-                    self.st.preview = Some(s);
-                }
-                Err(e) => {
-                    self.st.error = Some(session::preview_error(&e));
-                }
+            let publication = preview::Publication::default();
+            let options = self.options(None, &publication);
+            let portal_cancel = crate::capture::screen::PortalCancel::default();
+            let worker_cancel = portal_cancel.clone();
+            if let Some(job) = startup::Job::spawn(
+                move || {
+                    crate::capture::screen::with_app_portal(&worker_cancel, || {
+                        let (o, warning) = options()?;
+                        let s = Session::start_with_camera(&o, cam)?;
+                        Ok((s, o, warning))
+                    })
+                },
+                discard_start,
+            ) {
+                self.starting = Some(Starting {
+                    job,
+                    publication,
+                    settings: self.st.settings.clone(),
+                    cancelled: false,
+                    portal_cancel,
+                    file: None,
+                });
+                self.st.starting = true;
             }
-            self.st.preview_settings = Some(self.st.settings.clone());
+        }
+    }
+
+    fn poll_start(&mut self, el: &ActiveEventLoop) {
+        let want = self.main_visible || self.live_wanted();
+        let Some(start) = &mut self.starting else {
+            return;
+        };
+        if start.settings.capture_key() != self.st.settings.capture_key()
+            || (start.file.is_none() && !want)
+        {
+            start.cancel();
+        }
+        // A queued recording can reuse the pending preview's portal selection.
+        // Do not dismiss the picker merely because Start was pressed again.
+        let ready = match start.job.poll() {
+            Ok(None) => return,
+            terminal => terminal,
+        };
+        let mut start = self.starting.take().unwrap();
+        self.st.starting = false;
+        if start.cancelled {
+            if let Ok(Some(ready)) = ready {
+                if start.file.is_some() {
+                    self.recording_start_cleanup.push(ready.discard());
+                }
+                // Idle preview cleanup may detach in Ready::drop.
+            }
+            if start.file.is_some() {
+                self.restore_after_recording(el);
+            }
+            return;
+        }
+        let result = match ready {
+            Ok(Some(ready)) => ready.accept(),
+            Err(e) => Err(anyhow::anyhow!(e)),
+            Ok(None) => unreachable!(),
+        };
+        if result.is_ok() {
+            start.publication.activate();
+            self.publication = Some(std::mem::take(&mut start.publication));
+        }
+        if let Some(file) = start.file.take() {
+            self.accept_recording(el, file, &start.settings, result);
+            return;
+        }
+        match result {
+            Ok((s, o, warning)) => {
+                self.apply_options(&o, warning);
+                self.st.mark_start_settings(&start.settings);
+                if let Some(a) = s.cam_aspect() {
+                    self.st.cam_aspect = a;
+                }
+                self.st.preview = Some(s);
+                self.st.preview_settings = Some(start.settings.clone());
+            }
+            Err(e) => self.st.error = Some(session::preview_error(&e)),
         }
     }
 
     fn toggle_recording(&mut self, el: &ActiveEventLoop) {
-        if self.preview_cleanup.is_some() || self.pending_recording {
+        if let Some(start) = &mut self.starting
+            && start.file.is_some()
+        {
+            start.cancel();
+            self.pending_recording = false;
+            return;
+        }
+        if self.preview_cleanup.is_some() || self.starting.is_some() || self.pending_recording {
             self.pending_recording = !self.pending_recording;
             return;
         }
@@ -1325,8 +1470,11 @@ impl App {
     }
 
     fn start_recording(&mut self, el: &ActiveEventLoop) {
+        if self.st.recording.is_some() || self.st.finishing || self.quitting {
+            return;
+        }
         self.check_preview_failure();
-        if self.preview_cleanup.is_some() {
+        if self.preview_cleanup.is_some() || self.starting.is_some() {
             self.pending_recording = true;
             return;
         }
@@ -1375,18 +1523,52 @@ impl App {
         // The capture reads the exclusion list when it opens, so the recording
         // (which replaces the preview's capture) gets the current windows.
         self.exclude_own_windows();
-        let r = std::fs::create_dir_all(&self.st.settings.output_dir)
-            .map_err(anyhow::Error::from)
-            .and_then(|_| self.options(Some(&file)))
-            .and_then(|o| Session::start_with_camera(&o, cam));
+        let publication = preview::Publication::default();
+        let options = self.options(Some(&file), &publication);
+        let dir = self.st.settings.output_dir.clone();
+        let portal_cancel = crate::capture::screen::PortalCancel::default();
+        let worker_cancel = portal_cancel.clone();
+        if let Some(job) = startup::Job::spawn(
+            move || {
+                crate::capture::screen::with_app_portal(&worker_cancel, || {
+                    std::fs::create_dir_all(dir)?;
+                    let (o, warning) = options()?;
+                    let s = Session::start_with_camera(&o, cam)?;
+                    Ok((s, o, warning))
+                })
+            },
+            discard_start,
+        ) {
+            self.starting = Some(Starting {
+                job,
+                publication,
+                settings: self.st.settings.clone(),
+                cancelled: false,
+                portal_cancel,
+                file: Some(file),
+            });
+            self.st.starting = true;
+        } else {
+            self.pending_recording = true;
+        }
+        let _ = el;
+    }
+
+    fn accept_recording(
+        &mut self,
+        el: &ActiveEventLoop,
+        file: std::path::PathBuf,
+        settings: &Settings,
+        r: Started,
+    ) {
         match r {
-            Ok(sess) => {
+            Ok((sess, o, warning)) => {
+                self.apply_options(&o, warning);
                 let _ = std::fs::write(
                     record::pidfile_path(),
                     format!("{}\n{}\n", std::process::id(), file.display()),
                 );
-                self.st.pip_applied = Some(self.st.settings.pip_spec());
-                self.st.volumes_applied = Some(self.st.settings.volumes());
+                self.st.mark_start_settings(settings);
                 if let Some(a) = sess.cam_aspect() {
                     self.st.cam_aspect = a;
                 }
@@ -1560,6 +1742,7 @@ impl App {
         let Some(mut sess) = self.st.recording.take() else {
             return;
         };
+        self.revoke_preview_publication();
         // The camera goes back to the preview once the file is finished.
         self.st.spare_cam = sess.take_camera();
         let file = sess.output.clone().unwrap_or_default();
@@ -1634,7 +1817,15 @@ impl App {
     /// Move preview teardown off winit: even healthy capture can block joining
     /// source threads or waiting on GPU work. The worker owns the entire session
     /// (no borrowed app/window state), so dropping its handle safely detaches it.
+    fn revoke_preview_publication(&mut self) {
+        self.publication.take();
+        self.tap.clear();
+        self.st.preview_frame = None;
+        self.st.preview_tex = None;
+    }
+
     fn finish_preview_async(&mut self) {
+        self.revoke_preview_publication();
         let Some(s) = self.st.preview.take() else {
             return;
         };
@@ -1644,6 +1835,27 @@ impl App {
             let _ = s.finish();
             wake();
         }));
+    }
+
+    fn poll_recording_start_cleanup(&mut self) {
+        let mut pending = Vec::new();
+        for worker in self.recording_start_cleanup.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                pending.push(worker);
+            }
+        }
+        self.recording_start_cleanup = pending;
+    }
+
+    /// Stop also cancels the pre-capture fence, before a Starting exists.
+    fn cancel_recording_start(&mut self) -> bool {
+        self.pending_recording = false;
+        if let Some(start) = &mut self.starting {
+            start.cancel();
+        }
+        self.capture_hide.take().is_some()
     }
 
     fn poll_preview_cleanup(&mut self) {
@@ -1664,11 +1876,19 @@ impl App {
             return;
         }
         self.quitting = true;
+        // Give a pending picker time to process cancellation / Request.Close,
+        // but preparation before Start (D-Bus, GPU, devices) can stall too.
+        self.preview_start_quit_deadline = Some(Instant::now() + Duration::from_secs(2));
         let debug = std::env::var_os("REC_DEBUG").is_some();
         if debug {
             eprintln!("rec: debug: quit: finalizing");
         }
         self.pending_recording = false;
+        self.revoke_preview_publication();
+        if let Some(start) = &mut self.starting {
+            start.cancel();
+        }
+        self.st.starting = false;
         self.capture_hide = None;
         self.stop_recording();
         self.finish_preview_async();
@@ -1676,6 +1896,32 @@ impl App {
         // teardown hold Quit hostage; the owning worker can outlive the app.
         self.preview_cleanup.take();
         self.poll_quit(el);
+    }
+
+    fn poll_quit_startup(&mut self, now: Instant) {
+        if let Some(start) = &self.starting {
+            match start.job.poll() {
+                Ok(None) => {
+                    if detach_preview_start_on_quit(
+                        start.file.is_some(),
+                        self.preview_start_quit_deadline,
+                        now,
+                    ) {
+                        // Dropping Starting cancels again; Job retains its lease
+                        // in the worker and discards any late session off-thread.
+                        self.starting.take();
+                    }
+                }
+                terminal => {
+                    let start = self.starting.take().unwrap();
+                    if let Ok(Some(ready)) = terminal
+                        && start.file.is_some()
+                    {
+                        self.recording_start_cleanup.push(ready.discard());
+                    }
+                }
+            }
+        }
     }
 
     /// Keep dispatching the desktop connection while a recording finalizes;
@@ -1692,7 +1938,12 @@ impl App {
                 eprintln!("rec: could not finish the recording: {e}");
             }
         }
-        if self.st.finishing {
+        // Request.Close alone is not enough: an unadopted recording can
+        // already own a file that still needs finalization.
+        self.poll_quit_startup(Instant::now());
+        self.poll_recording_start_cleanup();
+        if self.st.finishing || self.starting.is_some() || !self.recording_start_cleanup.is_empty()
+        {
             el.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(20),
             ));
@@ -1772,6 +2023,8 @@ impl App {
             return;
         }
         self.poll_preview_cleanup();
+        self.poll_recording_start_cleanup();
+        self.poll_start(el);
         // Commands in this tick must not synchronously retire a dead preview.
         self.check_preview_failure();
         self.poll_capture_hide(el);
@@ -1915,7 +2168,6 @@ impl App {
         for (m, l) in self.st.meters.iter_mut().zip(lv) {
             m.feed(l, dt);
         }
-        self.sync_preview();
         self.st.apply_pip();
         self.st.apply_volumes();
         // Tray.
@@ -1958,6 +2210,8 @@ impl App {
                 }
             }
         }
+        // Tray startup has now been dispatched independently of permission.
+        self.sync_preview();
         while let Ok(c) = self.recorder_rx.try_recv() {
             let cmd = match c {
                 Control::Stop if self.st.recording.is_some() => Cmd::ToggleRecording,
@@ -1977,7 +2231,13 @@ impl App {
                 Control::Show => Cmd::ShowWindow,
                 Control::Settings => Cmd::ShowSettings,
                 Control::StartRecording => {
-                    if self.preview_cleanup.is_some() || self.pending_recording {
+                    if self.starting.as_ref().is_some_and(|s| s.file.is_some()) {
+                        continue;
+                    }
+                    if self.preview_cleanup.is_some()
+                        || self.starting.is_some()
+                        || self.pending_recording
+                    {
                         self.pending_recording = true;
                         continue;
                     }
@@ -1990,7 +2250,9 @@ impl App {
                 Control::ToggleRecording => Cmd::ToggleRecording,
                 Control::Hide => Cmd::HideWindow,
                 Control::Stop => {
-                    self.pending_recording = false;
+                    if self.cancel_recording_start() {
+                        self.restore_after_recording(el);
+                    }
                     if self.st.recording.is_some() {
                         Cmd::ToggleRecording
                     } else {
@@ -2008,6 +2270,7 @@ impl App {
         // Process Stop/Quit already queued before fulfilling a deferred Start.
         if !self.exit_if_requested(el)
             && self.preview_cleanup.is_none()
+            && self.starting.is_none()
             && std::mem::take(&mut self.pending_recording)
         {
             self.start_recording(el);
@@ -2394,6 +2657,8 @@ impl Drop for App {
         // Idempotent: `quit` already closed them; this covers a panic path, and
         // keeps the windows (which were created from the device) ahead of the
         // GPU instance in the drop order.
+        self.revoke_preview_publication();
+        self.starting.take();
         self.close_windows();
     }
 }
@@ -2492,6 +2757,114 @@ pub fn run(
 mod tests {
     use super::*;
 
+    #[test]
+    fn quit_bounds_preview_startup_but_gives_picker_time_to_close() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(2);
+        assert!(!detach_preview_start_on_quit(false, None, now));
+        assert!(!detach_preview_start_on_quit(false, Some(deadline), now));
+        assert!(!detach_preview_start_on_quit(
+            false,
+            Some(deadline),
+            deadline - Duration::from_nanos(1)
+        ));
+        assert!(detach_preview_start_on_quit(
+            false,
+            Some(deadline),
+            deadline
+        ));
+        assert!(detach_preview_start_on_quit(
+            false,
+            Some(deadline),
+            deadline + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn quit_never_detaches_recording_startup_after_preview_deadline() {
+        let deadline = Instant::now();
+        for now in [deadline, deadline + Duration::from_secs(3600)] {
+            assert!(!detach_preview_start_on_quit(true, Some(deadline), now));
+        }
+    }
+
+    #[test]
+    fn quit_polls_stalled_startup_without_blocking_then_detaches_only_preview() {
+        for recording in [true, false] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let mut app = App::new(false, false, None, true, rx, None);
+            let (release, wait) = std::sync::mpsc::channel();
+            let job = startup::Job::spawn(
+                move || {
+                    wait.recv().unwrap();
+                    Err(anyhow::anyhow!("test startup cancelled"))
+                },
+                discard_start,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            app.preview_start_quit_deadline = Some(deadline);
+            app.starting = Some(Starting {
+                job,
+                publication: preview::Publication::default(),
+                settings: app.st.settings.clone(),
+                cancelled: false,
+                portal_cancel: Default::default(),
+                file: recording.then(PathBuf::new),
+            });
+            app.starting.as_mut().unwrap().cancel();
+            app.poll_quit_startup(deadline - Duration::from_millis(1));
+            assert!(
+                app.starting.is_some(),
+                "allow Request.Close before detaching"
+            );
+            app.poll_quit_startup(deadline);
+            assert_eq!(app.starting.is_some(), recording);
+            release.send(()).unwrap();
+            if recording {
+                let timeout = Instant::now() + Duration::from_secs(5);
+                while app.starting.is_some() {
+                    app.poll_quit_startup(deadline);
+                    assert!(Instant::now() < timeout);
+                    std::thread::yield_now();
+                }
+                for cleanup in app.recording_start_cleanup.drain(..) {
+                    cleanup.join().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_applied_settings_are_the_worker_snapshot() {
+        let snapshot = Settings::default();
+        let mut state = State::new(snapshot.clone());
+        state.settings.mic_muted = true;
+        state.settings.system_muted = true;
+        state.settings.pip_size += 0.1;
+        state.mark_start_settings(&snapshot);
+        assert_eq!(state.pip_applied, Some(snapshot.pip_spec()));
+        assert_eq!(state.volumes_applied, Some(snapshot.volumes()));
+        assert_ne!(state.pip_applied, Some(state.settings.pip_spec()));
+        assert_ne!(state.volumes_applied, Some(state.settings.volumes()));
+    }
+
+    #[test]
+    fn stop_cancels_pre_capture_fence_and_deferred_start() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(false, false, None, true, rx, None);
+        app.pending_recording = true;
+        app.capture_hide = Some(CaptureHide {
+            windows: Vec::new(),
+            sync: None,
+            deadline: Instant::now() + Duration::from_secs(5),
+        });
+        assert!(app.cancel_recording_start()); // caller restores hidden window
+        assert!(!app.pending_recording);
+        assert!(app.capture_hide.is_none()); // later polling cannot open capture
+        assert!(!app.cancel_recording_start()); // repeated Stop is harmless
+    }
+
     /// Run alone under Xvfb. A pending SIGTERM must beat a queued redraw even
     /// if the desktop has already destroyed the XID. Also exercise quit while
     /// the asynchronous finalizer owns the recording, and commands after Quit.
@@ -2524,7 +2897,6 @@ mod tests {
 
                 // Model a Stop already in progress. Quit must wait for this
                 // worker, not just for st.recording (which is already None).
-                self.app.st.finishing = true;
                 let finished = self.app.finished.clone();
                 let (finish_recording, wait_recording) = std::sync::mpsc::channel();
                 let worker = std::thread::spawn(move || {
@@ -2555,6 +2927,7 @@ mod tests {
                 self.app.st.error = None; // A dismissed banner cannot restart yet.
                 self.app.sync_preview();
                 assert!(self.app.st.preview.is_none());
+                self.app.st.finishing = true;
                 on_sigterm(libc::SIGTERM);
                 self.app.window_event(el, id, WindowEvent::RedrawRequested);
                 assert!(self.app.quitting);
@@ -2563,10 +2936,27 @@ mod tests {
                 assert!(self.app.st.finishing);
                 assert!(!el.exiting()); // recording finalization is still mandatory
                 let quit_started = Instant::now();
+                // A cancelled startup may have completed before Quit. Its
+                // retained finalizer must also finish before process exit.
+                let (release_start_cleanup, wait_start_cleanup) = std::sync::mpsc::channel();
+                self.app
+                    .recording_start_cleanup
+                    .push(std::thread::spawn(move || {
+                        wait_start_cleanup.recv().unwrap();
+                    }));
                 finish_recording.send(()).unwrap();
                 worker.join().unwrap();
                 self.app.poll_quit(el);
                 assert!(!self.app.st.finishing);
+                assert!(!el.exiting());
+                release_start_cleanup.send(()).unwrap();
+                self.app
+                    .recording_start_cleanup
+                    .pop()
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                self.app.poll_quit(el);
                 assert!(el.exiting());
                 assert!(quit_started.elapsed() < Duration::from_secs(1));
                 // Keep the preview worker blocked beyond the old 2s timeout.
