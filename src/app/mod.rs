@@ -956,6 +956,9 @@ impl App {
     }
 
     fn show_main(&mut self, el: &ActiveEventLoop) {
+        if self.exit_if_requested(el) {
+            return;
+        }
         if self.main.is_none() {
             // REC_MAIN_SIZE=WxH or full overrides the remembered size (layout
             // checks and screenshots). A window destroyed on hide reopens where
@@ -1063,6 +1066,9 @@ impl App {
     }
 
     fn show_settings(&mut self, el: &ActiveEventLoop) {
+        if self.exit_if_requested(el) {
+            return;
+        }
         if self.settings_win.is_none() {
             let w = self.open_window(el, "Rec Settings", (520.0, 820.0), (460.0, 480.0));
             self.settings_win = Some(w);
@@ -1624,6 +1630,9 @@ impl App {
     }
 
     fn handle(&mut self, el: &ActiveEventLoop, c: Cmd) {
+        if self.exit_if_requested(el) {
+            return;
+        }
         // Reopening a window during the fence would invalidate the exclusion.
         // Treat an explicit show request as cancellation of the pending start.
         if matches!(c, Cmd::ShowWindow | Cmd::ShowSettings) && self.capture_hide.is_some() {
@@ -1661,17 +1670,28 @@ impl App {
         }
     }
 
+    /// Check before touching any windows, not just on the periodic tick:
+    /// a queued redraw can precede that tick during desktop/session teardown.
+    /// Keep SIG_QUIT latched, including while a recording finishes; subsequent
+    /// commands must never recreate a window after quit has closed it.
+    fn exit_if_requested(&mut self, el: &ActiveEventLoop) -> bool {
+        if self.quitting {
+            return true;
+        }
+        if SIG_QUIT.load(Ordering::SeqCst) {
+            self.quit(el);
+            return true;
+        }
+        false
+    }
+
     /// Periodic work: commands, signals, finished recordings, failures, tray,
     /// meters.
     fn tick(&mut self, el: &ActiveEventLoop) {
+        if self.exit_if_requested(el) {
+            return;
+        }
         self.poll_capture_hide(el);
-        if self.quitting {
-            return;
-        }
-        if SIG_QUIT.swap(false, Ordering::SeqCst) {
-            self.quit(el);
-            return;
-        }
         if SIG_STOP.swap(false, Ordering::SeqCst) && self.st.recording.is_some() {
             self.stop_recording();
         }
@@ -1692,6 +1712,9 @@ impl App {
         let ui_cmds = std::mem::take(&mut self.st.cmds);
         for c in cmds.into_iter().chain(ui_cmds) {
             self.handle(el, c);
+            if self.exit_if_requested(el) {
+                return;
+            }
         }
         let done = self.finished.lock().unwrap().take();
         if let Some((file, r)) = done {
@@ -1902,7 +1925,7 @@ impl App {
     }
 
     fn redraw(&mut self, which: WindowId) {
-        if self.quitting || self.screen_locked {
+        if self.quitting || SIG_QUIT.load(Ordering::SeqCst) || self.screen_locked {
             return;
         }
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == which);
@@ -1971,6 +1994,12 @@ impl App {
             self.settings_win.as_mut()
         };
         let Some(win) = win else { return };
+        // The signal may have arrived while preparing the preview. In winit's
+        // X11 backend take_egui_input queries GetGeometry with an unwrap; don't
+        // make that query on a window the desktop may already be tearing down.
+        if SIG_QUIT.load(Ordering::SeqCst) {
+            return;
+        }
         let input = win.egui.take_egui_input(&win.window);
         let st = &mut self.st;
         let out = win.ctx.run_ui(input, |ui| {
@@ -2060,6 +2089,9 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.exit_if_requested(el) {
+            return;
+        }
         use winit::platform::wayland::ActiveEventLoopExtWayland;
         WAYLAND.store(el.is_wayland(), Ordering::Relaxed);
         if self.main.is_some() {
@@ -2108,6 +2140,9 @@ impl ApplicationHandler for App {
             return;
         }
         self.tick(el);
+        if self.exit_if_requested(el) {
+            return;
+        }
         if let Some(w) = &self.main
             && self.main_visible
             && !w.occluded
@@ -2121,10 +2156,28 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if matches!(event, WindowEvent::Destroyed)
-            && let Some(hide) = &mut self.capture_hide
-        {
-            hide.destroyed(id);
+        if self.exit_if_requested(el) {
+            return;
+        }
+        if matches!(event, WindowEvent::Destroyed) {
+            if let Some(hide) = &mut self.capture_hide {
+                hide.destroyed(id);
+            }
+            // A desktop can destroy an X11 window independently of us. Never
+            // forward this event (or later queued events) to egui for that XID.
+            if self.main.as_ref().is_some_and(|w| w.window.id() == id) {
+                self.main = None;
+                self.main_visible = false;
+                self.update_tap_wanted();
+            }
+            if self
+                .settings_win
+                .as_ref()
+                .is_some_and(|w| w.window.id() == id)
+            {
+                self.settings_win = None;
+            }
+            return;
         }
         let is_main = self.main.as_ref().is_some_and(|w| w.window.id() == id);
         let win = if is_main {
@@ -2132,7 +2185,9 @@ impl ApplicationHandler for App {
         } else {
             self.settings_win.as_mut()
         };
-        let Some(win) = win else { return };
+        let Some(win) = win.filter(|w| w.window.id() == id) else {
+            return;
+        };
         let resp = win.egui.on_window_event(&win.window, &event);
         match event {
             WindowEvent::CloseRequested => {
@@ -2182,13 +2237,16 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if self.quitting {
+        if self.exit_if_requested(el) {
             el.exit();
             return;
         }
         if self.last_tick.elapsed() >= Duration::from_millis(100) {
             self.last_tick = Instant::now();
             self.tick(el);
+        }
+        if self.exit_if_requested(el) {
+            return;
         }
         // Animate while capturing (preview, meters, timer); otherwise idle
         // with a slow tick for signals and the control socket.
@@ -2335,6 +2393,79 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run alone under Xvfb. A pending SIGTERM must beat a queued redraw even
+    /// if the desktop has already destroyed the XID. Also exercise quit while
+    /// the asynchronous finalizer owns the recording, and commands after Quit.
+    #[test]
+    #[ignore = "requires X11, software Vulkan and an isolated session"]
+    fn sigterm_preempts_destroyed_x11_redraw_and_waits_for_finalizer() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt;
+
+        struct Check {
+            app: App,
+            checked: bool,
+        }
+        impl ApplicationHandler for Check {
+            fn resumed(&mut self, el: &ActiveEventLoop) {
+                self.app.resumed(el);
+                let win = self.app.main.as_ref().expect("main window");
+                let id = win.window.id();
+                let RawWindowHandle::Xlib(handle) = win.window.window_handle().unwrap().as_raw()
+                else {
+                    panic!("expected Xlib window");
+                };
+                let (conn, _) = x11rb::connect(None).unwrap();
+                conn.destroy_window(handle.window as u32)
+                    .unwrap()
+                    .check()
+                    .unwrap();
+                conn.flush().unwrap();
+
+                // Model a Stop already in progress. Quit must wait for this
+                // worker, not just for st.recording (which is already None).
+                self.app.st.finishing = true;
+                let finished = self.app.finished.clone();
+                let worker = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    *finished.lock().unwrap() =
+                        Some((PathBuf::new(), Err("test finalizer".into())));
+                });
+                on_sigterm(libc::SIGTERM);
+                self.app.window_event(el, id, WindowEvent::RedrawRequested);
+                assert!(self.app.quitting);
+                assert!(self.app.finished.lock().unwrap().is_some());
+                worker.join().unwrap();
+                // Neither a command later in the batch nor late events may
+                // recreate windows or enter egui after synchronous finalizing.
+                self.app.handle(el, Cmd::ShowWindow);
+                self.app.handle(el, Cmd::ShowSettings);
+                self.app.user_event(el, ());
+                self.app.about_to_wait(el);
+                assert!(self.app.main.is_none());
+                assert!(self.app.settings_win.is_none());
+                assert!(SIG_QUIT.load(Ordering::SeqCst));
+                self.checked = true;
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+        SIG_QUIT.store(false, Ordering::SeqCst);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut check = Check {
+            app: App::new(false, false, None, true, rx, None),
+            checked: false,
+        };
+        let el = EventLoop::<()>::with_user_event()
+            .with_x11()
+            .with_any_thread(true)
+            .build()
+            .unwrap();
+        el.run_app(&mut check).unwrap();
+        assert!(check.checked);
+        SIG_QUIT.store(false, Ordering::SeqCst);
+    }
 
     /// Run under headless sway with WAYLAND_DISPLAY set. Exercises the real
     /// winit deferred drop and the libwayland callback ABI, not presentation.
