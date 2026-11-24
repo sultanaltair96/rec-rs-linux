@@ -3025,11 +3025,12 @@ mod tests {
                 vec![i as u8; 32],
             ))
         };
+        let mut drops = 0;
         for i in 0..12 {
             q.push_back((i as f64, frame(i)));
             // Emission is at frame 2: nothing newer than 2.5 may become current.
             // Four 4x2 BGRA frames: the cap is expressed in bytes.
-            Writer::cap(&mut q, &mut last, 4 * 32, 2.5);
+            drops += Writer::cap(&mut q, &mut last, 4 * 32, 2.5);
         }
         assert_eq!(
             last.as_ref().unwrap().pts,
@@ -3037,6 +3038,7 @@ mod tests {
             "current frame stays due, later ones are skipped"
         );
         assert_eq!(q.len(), 4);
+        assert_eq!(drops, 6, "forced byte-budget evictions are counted");
     }
 
     #[test]
