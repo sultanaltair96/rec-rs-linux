@@ -548,27 +548,53 @@ pub fn read(path: &Path) -> Result<MovieInfo> {
         // and presentation start from the fragment headers so `probe` reports
         // the real movie (a crash-left file is as long as its samples).
         let mut per_track: HashMap<u32, Vec<Sample>> = HashMap::new();
-        let mut firsts: HashMap<u32, u64> = HashMap::new();
+        let mut firsts: HashMap<u32, FragmentClock> = HashMap::new();
+        let mut ends: HashMap<u32, u64> = HashMap::new();
         for b in boxes.iter().filter(|b| b.kind == MOOF) {
             let buf = read_at(&mut file, b.start, b.size)?;
             for (tid, decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
+                if samples.is_empty() {
+                    continue;
+                }
+                // Probe describes the fragmented timeline, not a proposed stts
+                // rewrite. External muxers (e.g. MediaMTX) can emit overlapping
+                // decode ranges: count every packet but measure the timeline's
+                // extent instead of rejecting it or summing overlapping time.
+                // Keep the preceding fragment's end separately from the maximum
+                // end, since an absent tfdt continues that preceding fragment.
+                let clock = firsts.entry(tid).or_insert_with(|| {
+                    let first = decode_time.unwrap_or(0);
+                    FragmentClock { first, end: first }
+                });
+                let start = decode_time.unwrap_or(clock.end);
+                clock.first = clock.first.min(start);
+                clock.end = start
+                    .checked_add(media_duration(&samples))
+                    .context("track decode time overflow")?;
+                ends.entry(tid)
+                    .and_modify(|end| *end = (*end).max(clock.end))
+                    .or_insert(clock.end);
                 per_track.entry(tid).or_default().extend(samples);
-                firsts
-                    .entry(tid)
-                    .and_modify(|f| *f = (*f).min(decode_time))
-                    .or_insert(decode_time);
             }
         }
         for t in tracks.iter_mut() {
             let Some(samples) = per_track.get(&t.track_id) else {
                 continue;
             };
-            let samples = sane_durations(samples, t.timescale);
+            let samples = if t.handler == Handler::Audio {
+                sane_durations(samples, t.timescale)
+            } else {
+                samples.to_vec()
+            };
             t.samples = samples.len() as u64;
             t.bytes = samples.iter().map(|s| s.size as u64).sum();
-            t.duration = media_duration(&samples);
-            t.first_pts =
-                firsts.get(&t.track_id).copied().unwrap_or(0) as f64 / t.timescale.max(1) as f64;
+            t.duration = if t.handler == Handler::Video {
+                ends[&t.track_id] - firsts[&t.track_id].first
+            } else {
+                media_duration(&samples)
+            };
+            t.first_pts = firsts.get(&t.track_id).map_or(0, |clock| clock.first) as f64
+                / t.timescale.max(1) as f64;
             let mut durations: HashMap<u32, u32> = HashMap::new();
             for s in &samples {
                 *durations.entry(s.duration).or_default() += 1;
@@ -606,6 +632,9 @@ struct Sample {
     sync: bool,
 }
 
+/// Track id, optional base decode time, and samples of a single `traf`.
+type TrackFragment = (u32, Option<u64>, Vec<Sample>);
+
 /// Samples of every track in one `moof`, in decode order.
 ///
 /// `moof_offset` is the box's absolute offset in the file: the base for a
@@ -615,12 +644,12 @@ fn parse_moof(
     buf: &[u8],
     moof_offset: u64,
     trex: &HashMap<u32, Trex>,
-) -> Result<Vec<(u32, u64, Vec<Sample>)>> {
+) -> Result<Vec<TrackFragment>> {
     if buf.len() < 8 || &buf[4..8] != b"moof" {
         bail!("not a moof box");
     }
     let kids = children(buf, 8, buf.len())?;
-    let mut out: Vec<(u32, u64, Vec<Sample>)> = vec![];
+    let mut out = vec![];
     // Base offset for a traf without `base_data_offset`: the end of the
     // previous traf's data (ISO 14496-12 §8.8.7).
     let mut running_base = moof_offset;
@@ -659,15 +688,16 @@ fn parse_moof(
         }
         // The fragment's decode time (the track's presentation start in a
         // fragmented movie).
-        let mut decode_time = 0u64;
-        if let Some(dt) = find(&tk, b"tfdt") {
+        let decode_time = if let Some(dt) = find(&tk, b"tfdt") {
             let b = slice(traf, dt);
-            decode_time = if b[8] == 1 {
+            Some(if b[8] == 1 {
                 be64(b, 12)?
             } else {
                 be32(b, 12)? as u64
-            };
-        }
+            })
+        } else {
+            None
+        };
         let mut samples: Vec<Sample> = vec![];
         let mut data_end = base;
         for trun_ref in tk.iter().filter(|b| &b.kind == b"trun") {
@@ -739,11 +769,9 @@ fn parse_moof(
             data_end = offset;
         }
         running_base = data_end;
-        if let Some((_, _, list)) = out.iter_mut().find(|(id, _, _)| *id == track_id) {
-            list.extend(samples);
-        } else {
-            out.push((track_id, decode_time, samples));
-        }
+        // Keep each traf's boundary, even when a moof contains multiple
+        // trafs for the same track: each can have its own tfdt.
+        out.push((track_id, decode_time, samples));
     }
     Ok(out)
 }
@@ -776,7 +804,58 @@ struct Tables {
     co64: bool,
 }
 
-/// Repair a fragment's sample durations.
+#[derive(Clone, Copy)]
+struct FragmentClock {
+    first: u64,
+    end: u64,
+}
+
+/// Append a fragment without losing video decode-time gaps at its boundary.
+///
+/// Sample tables start at zero, relative to the first fragment's decode time.
+/// A later tfdt can leave a hole not represented in the preceding trun: hold
+/// its last frame across that hole rather than shifting every following PTS.
+/// Missing tfdt means continuation, not an explicit reset to zero. Audio is
+/// deliberately left to its separate qtmux duration repair. This is only for
+/// finalization: unlike a probe, regular sample tables cannot represent
+/// overlapping fragment decode ranges without changing packet timestamps.
+fn append_fragment(
+    timeline: &mut Vec<Sample>,
+    firsts: &mut HashMap<u32, FragmentClock>,
+    track_id: u32,
+    decode_time: Option<u64>,
+    samples: Vec<Sample>,
+    video: bool,
+) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let clock = firsts.entry(track_id).or_insert_with(|| {
+        let first = decode_time.unwrap_or(0);
+        FragmentClock { first, end: first }
+    });
+    if video
+        && !timeline.is_empty()
+        && let Some(time) = decode_time
+    {
+        let expected = clock.end;
+        if time < expected {
+            bail!("video track {track_id} has overlapping fragment decode times");
+        }
+        let last = timeline.last_mut().unwrap();
+        last.duration = u32::try_from(last.duration as u64 + time - expected)
+            .context("video fragment gap exceeds sample duration range")?;
+        clock.end = time;
+    }
+    clock.end = clock
+        .end
+        .checked_add(media_duration(&samples))
+        .context("track decode time overflow")?;
+    timeline.extend(samples);
+    Ok(())
+}
+
+/// Repair an audio track's sample durations.
 ///
 /// qtmux re-times audio buffers whose duration it considers wrong
 /// (`max-raw-audio-drift`): a real PipeWire mic delivers 1024/2048-frame
@@ -897,7 +976,7 @@ fn extend_last_sample(samples: &mut [Sample], end: u64) {
         .map(|s| s.duration as u64)
         .sum();
     if let Some(last) = samples.last_mut()
-        && end > start
+        && end > start + last.duration as u64
     {
         last.duration = (end - start).min(u32::MAX as u64) as u32;
     }
@@ -1222,7 +1301,8 @@ fn kill_now() -> ! {
 ///
 /// `layout.audio_priming` and `layout.default_audio` are in moov audio order.
 /// A track's priming is given in samples at 48 kHz and scaled to the track's
-/// own timescale here.
+/// own timescale here. `video_end` caps audio presentation (after priming),
+/// without trimming AAC samples or extending audio tracks that end earlier.
 ///
 /// `keep` copies the file before the append, so a test can compare the
 /// fragmented and finalised forms of the same recording.
@@ -1247,10 +1327,22 @@ pub fn finalize(
     // Samples per track id, in fragment order.
     let mut per_track: HashMap<u32, Vec<Sample>> = HashMap::new();
     if defragmented {
+        let mut firsts = HashMap::new();
         for b in boxes.iter().filter(|b| b.kind == MOOF) {
             let buf = read_at(&mut file, b.start, b.size)?;
-            for (id, _decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
-                per_track.entry(id).or_default().extend(samples);
+            for (id, decode_time, samples) in parse_moof(&buf, b.start, &init.trex)? {
+                let video = init
+                    .tracks
+                    .iter()
+                    .any(|t| t.info.track_id == id && t.info.handler == Handler::Video);
+                append_fragment(
+                    per_track.entry(id).or_default(),
+                    &mut firsts,
+                    id,
+                    decode_time,
+                    samples,
+                    video,
+                )?;
             }
         }
     }
@@ -1264,7 +1356,11 @@ pub fn finalize(
         let samples = per_track.get(&t.info.track_id);
         let media_duration = match samples {
             Some(samples) => {
-                let mut samples = sane_durations(samples, t.info.timescale);
+                let mut samples = if t.info.handler == Handler::Audio {
+                    sane_durations(samples, t.info.timescale)
+                } else {
+                    samples.to_vec()
+                };
                 if t.info.handler == Handler::Video
                     && let Some(end) = video_end
                 {
@@ -1287,7 +1383,6 @@ pub fn finalize(
         plan.media_duration = Some(media_duration);
         let tkhd_duration = scale(media_duration, t.info.timescale, init.movie_timescale);
         plan.tkhd_duration = Some(tkhd_duration);
-        track_durations.push(tkhd_duration);
 
         if t.info.handler == Handler::Audio {
             let index = audio_seen;
@@ -1301,21 +1396,29 @@ pub fn finalize(
                 plan.tkhd_flags = Some(if index == default { 0x7 } else { 0x6 });
             }
             let priming_48k = layout.audio_priming.get(index).copied().unwrap_or(0);
-            if priming_48k > 0 && t.info.timescale > 0 {
-                let priming = scale(priming_48k, 48_000, t.info.timescale);
-                if priming < media_duration {
-                    let shown = scale(
-                        media_duration - priming,
-                        t.info.timescale,
-                        init.movie_timescale,
-                    );
-                    plan.edits = Some(vec![Edit {
-                        segment_duration: shown,
-                        media_time: priming as i64,
-                    }]);
-                }
+            let priming = scale(priming_48k, 48_000, t.info.timescale);
+            // Keep the existing priming policy for empty/too-short media.
+            let priming = if priming < media_duration { priming } else { 0 };
+            let shown = scale(
+                media_duration - priming,
+                t.info.timescale,
+                init.movie_timescale,
+            );
+            let capped = video_end
+                .map(|end| (end.max(0.0) * init.movie_timescale as f64).round() as u64)
+                .map_or(shown, |end| shown.min(end));
+            // Even with zero priming an edit is needed to hide the tail of
+            // the AAC frame crossing the take end. Leave media duration and
+            // sample tables intact so that frame remains decodable.
+            if priming > 0 || capped < shown {
+                plan.edits = Some(vec![Edit {
+                    segment_duration: capped,
+                    media_time: priming as i64,
+                }]);
+                plan.tkhd_duration = Some(capped);
             }
         }
+        track_durations.push(plan.tkhd_duration.unwrap_or(tkhd_duration));
         plans.push(plan);
     }
     let movie_duration = track_durations.iter().copied().max().unwrap_or(0);

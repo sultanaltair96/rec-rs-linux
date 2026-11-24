@@ -76,27 +76,32 @@ impl Decoded {
 /// but not by more than this.
 const TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// A track's presentation span: `(start, duration)` in seconds, with the
-/// edit list's skipped priming subtracted from the duration.
-fn track_span(t: &mp4::TrackInfo) -> (f64, f64) {
+/// A track's presentation span: `(start, duration)` in seconds. The media
+/// bounds exclude priming, while the edit's movie-timescale duration can also
+/// trim encoder padding at the end.
+fn track_span(t: &mp4::TrackInfo, movie: &mp4::MovieInfo) -> (f64, f64) {
     let ts = t.timescale.max(1) as f64;
-    let priming = t
-        .edits
-        .iter()
-        .find(|e| e.media_time > 0)
-        .map(|e| e.media_time as f64 / ts)
-        .unwrap_or(0.0);
-    (t.first_pts, (t.duration as f64 / ts - priming).max(0.0))
+    let edit = t.edits.iter().find(|e| e.media_time >= 0);
+    let priming = edit.map(|e| e.media_time as f64 / ts).unwrap_or(0.0);
+    let available = (t.duration as f64 / ts - priming).max(0.0);
+    let duration = edit
+        // An init moov can have a zero-duration placeholder edit: the
+        // fragments, not that placeholder, determine a crash-left file's span.
+        .filter(|e| movie.movie_timescale > 0 && (e.segment_duration > 0 || !movie.fragmented))
+        .map(|e| available.min(e.segment_duration as f64 / movie.movie_timescale as f64))
+        .unwrap_or(available);
+    (t.first_pts, duration)
 }
 
 /// The asset's duration: the end of its longest track, like
 /// `AVURLAsset.duration` upstream (a dropped-slot file's audio can run one
 /// buffer past the video, and ffprobe reports that longer figure too).
-fn movie_duration(tracks: &[mp4::TrackInfo]) -> f64 {
-    tracks
+fn movie_duration(movie: &mp4::MovieInfo) -> f64 {
+    movie
+        .tracks
         .iter()
         .map(|t| {
-            let (start, dur) = track_span(t);
+            let (start, dur) = track_span(t, movie);
             start + dur
         })
         .fold(0.0, f64::max)
@@ -140,7 +145,8 @@ pub fn probe(file: &Path) -> Result<()> {
     // The duration comes from the real samples, not the muxer's declared
     // movie duration: a crash-left fragmented file is as long as its fragments
     // (4.000 s, not 1.984 s), and a finalised file must not count the AAC
-    // priming that its edit list skips (2.000/2.006 s, not 2.049 s).
+    // priming or trailing padding that its edit list skips. Edit durations
+    // are bounds in movie units, not media units.
     // The demuxer's duration is the last resort; the mp4 tables are the truth.
     let fallback = if movie.movie_timescale > 0 && movie.duration > 0 {
         movie.duration as f64 / movie.movie_timescale as f64
@@ -149,7 +155,7 @@ pub fn probe(file: &Path) -> Result<()> {
     };
     // The asset's duration is its longest track's end (AVURLAsset.duration),
     // not the first video track's: a dropped slot can leave audio longer.
-    let media_secs = match movie_duration(&movie.tracks) {
+    let media_secs = match movie_duration(&movie) {
         d if d > 0.0 => d,
         _ => fallback,
     };
@@ -164,7 +170,7 @@ pub fn probe(file: &Path) -> Result<()> {
     );
     for (i, s) in streams.iter().enumerate() {
         let t = movie.tracks.get(i);
-        let (start, dur) = t.map(track_span).unwrap_or((0.0, fallback));
+        let (start, dur) = t.map(|t| track_span(t, &movie)).unwrap_or((0.0, fallback));
         let kbps = t
             .filter(|_| dur > 0.0)
             .map(|t| t.bytes as f64 * 8.0 / dur / 1000.0)
@@ -506,6 +512,110 @@ mod tests {
         }
     }
 
+    fn movie(
+        tracks: Vec<mp4::TrackInfo>,
+        movie_timescale: u32,
+        fragmented: bool,
+    ) -> mp4::MovieInfo {
+        mp4::MovieInfo {
+            movie_timescale,
+            duration: 0,
+            fragmented,
+            tracks,
+        }
+    }
+
+    #[test]
+    fn edit_duration_trims_padding_in_movie_not_media_units() {
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            98_304,
+            vec![Edit {
+                segment_duration: 2_000,
+                media_time: 1024,
+            }],
+        );
+        let movie = movie(vec![audio], 1000, false);
+        assert_eq!(track_span(&movie.tracks[0], &movie), (0.0, 2.0));
+        assert_eq!(movie_duration(&movie), 2.0);
+    }
+
+    #[test]
+    fn zero_media_time_edits_also_trim_padding() {
+        let video = track(
+            Handler::Video,
+            90_000,
+            270_000,
+            vec![Edit {
+                segment_duration: 2_000,
+                media_time: 0,
+            }],
+        );
+        assert_eq!(movie_duration(&movie(vec![video], 1000, false)), 2.0);
+    }
+
+    #[test]
+    fn edits_cannot_extend_beyond_available_media() {
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            96_000,
+            vec![Edit {
+                segment_duration: 10_000,
+                media_time: 48_000,
+            }],
+        );
+        assert_eq!(movie_duration(&movie(vec![audio], 1000, false)), 1.0);
+    }
+
+    #[test]
+    fn fragmented_placeholder_edits_do_not_hide_fragments() {
+        for edits in [
+            vec![],
+            vec![Edit {
+                segment_duration: 0,
+                media_time: 0,
+            }],
+        ] {
+            let mut video = track(Handler::Video, 90_000, 360_000, edits);
+            video.first_pts = 1.0;
+            let mut movie = movie(vec![video], 1000, true);
+            movie.duration = 1984; // Stale init duration must not limit fragments.
+            assert_eq!(track_span(&movie.tracks[0], &movie), (1.0, 4.0));
+            assert_eq!(movie_duration(&movie), 5.0);
+        }
+    }
+
+    #[test]
+    fn fragmented_nonzero_edit_still_bounds_presentation() {
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            193_024,
+            vec![Edit {
+                segment_duration: 3_000,
+                media_time: 1024,
+            }],
+        );
+        assert_eq!(movie_duration(&movie(vec![audio], 1000, true)), 3.0);
+    }
+
+    #[test]
+    fn unknown_movie_timescale_does_not_invent_an_edit_bound() {
+        let audio = track(
+            Handler::Audio,
+            48_000,
+            97_024,
+            vec![Edit {
+                segment_duration: 1,
+                media_time: 1024,
+            }],
+        );
+        let duration = movie_duration(&movie(vec![audio], 0, false));
+        assert!((duration - 2.0).abs() < 1e-9, "{duration}");
+    }
+
     #[test]
     fn the_asset_duration_is_the_longest_track() {
         // A 2 s video with dropped slots leaves the audio one buffer longer
@@ -520,7 +630,7 @@ mod tests {
                 media_time: 1024,
             }],
         );
-        let d = movie_duration(&[video, audio]);
+        let d = movie_duration(&movie(vec![video, audio], 48_000, false));
         let expected = (103_000.0 - 1024.0) / 48_000.0;
         assert!((d - expected).abs() < 1e-9, "{d} != {expected}");
         assert!(d > 2.0);
@@ -537,7 +647,7 @@ mod tests {
                 media_time: 2048,
             }],
         );
-        let d = movie_duration(&[audio]);
+        let d = movie_duration(&movie(vec![audio], 48_000, false));
         assert!((d - (96_000.0 - 2048.0) / 48_000.0).abs() < 1e-9, "{d}");
     }
 }
