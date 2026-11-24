@@ -699,8 +699,8 @@ struct App {
     main: Option<Win>,
     settings_win: Option<Win>,
     main_visible: bool,
-    /// Quit is in progress: the windows are gone and the loop is ending, so no
-    /// event may touch them.
+    /// Quit is in progress: dispatch teardown completions only, never touch
+    /// windows or start another capture session.
     quitting: bool,
     /// The main window was hidden for the running recording (G3): a capture
     /// that cannot exclude Rec's window would film it. Restored on stop.
@@ -748,6 +748,10 @@ struct App {
     start_recording: bool,
     test_pattern: bool,
     finished: Arc<Mutex<Option<Finished>>>,
+    /// Preview teardown is not recording finalization: it must not publish a
+    /// file, remove the recorder pidfile/socket, or restore hidden windows.
+    preview_cleanup: Option<std::thread::JoinHandle<()>>,
+    pending_recording: bool,
     update_tx: Sender<std::result::Result<updater::Found, String>>,
     update_rx: Receiver<std::result::Result<updater::Found, String>>,
     accent_rx: Receiver<Option<egui::Color32>>,
@@ -822,6 +826,8 @@ impl App {
             start_recording,
             test_pattern,
             finished: Arc::new(Mutex::new(None)),
+            preview_cleanup: None,
+            pending_recording: false,
             update_tx,
             update_rx,
             accent_rx,
@@ -1252,6 +1258,11 @@ impl App {
     /// Run a preview session while the window is visible and nothing is
     /// recording; restart it when the settings change.
     fn sync_preview(&mut self) {
+        self.check_preview_failure();
+        // A taken session still owns its capture until the worker returns.
+        if self.quitting || self.preview_cleanup.is_some() || self.pending_recording {
+            return;
+        }
         // The replay buffer and streams keep a session running while the
         // window is closed.
         let want = (self.main_visible || self.live_wanted())
@@ -1269,9 +1280,11 @@ impl App {
                 if want {
                     self.st.spare_cam = s.take_camera();
                 }
-                let _ = s.finish();
+                self.st.preview = Some(s);
+                self.finish_preview_async();
             }
-            self.st.preview_settings = None;
+            // Do not open another capture until the old worker releases it.
+            return;
         }
         if want && self.st.preview.is_none() && self.st.error.is_none() {
             self.exclude_own_windows();
@@ -1297,6 +1310,10 @@ impl App {
     }
 
     fn toggle_recording(&mut self, el: &ActiveEventLoop) {
+        if self.preview_cleanup.is_some() || self.pending_recording {
+            self.pending_recording = !self.pending_recording;
+            return;
+        }
         if self.st.finishing || self.capture_hide.is_some() {
             return;
         }
@@ -1308,12 +1325,21 @@ impl App {
     }
 
     fn start_recording(&mut self, el: &ActiveEventLoop) {
+        self.check_preview_failure();
+        if self.preview_cleanup.is_some() {
+            self.pending_recording = true;
+            return;
+        }
         // One capture session at a time: the recording feeds the preview and
         // takes over its camera, already exposed for the room.
         let mut cam = self.st.spare_cam.take();
         if let Some(mut s) = self.st.preview.take() {
             cam = cam.or_else(|| s.take_camera());
-            let _ = s.finish();
+            self.st.spare_cam = cam;
+            self.st.preview = Some(s);
+            self.finish_preview_async();
+            self.pending_recording = true;
+            return;
         }
         self.st.preview_settings = None;
         self.st.error = None;
@@ -1592,6 +1618,47 @@ impl App {
         }
     }
 
+    fn check_preview_failure(&mut self) {
+        if let Some(s) = self.st.preview.as_ref()
+            && s.failed()
+        {
+            let err = s.error().unwrap_or_default();
+            self.st.error = Some(format!("Preview stopped: {err}"));
+            if std::env::var_os("REC_DEBUG").is_some() {
+                eprintln!("rec: debug: preview failed; cleaning up asynchronously: {err}");
+            }
+            self.finish_preview_async();
+        }
+    }
+
+    /// Move preview teardown off winit: even healthy capture can block joining
+    /// source threads or waiting on GPU work. The worker owns the entire session
+    /// (no borrowed app/window state), so dropping its handle safely detaches it.
+    fn finish_preview_async(&mut self) {
+        let Some(s) = self.st.preview.take() else {
+            return;
+        };
+        debug_assert!(self.preview_cleanup.is_none());
+        self.st.preview_settings = None;
+        self.preview_cleanup = Some(std::thread::spawn(move || {
+            let _ = s.finish();
+            wake();
+        }));
+    }
+
+    fn poll_preview_cleanup(&mut self) {
+        if self
+            .preview_cleanup
+            .as_ref()
+            .is_some_and(|w| w.is_finished())
+        {
+            let _ = self.preview_cleanup.take().unwrap().join();
+            if std::env::var_os("REC_DEBUG").is_some() {
+                eprintln!("rec: debug: preview cleanup complete");
+            }
+        }
+    }
+
     fn quit(&mut self, el: &ActiveEventLoop) {
         if self.quitting {
             return;
@@ -1601,29 +1668,41 @@ impl App {
         if debug {
             eprintln!("rec: debug: quit: finalizing");
         }
-        if let Some(s) = self.st.recording.take() {
-            let file = s.output.clone();
-            let r = s.finish();
-            let _ = std::fs::remove_file(record::pidfile_path());
-            if let Some(f) = &file {
-                println!("{}", f.display());
-            }
-            if let Err(e) = r {
-                eprintln!("rec: could not finish the recording: {e:#}");
+        self.pending_recording = false;
+        self.capture_hide = None;
+        self.stop_recording();
+        self.finish_preview_async();
+        // Idle preview has no recording to finalize. Never let stuck capture/GPU
+        // teardown hold Quit hostage; the owning worker can outlive the app.
+        self.preview_cleanup.take();
+        self.poll_quit(el);
+    }
+
+    /// Keep dispatching the desktop connection while a recording finalizes;
+    /// idle preview teardown is detached, not a prerequisite for exiting.
+    /// Quit stays latched and no late command may start a session or window.
+    fn poll_quit(&mut self, el: &ActiveEventLoop) {
+        self.poll_preview_cleanup();
+        let done = self.finished.lock().unwrap().take();
+        if let Some((file, result)) = done {
+            self.st.finishing = false;
+            self.stop_recorder_socket();
+            println!("{}", file.display());
+            if let Err(e) = result {
+                eprintln!("rec: could not finish the recording: {e}");
             }
         }
-        // A recording that was already finalizing in the worker thread.
-        while self.st.finishing && self.finished.lock().unwrap().is_none() {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if let Some(s) = self.st.preview.take() {
-            let _ = s.finish();
+        if self.st.finishing {
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(20),
+            ));
+            return;
         }
         session::stop_all(&self.st.live);
         self.tray = None;
         // Before the loop ends: see `close_windows`.
         self.close_windows();
-        if debug {
+        if std::env::var_os("REC_DEBUG").is_some() {
             eprintln!("rec: debug: quit: exiting the event loop");
         }
         el.exit();
@@ -1676,6 +1755,7 @@ impl App {
     /// commands must never recreate a window after quit has closed it.
     fn exit_if_requested(&mut self, el: &ActiveEventLoop) -> bool {
         if self.quitting {
+            self.poll_quit(el);
             return true;
         }
         if SIG_QUIT.load(Ordering::SeqCst) {
@@ -1691,6 +1771,9 @@ impl App {
         if self.exit_if_requested(el) {
             return;
         }
+        self.poll_preview_cleanup();
+        // Commands in this tick must not synchronously retire a dead preview.
+        self.check_preview_failure();
         self.poll_capture_hide(el);
         if SIG_STOP.swap(false, Ordering::SeqCst) && self.st.recording.is_some() {
             self.stop_recording();
@@ -1747,15 +1830,7 @@ impl App {
             self.stop_recording();
             self.st.error = Some(format!("Recording stopped: {err}"));
         }
-        if let Some(s) = self.st.preview.as_ref()
-            && s.failed()
-        {
-            let err = s.error().unwrap_or_default();
-            if let Some(s) = self.st.preview.take() {
-                let _ = s.finish();
-            }
-            self.st.error = Some(format!("Preview stopped: {err}"));
-        }
+        self.check_preview_failure();
         if self.st.refresh_devices {
             self.st.refresh_devices = false;
             load_devices(&mut self.st);
@@ -1895,10 +1970,17 @@ impl App {
             self.handle(el, cmd);
         }
         while let Ok(c) = self.control_rx.try_recv() {
+            if self.exit_if_requested(el) {
+                return;
+            }
             let cmd = match c {
                 Control::Show => Cmd::ShowWindow,
                 Control::Settings => Cmd::ShowSettings,
                 Control::StartRecording => {
+                    if self.preview_cleanup.is_some() || self.pending_recording {
+                        self.pending_recording = true;
+                        continue;
+                    }
                     if self.st.recording.is_none() {
                         Cmd::ToggleRecording
                     } else {
@@ -1908,6 +1990,7 @@ impl App {
                 Control::ToggleRecording => Cmd::ToggleRecording,
                 Control::Hide => Cmd::HideWindow,
                 Control::Stop => {
+                    self.pending_recording = false;
                     if self.st.recording.is_some() {
                         Cmd::ToggleRecording
                     } else {
@@ -1921,6 +2004,13 @@ impl App {
                 Control::Quit => Cmd::Quit,
             };
             self.handle(el, cmd);
+        }
+        // Process Stop/Quit already queued before fulfilling a deferred Start.
+        if !self.exit_if_requested(el)
+            && self.preview_cleanup.is_none()
+            && std::mem::take(&mut self.pending_recording)
+        {
+            self.start_recording(el);
         }
     }
 
@@ -2238,7 +2328,6 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if self.exit_if_requested(el) {
-            el.exit();
             return;
         }
         if self.last_tick.elapsed() >= Duration::from_millis(100) {
@@ -2315,10 +2404,19 @@ fn spawn_accent_fetch(tx: Sender<Option<egui::Color32>>) {
     std::thread::Builder::new()
         .name("rec-accent".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let color = rt.ok().and_then(|rt| {
+            // ashpd caches its connection process-wide. If this query wins
+            // the first-connection race, later camera/screen portal calls must
+            // still have an executor after the accent-fetch thread returns.
+            static RT: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+                std::sync::OnceLock::new();
+            let rt = RT.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .ok()
+            });
+            let color = rt.as_ref().and_then(|rt| {
                 rt.block_on(async {
                     let s = ashpd::desktop::settings::Settings::new().await.ok()?;
                     let c = s.accent_color().await.ok()?;
@@ -2428,18 +2526,61 @@ mod tests {
                 // worker, not just for st.recording (which is already None).
                 self.app.st.finishing = true;
                 let finished = self.app.finished.clone();
+                let (finish_recording, wait_recording) = std::sync::mpsc::channel();
                 let worker = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(50));
+                    wait_recording.recv().unwrap();
                     *finished.lock().unwrap() =
                         Some((PathBuf::new(), Err("test finalizer".into())));
                 });
+                // A failed preview may still be releasing its capture. Start
+                // is deferred; repeated explicit Start is idempotent, and quit
+                // cancels that intent without blocking this event callback.
+                let (release, wait) = std::sync::mpsc::channel();
+                let preview = self.app.st.preview.take();
+                let (preview_done, preview_completion) = std::sync::mpsc::channel();
+                self.app.preview_cleanup = Some(std::thread::spawn(move || {
+                    wait.recv().unwrap();
+                    if let Some(s) = preview {
+                        let _ = s.finish();
+                    }
+                    let _ = preview_done.send(());
+                }));
+                self.app.start_recording(el);
+                self.app.start_recording(el);
+                assert!(self.app.pending_recording);
+                self.app.toggle_recording(el);
+                assert!(!self.app.pending_recording);
+                self.app.toggle_recording(el);
+                assert!(self.app.pending_recording);
+                self.app.st.error = None; // A dismissed banner cannot restart yet.
+                self.app.sync_preview();
+                assert!(self.app.st.preview.is_none());
                 on_sigterm(libc::SIGTERM);
                 self.app.window_event(el, id, WindowEvent::RedrawRequested);
                 assert!(self.app.quitting);
-                assert!(self.app.finished.lock().unwrap().is_some());
+                assert!(!self.app.pending_recording);
+                assert!(self.app.preview_cleanup.is_none()); // detached, not joined
+                assert!(self.app.st.finishing);
+                assert!(!el.exiting()); // recording finalization is still mandatory
+                let quit_started = Instant::now();
+                finish_recording.send(()).unwrap();
                 worker.join().unwrap();
+                self.app.poll_quit(el);
+                assert!(!self.app.st.finishing);
+                assert!(el.exiting());
+                assert!(quit_started.elapsed() < Duration::from_secs(1));
+                // Keep the preview worker blocked beyond the old 2s timeout.
+                // Exit has already been requested, without releasing that worker.
+                assert_eq!(
+                    preview_completion.recv_timeout(Duration::from_millis(2100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
+                release.send(()).unwrap();
+                preview_completion
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
                 // Neither a command later in the batch nor late events may
-                // recreate windows or enter egui after synchronous finalizing.
+                // recreate windows or enter egui after finalizing.
                 self.app.handle(el, Cmd::ShowWindow);
                 self.app.handle(el, Cmd::ShowSettings);
                 self.app.user_event(el, ());
