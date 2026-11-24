@@ -3028,7 +3028,8 @@ mod tests {
         for i in 0..12 {
             q.push_back((i as f64, frame(i)));
             // Emission is at frame 2: nothing newer than 2.5 may become current.
-            Writer::cap(&mut q, &mut last, 4, 2.5);
+            // Four 4x2 BGRA frames: the cap is expressed in bytes.
+            Writer::cap(&mut q, &mut last, 4 * 32, 2.5);
         }
         assert_eq!(
             last.as_ref().unwrap().pts,
