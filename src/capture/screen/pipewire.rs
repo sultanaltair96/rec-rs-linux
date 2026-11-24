@@ -30,8 +30,10 @@
 //! Adapted from rec-rs src/screen.rs (MIT OR Apache-2.0), which gets its frames
 //! from ScreenCaptureKit instead of a PipeWire node.
 
+use std::cell::RefCell;
 use std::io::Cursor;
 use std::os::fd::OwnedFd;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -191,6 +193,15 @@ impl Stream {
         }
     }
 
+    /// Fatal capture failure, available before `stop()` joins the source.
+    pub fn fatal_error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
+    pub(super) fn error_handle(&self) -> Arc<Mutex<Option<String>>> {
+        self.error.clone()
+    }
+
     pub fn description(&self) -> &str {
         &self.description
     }
@@ -270,7 +281,10 @@ impl VideoSource for Stream {
     }
 
     fn is_running(&self) -> bool {
-        self.thread.is_some()
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && self.fatal_error().is_none()
     }
 }
 
@@ -310,7 +324,12 @@ fn run(
     let core = context
         .connect_fd_rc(fd, None)
         .map_err(|e| anyhow!("connecting to the portal's PipeWire remote: {e}"))?;
-    let stream = new_stream(&core)?;
+    let target = resolve_target(&core, &main, node_id, error.clone());
+    if stop.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let (serial, _target_watch) = target?;
+    let stream = new_stream(&core, &serial)?;
     let data = StreamData {
         format: VideoInfoRaw::new(),
         tx,
@@ -331,13 +350,7 @@ fn run(
             if super::debug() {
                 eprintln!("rec: debug: screen stream {old:?} -> {new:?}");
             }
-            if let pw::stream::StreamState::Error(e) = new {
-                set_error(&data.error, format!("PipeWire stream error: {e}"));
-                // A dead stream is not worth waiting in `run()` for.
-                if let Some(main) = &data.quit_on_error {
-                    main.quit();
-                }
-            }
+            on_state(data, old, new);
         })
         .register()
         .context("registering the stream listener")?;
@@ -354,11 +367,13 @@ fn run(
     Ok(())
 }
 
-fn new_stream(core: &pw::core::CoreRc) -> Result<pw::stream::StreamRc> {
+fn new_stream(core: &pw::core::CoreRc, serial: &str) -> Result<pw::stream::StreamRc> {
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Screen",
+        "target.object" => serial,
+        "node.dont-reconnect" => "true",
     };
     pw::stream::StreamRc::new(core.clone(), "rec-rs screen", props)
         .map_err(|e| anyhow!("creating a PipeWire stream: {e}"))
@@ -371,13 +386,126 @@ fn connect_stream(stream: &pw::stream::Stream, node_id: u32) -> Result<()> {
     stream
         .connect(
             spa::utils::Direction::Input,
-            Some(node_id),
+            None, // target.object is the stable object.serial, never a recycled id.
             pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::DONT_RECONNECT
                 | pw::stream::StreamFlags::MAP_BUFFERS
                 | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .map_err(|e| anyhow!("connecting to the screen-cast node {node_id}: {e}"))
+}
+
+/// Keep the restricted portal registry alive for the entire connection. A
+/// numeric global id is only used to find the portal's node; routing uses its
+/// serial so a recycled id can never select a different producer.
+struct TargetWatch {
+    _registry: pw::registry::RegistryRc,
+    _listener: pw::registry::Listener,
+    _core_listener: pw::core::Listener,
+}
+
+fn resolve_target(
+    core: &pw::core::CoreRc,
+    main: &pw::main_loop::MainLoopRc,
+    node_id: u32,
+    error: Arc<Mutex<Option<String>>>,
+) -> Result<(String, TargetWatch)> {
+    let registry = core
+        .get_registry_rc()
+        .context("opening the portal PipeWire registry")?;
+    let serial = Rc::new(RefCell::new(None::<String>));
+    let listener = registry
+        .add_listener_local()
+        .global({
+            let serial = serial.clone();
+            move |global| {
+                if global.id == node_id && global.type_ == pw::types::ObjectType::Node {
+                    *serial.borrow_mut() = global
+                        .props
+                        .and_then(|props| props.get("object.serial"))
+                        .filter(|s| s.parse::<u64>().is_ok())
+                        .map(str::to_owned);
+                }
+            }
+        })
+        .global_remove({
+            let main = main.clone();
+            let error = error.clone();
+            let serial = serial.clone();
+            move |id| {
+                if id == node_id {
+                    serial.borrow_mut().take();
+                    set_error(
+                        &error,
+                        format!("PipeWire screen-cast node {node_id} was removed"),
+                    );
+                    main.quit();
+                }
+            }
+        })
+        .register();
+    let seq = core
+        .sync(0)
+        .context("synchronising the portal PipeWire registry")?;
+    let core_listener = core
+        .add_listener_local()
+        .done({
+            let main = main.clone();
+            move |id, done| {
+                if id == pw::core::PW_ID_CORE && done == seq {
+                    main.quit();
+                }
+            }
+        })
+        .error({
+            let main = main.clone();
+            let error = error.clone();
+            move |_, _, _, message| {
+                set_error(&error, format!("PipeWire remote error: {message}"));
+                main.quit();
+            }
+        })
+        .register();
+    let timer = main.loop_().add_timer({
+        let main = main.clone();
+        move |_| main.quit()
+    });
+    timer.update_timer(Some(PROBE_RETRY_WAIT), None);
+    main.run();
+    if let Some(message) = error.lock().unwrap().as_ref() {
+        bail!("{message}");
+    }
+    let serial = serial.borrow_mut().take().ok_or_else(|| {
+        anyhow!("PipeWire screen-cast node {node_id} has no object.serial in the portal registry")
+    })?;
+    Ok((
+        serial,
+        TargetWatch {
+            _registry: registry,
+            _listener: listener,
+            _core_listener: core_listener,
+        },
+    ))
+}
+
+fn on_state(data: &mut StreamData, old: pw::stream::StreamState, new: pw::stream::StreamState) {
+    let message = match new {
+        pw::stream::StreamState::Error(e) => format!("PipeWire stream error: {e}"),
+        pw::stream::StreamState::Unconnected
+            if !matches!(old, pw::stream::StreamState::Unconnected) =>
+        {
+            "PipeWire screen-cast stream disconnected".to_owned()
+        }
+        _ => return,
+    };
+    set_error(&data.error, message);
+    if let Some(done) = data.probe_done.take() {
+        let _ = done.send(());
+    }
+    if let Some(main) = &data.quit_on_error {
+        main.quit();
+    }
 }
 
 fn set_error(slot: &Arc<Mutex<Option<String>>>, msg: String) {
@@ -712,12 +840,13 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
     let core = context
         .connect_fd_rc(fd, None)
         .map_err(|e| anyhow!("connecting to the portal's PipeWire remote: {e}"))?;
-    let stream = new_stream(&core)?;
+    let error = Arc::new(Mutex::new(None::<String>));
+    let (serial, _target_watch) = resolve_target(&core, &main, node_id, error.clone())?;
+    let stream = new_stream(&core, &serial)?;
     if super::debug() {
         eprintln!("rec: debug: probe connecting to node {node_id} (wait {wait:?})");
     }
     let size = Arc::new(Mutex::new(None::<(usize, usize)>));
-    let error = Arc::new(Mutex::new(None::<String>));
     let (tx, _rx) = sync_channel(1);
     // The watchdog leaves the loop through the loop's own event source, the
     // same way `Stream::halt` does: no thread ever dereferences the loop.
@@ -740,7 +869,6 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
         probe_done: Some(probe_done),
     };
     let size2 = size.clone();
-    let error2 = error.clone();
     let debug_state = super::debug();
     let listener = stream
         .add_local_listener_with_user_data(data)
@@ -768,17 +896,7 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
             if debug_state {
                 eprintln!("rec: debug: probe stream {old:?} -> {new:?} (target node {node_id})");
             }
-            if let pw::stream::StreamState::Error(e) = new {
-                set_error(&error2, format!("PipeWire stream error: {e}"));
-                // The watchdog must not keep waiting for a format that will
-                // never come.
-                if let Some(done) = data.probe_done.take() {
-                    let _ = done.send(());
-                }
-                if let Some(main) = &data.quit_on_error {
-                    main.quit();
-                }
-            }
+            on_state(data, old, new);
         })
         .register()
         .context("registering the probe listener")?;
@@ -802,16 +920,16 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
     drop(context);
     drop(main);
     let _ = watcher.join();
+    if let Some(e) = error.lock().unwrap().take() {
+        bail!("the portal's PipeWire stream failed: {e}");
+    }
     if let Some(s) = *size.lock().unwrap()
         && s.0 >= 2
         && s.1 >= 2
     {
         return Ok(s);
     }
-    match error.lock().unwrap().take() {
-        Some(e) => bail!("the portal's PipeWire stream failed: {e}"),
-        None => bail!("the portal's PipeWire stream did not offer a video format within {wait:?}"),
-    }
+    bail!("the portal's PipeWire stream did not offer a video format within {wait:?}")
 }
 
 /// The processing thread: crop, draw the cursor and clicks, deliver.
@@ -883,6 +1001,48 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    // The dead-loop hook and exit counter are global. Keep tests that create
+    // capture threads from consuming one another's hook or exit notification.
+    static STREAM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn disconnect_and_error_are_fatal_but_initial_unconnected_is_not() {
+        use pw::stream::StreamState::{Error, Paused, Streaming, Unconnected};
+        let (tx, _rx) = sync_channel(1);
+        let (done, completion) = std::sync::mpsc::channel();
+        let mut data = StreamData {
+            format: VideoInfoRaw::new(),
+            tx,
+            dropped: 0,
+            cursor: None,
+            error: Arc::new(Mutex::new(None)),
+            warned_no_bitmap: false,
+            saw_buffer: false,
+            quit_on_format: None,
+            quit_on_error: None,
+            probe_done: Some(done),
+        };
+        on_state(&mut data, Unconnected, Unconnected);
+        on_state(&mut data, Streaming, Paused);
+        assert!(data.error.lock().unwrap().is_none());
+        on_state(&mut data, Paused, Unconnected);
+        completion.recv_timeout(Duration::from_millis(100)).unwrap();
+        let first = data.error.lock().unwrap().clone().unwrap();
+        assert!(first.contains("disconnected"));
+        on_state(&mut data, Unconnected, Error("late error".into()));
+        assert_eq!(data.error.lock().unwrap().as_deref(), Some(first.as_str()));
+        *data.error.lock().unwrap() = None;
+        on_state(&mut data, Streaming, Error("producer failed".into()));
+        assert!(
+            data.error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("producer failed")
+        );
+    }
+
     #[test]
     fn a_frame_timestamp_must_be_on_our_clock() {
         let now = 1000.0;
@@ -927,6 +1087,7 @@ mod tests {
     /// needs no portal, so it runs on every `cargo test`.
     #[test]
     fn stopping_a_capture_whose_loop_already_exited_is_safe() {
+        let _guard = STREAM_TEST_LOCK.lock().unwrap();
         // A regular file is not a PipeWire socket; with the hook returning
         // first, it is never even used as one.
         let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
@@ -964,12 +1125,93 @@ mod tests {
     /// normal case: this needs `scripts/screen/headless.sh`).
     fn live_portal() -> Option<super::super::portal::Prepared> {
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS")?;
-        super::super::portal::prepare(
+        let result = super::super::portal::prepare(
             super::super::Want::Monitor,
             CaptureOptions::default(),
             std::time::Duration::from_secs(20),
-        )
-        .ok()
+        );
+        if std::env::var_os("REC_HEADLESS_SESSION").is_some() {
+            Some(result.expect("headless portal must be available"))
+        } else {
+            result.ok()
+        }
+    }
+
+    #[test]
+    fn closing_a_session_while_streaming_is_fatal() {
+        let _guard = STREAM_TEST_LOCK.lock().unwrap();
+        let Some(prepared) = live_portal() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut stream = Stream::new(
+            prepared.node_id,
+            prepared.dup_fd().unwrap(),
+            None,
+            CaptureOptions::default(),
+            "session-close".into(),
+        );
+        stream
+            .begin(Arc::new(move |_| {
+                let _ = tx.send(());
+            }))
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("capture must deliver a real frame");
+        assert!(stream.is_running());
+        assert!(stream.fatal_error().is_none());
+        prepared.close();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stream.thread.as_ref().is_some_and(|t| !t.is_finished()) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            stream.thread.as_ref().unwrap().is_finished(),
+            "capture must terminate without stop"
+        );
+        assert!(!stream.is_running());
+        let error = stream
+            .fatal_error()
+            .expect("session close must expose a fatal error");
+        assert!(error.contains("PipeWire"), "{error}");
+        assert!(stream.halt().is_err(), "stop must retain the failure");
+    }
+
+    #[test]
+    fn probing_a_closed_session_fails_without_retargeting() {
+        let Some(prepared) = live_portal() else {
+            return;
+        };
+        let fd = prepared.dup_fd().unwrap();
+        let node_id = prepared.node_id;
+        prepared.close();
+        let started = Instant::now();
+        let error = probe_size(fd, node_id, Duration::from_secs(2)).unwrap_err();
+        assert!(format!("{error:#}").contains("PipeWire"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn stream_properties_pin_the_serial_and_disable_reconnection() {
+        pw::init();
+        let main = pw::main_loop::MainLoopRc::new(None).unwrap();
+        let context = pw::context::ContextRc::new(&main, None).unwrap();
+        let Some(prepared) = live_portal() else {
+            return;
+        };
+        let core = context
+            .connect_fd_rc(prepared.dup_fd().unwrap(), None)
+            .unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let (serial, _watch) = resolve_target(&core, &main, prepared.node_id, error).unwrap();
+        assert!(serial.parse::<u64>().is_ok());
+        let stream = new_stream(&core, &serial).unwrap();
+        assert_eq!(
+            stream.properties().get("target.object"),
+            Some(serial.as_str())
+        );
+        assert_eq!(stream.properties().get("node.dont-reconnect"), Some("true"));
     }
 
     /// 200 start/stop cycles against real screen-cast nodes, half of them with
@@ -986,6 +1228,7 @@ mod tests {
     /// milliseconds, and the stream's error callback leaves the loop.
     #[test]
     fn two_hundred_start_stop_cycles_survive_dying_streams() {
+        let _guard = STREAM_TEST_LOCK.lock().unwrap();
         let Some(prepared) = live_portal() else {
             return;
         };
@@ -1034,8 +1277,8 @@ mod tests {
                 CaptureOptions::default(),
                 format!("stress-dead-{i}"),
             );
-            stream.begin(sink.clone()).unwrap();
             let target = loops_exited() + 1;
+            stream.begin(sink.clone()).unwrap();
             let deadline = Instant::now() + std::time::Duration::from_secs(10);
             while loops_exited() < target && Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));

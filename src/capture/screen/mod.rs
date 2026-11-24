@@ -429,6 +429,16 @@ pub fn open(req: &ScreenRequest) -> Result<Box<dyn VideoSource>> {
 
 /// Start capturing `req` with `opts`.
 pub fn open_with(req: &ScreenRequest, opts: &CaptureOptions) -> Result<Box<dyn VideoSource>> {
+    Ok(open_with_status(req, opts)?.0)
+}
+
+/// A screen-specific failure handle lets the recording observe fatal portal
+/// loss without changing the shared frame/audio contract.
+pub type ScreenError = std::sync::Arc<Mutex<Option<String>>>;
+pub fn open_with_status(
+    req: &ScreenRequest,
+    opts: &CaptureOptions,
+) -> Result<(Box<dyn VideoSource>, Option<ScreenError>)> {
     match backend()? {
         Backend::X11 => {
             let server = x11::Server::connect()?;
@@ -436,9 +446,13 @@ pub fn open_with(req: &ScreenRequest, opts: &CaptureOptions) -> Result<Box<dyn V
                 Some(sel) => x11::resolve_window(&server, sel)?.0,
                 None => x11::resolve_display(&server, req.display, req.region.as_ref())?.0,
             };
-            Ok(Box::new(x11::Source::new(spec, *opts)))
+            Ok((Box::new(x11::Source::new(spec, *opts)), None))
         }
-        Backend::Portal => Ok(Box::new(PortalSource::open(req, *opts)?)),
+        Backend::Portal => {
+            let source = PortalSource::open(req, *opts)?;
+            let error = source.stream.error_handle();
+            Ok((Box::new(source), Some(error)))
+        }
     }
 }
 

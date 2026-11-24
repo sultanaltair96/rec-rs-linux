@@ -1021,6 +1021,21 @@ screen_test pattern-screen headless.sh portal 1280 720 100
 screen_test screen-region headless.sh region 640 480 40
 # Wayland: `permissions --request` stores a grant; a corrupt token is recovered.
 screen_test screen-token headless.sh token 1280 720 0
+# A revoked portal node must end the recording, not relink to a camera.
+if wanted screen-disconnect; then
+    if [ -z "$screen_harness" ]; then
+        echo "SKIP  screen-disconnect  (needs the headless screen harness)"
+        skip=$((skip+1))
+    elif REC_BIN="$REC_ABS" OUT_DIR="$OUT" SCREEN_LOG_DIR="$OUT/screen-disconnect-harness" \
+        timeout "$TIMEOUT" scripts/screen/headless.sh sh scripts/screen/disconnect.sh \
+        >"$OUT/screen-disconnect.harness.log" 2>&1; then
+        echo "PASS  screen-disconnect  (node removed; stopped, no relink, decoded)"
+        pass=$((pass+1))
+    else
+        echo "FAIL  screen-disconnect  (see $OUT/screen-disconnect.harness.log)"
+        fail=$((fail+1))
+    fi
+fi
 # X11: RandR enumeration and a root capture without a portal.
 screen_test screen-x11 xvfb.sh x11 1280 800 30
 # X11: --window <app> captures one client's own surface.
