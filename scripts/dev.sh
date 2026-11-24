@@ -26,7 +26,17 @@
 # Anything that can block is additionally run under `timeout` *inside* the
 # container (DEV_TIMEOUT, default 30 minutes, 0 = no limit), because a host-side
 # timeout can only kill the client.
+# /tmp stays disk-backed by default. DEV_SMALL_TMPFS=1 opts into a small
+# 128 MiB tmpfs for /tmp; it counts against the container's memory ceiling.
 set -eu
+
+case "${DEV_SMALL_TMPFS:-0}" in
+    0 | 1) ;;
+    *)
+        echo "dev.sh: DEV_SMALL_TMPFS must be 0 or 1 (1 enables a 128 MiB /tmp tmpfs)" >&2
+        exit 1
+        ;;
+esac
 
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 IMAGE_BASE=rec-rs-linux-dev
@@ -178,6 +188,12 @@ fi
 mem=${DEV_MEMORY:-4g}
 if [ "$mem" != "0" ]; then
     caps="$caps --memory $mem --memory-swap $mem"
+fi
+
+# Keep large build/test scratch files off RAM unless explicitly requested.
+# Never use Docker's uncapped tmpfs default (half the host's RAM).
+if [ "${DEV_SMALL_TMPFS:-0}" = "1" ]; then
+    caps="$caps --tmpfs /tmp:rw,nosuid,nodev,size=128m,mode=1777"
 fi
 
 # shellcheck disable=SC2086 # $envs is a list of -e NAME=value pairs
