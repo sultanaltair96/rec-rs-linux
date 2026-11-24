@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use pipewire as pw;
+use pw::proxy::ProxyT;
 use pw::spa;
 use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
@@ -132,6 +133,8 @@ struct RawFrame {
 /// What the capture thread shares with its callbacks.
 struct StreamData {
     format: VideoInfoRaw,
+    target: Option<Rc<RefCell<TargetState>>>,
+    was_streaming: bool,
     tx: SyncSender<RawFrame>,
     dropped: u64,
     /// The last cursor bitmap, reused while the compositor's cursor is
@@ -328,7 +331,7 @@ fn run(
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let (serial, _target_watch) = target?;
+    let (serial, target_watch) = target?;
     let stream = new_stream(&core, &serial)?;
     let data = StreamData {
         format: VideoInfoRaw::new(),
@@ -339,6 +342,8 @@ fn run(
         warned_no_bitmap: false,
         saw_buffer: false,
         quit_on_format: None,
+        target: Some(target_watch.state.clone()),
+        was_streaming: false,
         quit_on_error: Some(main.clone()),
         probe_done: None,
     };
@@ -400,9 +405,61 @@ fn connect_stream(stream: &pw::stream::Stream, node_id: u32) -> Result<()> {
 /// numeric global id is only used to find the portal's node; routing uses its
 /// serial so a recycled id can never select a different producer.
 struct TargetWatch {
-    _registry: pw::registry::RegistryRc,
+    // Listeners must be dropped before the proxies they observe.
+    _proxy_listener: pw::proxy::ProxyListener,
+    _node: pw::node::Node,
     _listener: pw::registry::Listener,
+    _registry: pw::registry::RegistryRc,
     _core_listener: pw::core::Listener,
+    state: Rc<RefCell<TargetState>>,
+}
+
+#[derive(Default)]
+struct TargetState {
+    node_id: u32,
+    serial: Option<String>,
+    present: bool,
+}
+
+impl TargetState {
+    fn remove(&mut self, id: u32) -> bool {
+        // global_remove carries only an id. Preserve the serial of the exact
+        // global we resolved, and never adopt a later global with a reused id.
+        if id != self.node_id || self.serial.is_none() {
+            return false;
+        }
+        self.present = false;
+        true
+    }
+
+    fn removed_message(&self, event: &str) -> String {
+        format!(
+            "PipeWire screen-cast node {} (serial {}) was removed ({event})",
+            self.node_id,
+            self.serial.as_deref().unwrap_or("unknown")
+        )
+    }
+}
+
+fn target_removed(
+    state: &Rc<RefCell<TargetState>>,
+    id: u32,
+    event: &str,
+    error: &Arc<Mutex<Option<String>>>,
+    main: &pw::main_loop::MainLoopRc,
+) {
+    let mut target = state.borrow_mut();
+    let matched = target.remove(id);
+    if super::debug() {
+        eprintln!(
+            "rec: debug: screen target {event}: id {id}, target {} serial {:?}, matched {matched}",
+            target.node_id, target.serial
+        );
+    }
+    if matched {
+        set_error(error, target.removed_message(event));
+        main.quit();
+    }
 }
 
 fn resolve_target(
@@ -414,35 +471,45 @@ fn resolve_target(
     let registry = core
         .get_registry_rc()
         .context("opening the portal PipeWire registry")?;
-    let serial = Rc::new(RefCell::new(None::<String>));
+    let state = Rc::new(RefCell::new(TargetState {
+        node_id,
+        ..Default::default()
+    }));
+    let target_global = Rc::new(RefCell::new(None));
     let listener = registry
         .add_listener_local()
         .global({
-            let serial = serial.clone();
+            let state = state.clone();
+            let target_global = target_global.clone();
             move |global| {
-                if global.id == node_id && global.type_ == pw::types::ObjectType::Node {
-                    *serial.borrow_mut() = global
+                let mut target = state.borrow_mut();
+                if global.id == node_id
+                    && global.type_ == pw::types::ObjectType::Node
+                    && target.serial.is_none()
+                {
+                    target.serial = global
                         .props
                         .and_then(|props| props.get("object.serial"))
                         .filter(|s| s.parse::<u64>().is_ok())
                         .map(str::to_owned);
+                    target.present = target.serial.is_some();
+                    if target.present {
+                        *target_global.borrow_mut() = Some(global.to_owned());
+                    }
+                    if super::debug() {
+                        eprintln!(
+                            "rec: debug: screen target registry.global: id {node_id}, serial {:?}",
+                            target.serial
+                        );
+                    }
                 }
             }
         })
         .global_remove({
             let main = main.clone();
             let error = error.clone();
-            let serial = serial.clone();
-            move |id| {
-                if id == node_id {
-                    serial.borrow_mut().take();
-                    set_error(
-                        &error,
-                        format!("PipeWire screen-cast node {node_id} was removed"),
-                    );
-                    main.quit();
-                }
-            }
+            let state = state.clone();
+            move |id| target_removed(&state, id, "registry.global_remove", &error, &main)
         })
         .register();
     let seq = core
@@ -461,7 +528,12 @@ fn resolve_target(
         .error({
             let main = main.clone();
             let error = error.clone();
-            move |_, _, _, message| {
+            move |id, seq, res, message| {
+                if super::debug() {
+                    eprintln!(
+                        "rec: debug: screen core.error: id {id}, seq {seq}, res {res}: {message}"
+                    );
+                }
                 set_error(&error, format!("PipeWire remote error: {message}"));
                 main.quit();
             }
@@ -476,21 +548,54 @@ fn resolve_target(
     if let Some(message) = error.lock().unwrap().as_ref() {
         bail!("{message}");
     }
-    let serial = serial.borrow_mut().take().ok_or_else(|| {
+    let serial = state.borrow().serial.clone().ok_or_else(|| {
         anyhow!("PipeWire screen-cast node {node_id} has no object.serial in the portal registry")
     })?;
+    let node: pw::node::Node = registry
+        .bind(
+            target_global
+                .borrow()
+                .as_ref()
+                .expect("resolved target global"),
+        )
+        .context("binding the screen-cast target node")?;
+    let proxy_listener = node
+        .upcast_ref()
+        .add_listener_local()
+        .removed({
+            let state = state.clone();
+            let main = main.clone();
+            let error = error.clone();
+            move || target_removed(&state, node_id, "target proxy.removed", &error, &main)
+        })
+        .register();
     Ok((
         serial,
         TargetWatch {
+            _proxy_listener: proxy_listener,
+            _node: node,
             _registry: registry,
             _listener: listener,
             _core_listener: core_listener,
+            state,
         },
     ))
 }
 
 fn on_state(data: &mut StreamData, old: pw::stream::StreamState, new: pw::stream::StreamState) {
+    data.was_streaming |= matches!(old, pw::stream::StreamState::Streaming)
+        || matches!(new, pw::stream::StreamState::Streaming);
     let message = match new {
+        // Paused is normal for a live, idle producer. Only independent target
+        // absence after streaming makes it terminal; never use a frame timeout.
+        pw::stream::StreamState::Paused if data.was_streaming => {
+            let Some(target) = &data.target else { return };
+            let target = target.borrow();
+            if target.present {
+                return;
+            }
+            target.removed_message("stream Paused after Streaming; target absent")
+        }
         pw::stream::StreamState::Error(e) => format!("PipeWire stream error: {e}"),
         pw::stream::StreamState::Unconnected
             if !matches!(old, pw::stream::StreamState::Unconnected) =>
@@ -841,7 +946,7 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
         .connect_fd_rc(fd, None)
         .map_err(|e| anyhow!("connecting to the portal's PipeWire remote: {e}"))?;
     let error = Arc::new(Mutex::new(None::<String>));
-    let (serial, _target_watch) = resolve_target(&core, &main, node_id, error.clone())?;
+    let (serial, target_watch) = resolve_target(&core, &main, node_id, error.clone())?;
     let stream = new_stream(&core, &serial)?;
     if super::debug() {
         eprintln!("rec: debug: probe connecting to node {node_id} (wait {wait:?})");
@@ -865,6 +970,8 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
         warned_no_bitmap: false,
         saw_buffer: false,
         quit_on_format: Some(main.clone()),
+        target: Some(target_watch.state.clone()),
+        was_streaming: false,
         quit_on_error: Some(main.clone()),
         probe_done: Some(probe_done),
     };
@@ -1019,12 +1126,40 @@ mod tests {
             warned_no_bitmap: false,
             saw_buffer: false,
             quit_on_format: None,
+            target: None,
+            was_streaming: false,
             quit_on_error: None,
             probe_done: Some(done),
         };
         on_state(&mut data, Unconnected, Unconnected);
         on_state(&mut data, Streaming, Paused);
         assert!(data.error.lock().unwrap().is_none());
+        let target = Rc::new(RefCell::new(TargetState {
+            node_id: 42,
+            serial: Some("1234".into()),
+            present: true,
+        }));
+        data.target = Some(target.clone());
+        on_state(&mut data, Streaming, Paused);
+        assert!(
+            data.error.lock().unwrap().is_none(),
+            "live Paused is not loss"
+        );
+        target.borrow_mut().remove(42);
+        data.was_streaming = false;
+        on_state(&mut data, Unconnected, Paused);
+        assert!(
+            data.error.lock().unwrap().is_none(),
+            "initial Paused is not loss"
+        );
+        on_state(&mut data, Streaming, Paused);
+        let loss = data.error.lock().unwrap().take().unwrap();
+        assert!(loss.contains("serial 1234"));
+        assert!(loss.contains("target absent"));
+        data.probe_done = None; // The fatal target loss already completed the probe.
+        completion.recv_timeout(Duration::from_millis(100)).unwrap();
+        let (done, completion) = std::sync::mpsc::channel();
+        data.probe_done = Some(done);
         on_state(&mut data, Paused, Unconnected);
         completion.recv_timeout(Duration::from_millis(100)).unwrap();
         let first = data.error.lock().unwrap().clone().unwrap();
@@ -1041,6 +1176,53 @@ mod tests {
                 .unwrap()
                 .contains("producer failed")
         );
+    }
+
+    #[test]
+    fn registry_and_proxy_loss_callbacks_publish_the_exact_target() {
+        pw::init();
+        let main = pw::main_loop::MainLoopRc::new(None).unwrap();
+        let state = Rc::new(RefCell::new(TargetState {
+            node_id: 42,
+            serial: Some("1234".into()),
+            present: true,
+        }));
+        let error = Arc::new(Mutex::new(None));
+        target_removed(&state, 43, "registry.global_remove", &error, &main);
+        assert!(error.lock().unwrap().is_none());
+        for event in ["registry.global_remove", "target proxy.removed"] {
+            target_removed(&state, 42, event, &error, &main);
+            let message = error.lock().unwrap().take().unwrap();
+            assert!(message.contains("42 (serial 1234)"));
+            assert!(message.contains(event));
+            assert!(!state.borrow().present);
+        }
+    }
+
+    #[test]
+    fn target_removal_matches_only_the_resolved_global() {
+        let mut target = TargetState {
+            node_id: 42,
+            ..Default::default()
+        };
+        assert!(
+            !target.remove(42),
+            "an unresolved global is not our producer"
+        );
+        target.serial = Some("1234".into());
+        target.present = true;
+        assert!(!target.remove(43), "unrelated global removal is harmless");
+        assert!(target.present);
+        assert!(target.remove(42));
+        assert!(!target.present);
+        assert_eq!(
+            target.serial.as_deref(),
+            Some("1234"),
+            "retain identity after removal"
+        );
+        let message = target.removed_message("registry.global_remove");
+        assert!(message.contains("42 (serial 1234)"));
+        assert!(message.contains("registry.global_remove"));
     }
 
     #[test]
