@@ -58,17 +58,22 @@ for image in $IMAGES; do
             setup='true'
             ;;
     esac
+    # POSIX sh pipelines return tee's status, not docker's. Capture docker's
+    # status directly so a failing test or container setup fails the suite.
     if docker run --rm --init --memory "$MEM" --memory-swap "$MEM" \
             -v "$OUT:/out:ro" -v "$REPO:/repo:ro" -w /tmp \
             -e IMAGE_NAME="$IMAGE_NAME" \
             "$image" \
-            sh -c "$setup
+            sh -c "set -e
+                   $setup
                    sh /repo/packaging/test-mediamtx.sh
                    useradd -m tester
                    su tester -c 'sh /repo/packaging/appimage/test-inside.sh'" \
-            2>&1 | tee "$LOG/$name.log"; then
+            >"$LOG/$name.log" 2>&1; then
+        cat "$LOG/$name.log"
         echo "RESULT $image: done"
     else
+        cat "$LOG/$name.log"
         echo "RESULT $image: FAILED (see $LOG/$name.log)"
         status=1
     fi
