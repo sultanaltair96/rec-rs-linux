@@ -449,6 +449,7 @@ fn run_capture(
     let mut clock = CameraClock::default();
     let mut stream = new_stream(&dev)?;
     let mut ready_sent = false;
+    let mut first_frame = true;
     let mut timeouts = 0u32;
     while !stop.load(Ordering::SeqCst) {
         match stream.next() {
@@ -464,6 +465,18 @@ fn run_capture(
                 match converter.convert(src) {
                     Ok(frame) => {
                         let pts = clock.stamp(meta.timestamp.sec, meta.timestamp.usec);
+                        // A UVC camera can spend hundreds of milliseconds on
+                        // its first exposure (SOE timestamp) while it starts.
+                        // That one old frame is not representative of steady
+                        // capture and would inflate the writer's adaptive lag
+                        // for seconds. Discard it once, never rewrite its PTS.
+                        if discard_initial_frame(&mut first_frame, crate::media_types::now() - pts)
+                        {
+                            if std::env::var_os("REC_DEBUG").is_some() {
+                                eprintln!("rec: debug: discarded a stale initial camera frame");
+                            }
+                            continue;
+                        }
                         if !ready_sent {
                             if let Ok(mut s) = size.lock() {
                                 *s = (frame.width, frame.height);
@@ -512,6 +525,12 @@ fn run_capture(
         }
     }
     Ok(())
+}
+
+/// Discard at most the first frame, and only if its capture timestamp is very
+/// old; slow devices must still be allowed to deliver their subsequent frames.
+fn discard_initial_frame(first: &mut bool, age: f64) -> bool {
+    std::mem::take(first) && age > 0.250
 }
 
 fn new_stream(dev: &v4l::Device) -> Result<MmapStream<'_>> {
@@ -662,6 +681,16 @@ mod tests {
             path: PathBuf::from(path),
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn only_an_old_first_frame_is_discarded() {
+        let mut first = true;
+        assert!(discard_initial_frame(&mut first, 0.390));
+        assert!(!discard_initial_frame(&mut first, 0.390));
+        let mut first = true;
+        assert!(!discard_initial_frame(&mut first, 0.080));
+        assert!(!discard_initial_frame(&mut first, 1.000));
     }
 
     /// Upstream `camera.rs::device` matching, with /dev paths.

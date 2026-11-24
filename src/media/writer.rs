@@ -180,10 +180,11 @@ pub const LAG_SECS: f64 = 0.05;
 /// The most emission may run behind real time, whatever the sources report.
 pub const MAX_LAG_SECS: f64 = 0.3;
 
-/// Frames buffered per source before the oldest are dropped. A screen source's
-/// own queue depth is about 8: hold fewer, which covers the emission lag at
-/// 60 fps up to about 115 ms of continuous motion.
-const QUEUE_MAX: usize = 7;
+/// Per-source queue budget. 192 MiB holds 24 packed 1080p frames, enough for
+/// the 300 ms maximum lag at 60 fps plus six frames of jitter. At 4K it holds
+/// at most six such frames; any forced eviction is counted as a video drop.
+/// Each source may additionally retain its last frame and an in-flight frame.
+const VIDEO_SOURCE_QUEUE_BYTES: usize = 192 * 1024 * 1024;
 
 /// Frames the GStreamer video appsrc and its queue may hold. Two frames cover
 /// one encoder frame plus one in flight; anything more is memory a slow
@@ -962,7 +963,12 @@ impl Writer {
         }
         self.cam_q.push_back((frame.pts, Arc::new(frame)));
         let due = self.due_time();
-        Self::cap(&mut self.cam_q, &mut self.cam_last, QUEUE_MAX, due);
+        self.stats.video_drops += Self::cap(
+            &mut self.cam_q,
+            &mut self.cam_last,
+            VIDEO_SOURCE_QUEUE_BYTES,
+            due,
+        );
     }
 
     /// Queue a screen frame (already counted) and start the clock if needed.
@@ -974,7 +980,12 @@ impl Writer {
         let _ = counted;
         self.screen_q.push_back((pts, Arc::new(frame)));
         let due = self.due_time();
-        Self::cap(&mut self.screen_q, &mut self.screen_last, QUEUE_MAX, due);
+        self.stats.video_drops += Self::cap(
+            &mut self.screen_q,
+            &mut self.screen_last,
+            VIDEO_SOURCE_QUEUE_BYTES,
+            due,
+        );
     }
 
     /// The first frame set the session clock: start the pipeline, the mix bus
@@ -1352,22 +1363,39 @@ impl Writer {
         }
     }
 
-    /// Bound a frame queue. A dropped frame becomes the current one only if it
-    /// is due by the next slot: when emission runs behind, a newer frame must
-    /// not be shown under an earlier timestamp (that put content up to several
-    /// frames early); it is skipped instead.
+    /// Discard frames superseded for the next slot, retaining future frames
+    /// until due. A hard per-source byte budget bounds even a stalled or
+    /// future-dated producer. Forced evictions are counted by the caller.
     fn cap(
         q: &mut VecDeque<(f64, Arc<VideoFrame>)>,
         last: &mut Option<Arc<VideoFrame>>,
-        max: usize,
+        max_bytes: usize,
         due: f64,
-    ) {
-        while q.len() > max {
-            let (pts, frame) = q.pop_front().unwrap();
-            if pts <= due || last.is_none() {
+    ) -> u64 {
+        while q.len() > 1 && q[1].0 <= due {
+            q.pop_front();
+        }
+        let frame_bytes = |frame: &VideoFrame| -> usize {
+            frame
+                .planes
+                .iter()
+                .fold(0usize, |n, p| n.saturating_add(p.data.len()))
+        };
+        let mut bytes = q
+            .iter()
+            .fold(0usize, |n, (_, f)| n.saturating_add(frame_bytes(f)));
+        let mut dropped = 0;
+        while bytes > max_bytes {
+            let Some((pts, frame)) = q.pop_front() else {
+                break;
+            };
+            bytes = bytes.saturating_sub(frame_bytes(&frame));
+            if pts <= due {
                 *last = Some(frame);
             }
+            dropped += 1;
         }
+        dropped
     }
 
     /// Pick the newest queued frame captured at or before `t`.
@@ -3000,7 +3028,8 @@ mod tests {
         for i in 0..12 {
             q.push_back((i as f64, frame(i)));
             // Emission is at frame 2: nothing newer than 2.5 may become current.
-            Writer::cap(&mut q, &mut last, 4, 2.5);
+            // Four 4x2 BGRA frames: the cap is expressed in bytes.
+            Writer::cap(&mut q, &mut last, 4 * 32, 2.5);
         }
         assert_eq!(
             last.as_ref().unwrap().pts,
@@ -3292,6 +3321,44 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn screen_queue_covers_290ms_of_lag_at_60fps() {
+        let mut w = test_writer();
+        let start = 1000.0;
+        for n in 0..180 {
+            let t = start + n as f64 / 60.0;
+            w.push_screen_frame(frame(t), false);
+            w.emit_until(t - 0.29, usize::MAX);
+        }
+        w.emit_until(start + 179.0 / 60.0, usize::MAX);
+        assert_eq!(w.stats.video_frames_out, 180);
+        assert_eq!(w.stats.video_dups, 0);
+        assert_eq!(w.stats.video_drops, 0);
+    }
+
+    #[test]
+    fn queue_byte_limit_drops_and_counts_oldest_at_4k() {
+        let mut w = test_writer();
+        let start = 1000.0;
+        // Frame memory is shared to keep the test cheap; the budget must use
+        // each queued plane's full size even when buffers happen to alias.
+        let mut f = frame_at(start, 3840, 2160);
+        for n in 0..8 {
+            f.pts = start + n as f64 / 60.0;
+            w.push_screen_frame(f.clone(), false);
+        }
+        let bytes: usize = w
+            .screen_q
+            .iter()
+            .flat_map(|(_, f)| &f.planes)
+            .map(|p| p.data.len())
+            .sum();
+        assert!(bytes <= VIDEO_SOURCE_QUEUE_BYTES);
+        assert!(w.stats.video_drops > 0);
+        assert!(w.screen_q.front().unwrap().0 > start);
+        assert_eq!(w.stats.video_drops as usize + w.screen_q.len(), 8);
+    }
+
     /// Inspect real appsrc buffers before encoding: durations must agree with
     /// the PCM byte count, including mono filler and the configured stop.
     #[test]

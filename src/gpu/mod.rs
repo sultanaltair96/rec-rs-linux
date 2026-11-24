@@ -332,6 +332,31 @@ struct Input {
     key: Option<(u32, u32, PixelFormat)>,
     planes: Vec<Tex>,
     rgba: Option<Tex>,
+    /// Keep the allocations alive so pointer identity cannot be recycled.
+    uploaded: Vec<(Arc<[u8]>, usize)>,
+}
+
+impl Input {
+    /// True exactly when the plane buffers or their layout changed. Cloned
+    /// frames share immutable Arc-backed planes; PTS alone is not an identity.
+    fn camera_needs_upload(&mut self, frame: &VideoFrame) -> bool {
+        let same = self.uploaded.len() == frame.planes.len()
+            && self
+                .uploaded
+                .iter()
+                .zip(&frame.planes)
+                .all(|((data, stride), plane)| {
+                    *stride == plane.stride && Arc::ptr_eq(data, &plane.data)
+                });
+        if !same {
+            self.uploaded = frame
+                .planes
+                .iter()
+                .map(|p| (p.data.clone(), p.stride))
+                .collect();
+        }
+        !same
+    }
 }
 
 /// Everything that only depends on the output size.
@@ -837,6 +862,7 @@ impl Renderer {
         if input.key != Some((w, h, kind)) {
             input.key = Some((w, h, kind));
             input.rgba = None;
+            input.uploaded.clear();
             let upload = Usage::TEXTURE_BINDING | Usage::COPY_DST;
             input.planes = match kind {
                 PixelFormat::Bgra => vec![Tex::new(
@@ -866,7 +892,11 @@ impl Renderer {
                 ],
             };
         }
-        for (i, plane) in frame.planes.iter().enumerate() {
+        let upload = match role {
+            Role::Screen => true,
+            Role::Cam => input.camera_needs_upload(frame),
+        };
+        for (i, plane) in frame.planes.iter().enumerate().filter(|_| upload) {
             let tex = &input.planes[i];
             let rows = frame.format.plane_rows(i, frame.height);
             queue.write_texture(
