@@ -27,6 +27,48 @@ fn camera_upload_is_reused_only_for_the_same_plane_buffers() {
     assert!(input.camera_needs_upload(&changed_stride));
 }
 
+/// Redrawing a cached camera must preserve its pixels, not just its upload key.
+#[test]
+fn unchanged_camera_upload_draws_twice_without_flicker() {
+    let pip = PipSpec {
+        size: 0.5,
+        shape: Shape::Square,
+        roundness: 0.0,
+        border: 0.0,
+        shadow: false,
+        place: Place::At([0.5, 0.5]),
+        ..Default::default()
+    };
+    let Some(mut r) = renderer(128, 96, pip, Scene::ScreenCam) else {
+        return;
+    };
+    let black = solid(128, 96, [0, 0, 0]);
+    for camera in [
+        solid(64, 48, [0, 255, 0]),
+        testkit::solid_nv12(64, 48, [0, 255, 0]),
+    ] {
+        let first = Image::bgra(
+            &r.render_now(Some(&black), Some(&camera), 1.0)
+                .expect("first draw"),
+        );
+        let [red, green, blue] = first.at(64, 48);
+        assert!(green > 250 && red < 6 && blue < 6, "camera is visible");
+        assert_eq!(first.at(0, 0), [0, 0, 0], "screen outside camera");
+
+        // A clone retains the plane Arcs, so the second render skips upload.
+        let unchanged = camera.clone();
+        let second = Image::bgra(
+            &r.render_now(Some(&black), Some(&unchanged), 2.0)
+                .expect("cached camera draw"),
+        );
+        assert_eq!(
+            second.rgb, first.rgb,
+            "{:?} camera flickered",
+            camera.format
+        );
+    }
+}
+
 /// A renderer in `width`x`height` with this overlay, or a skip.
 fn renderer(width: usize, height: usize, pip: PipSpec, scene: Scene) -> Option<Renderer> {
     testkit::renderer(width, height, pip, scene)
@@ -1020,6 +1062,95 @@ fn the_composited_frame_is_exposed_for_the_preview() {
     assert_eq!(texture.format(), wgpu::TextureFormat::Bgra8Unorm);
     assert_eq!(texture.width(), 64);
     assert_eq!(texture.height(), 36);
+}
+
+/// Exercise the real compositor and the app's inbox across repeated frames,
+/// including redraws between the writer's two callbacks. CPU pts deliberately
+/// differ: readback pipelining means timestamp equality is not a pairing key.
+#[test]
+fn preview_publishes_one_path_per_compositor_emission() {
+    use crate::app::{TestPreviewFrame as Frame, TestPreviewTap as Tap};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(mut r) = renderer(64, 36, PipSpec::default(), Scene::Screen) else {
+        return;
+    };
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let count = wakes.clone();
+    let (mut tap, cpu) = Tap::new(Arc::new(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+    let gpu = tap.gpu_sink();
+    tap.set_wanted(true);
+    let input = solid(64, 36, [21, 45, 67]);
+    for n in 1..=20 {
+        let pts = n as f64;
+        let frame = r.render_now(Some(&input), None, pts).expect("render");
+        let mut delayed = frame.clone();
+        delayed.pts -= 0.5;
+        // Run callbacks on a producer thread; force the UI to drain during
+        // the gap, not merely after both callbacks have completed.
+        let wakes_before = wakes.load(Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let (sent, recv) = std::sync::mpsc::channel();
+            let (resume, wait) = std::sync::mpsc::channel();
+            let tex = r.preview_frame(pts).expect("composited texture");
+            let gpu = &gpu;
+            let cpu = &cpu;
+            scope.spawn(move || {
+                gpu(tex);
+                sent.send(()).unwrap();
+                wait.recv().unwrap();
+                cpu(delayed);
+            });
+            recv.recv().unwrap();
+            assert!(tap.take().is_none(), "a half-pair must not be visible");
+            assert_eq!(wakes.load(Ordering::SeqCst), wakes_before);
+            resume.send(()).unwrap();
+        });
+        let Some(Frame::Gpu(tex)) = tap.take() else {
+            panic!("expected compositor texture, emission {n}");
+        };
+        assert_eq!(tex.pts, pts);
+        assert_eq!((tex.width, tex.height), (64, 36));
+        for _ in 0..3 {
+            assert!(tap.take().is_none(), "no leftover CPU frame on repaint");
+        }
+    }
+    assert!(wakes.load(Ordering::SeqCst) > 0);
+
+    // No GPU callback means genuine fallback, even after using the GPU.
+    cpu(input.clone());
+    assert!(matches!(tap.take(), Some(Frame::Cpu(_))));
+    assert!(tap.take().is_none());
+
+    // Hide/show between callbacks must not discard pairing information.
+    gpu(r.preview_frame(21.0).unwrap());
+    tap.set_wanted(false);
+    tap.set_wanted(true);
+    cpu(input.clone());
+    assert!(matches!(tap.take(), Some(Frame::Gpu(_))));
+    tap.set_wanted(false);
+    gpu(r.preview_frame(22.0).unwrap());
+    cpu(input.clone());
+    tap.set_wanted(true);
+    cpu(input.clone());
+    assert!(
+        matches!(tap.take(), Some(Frame::Cpu(_))),
+        "hidden pair drained"
+    );
+
+    // A slow UI sees only the newest committed emission, not a queue.
+    gpu(r.preview_frame(23.0).unwrap());
+    cpu(input.clone());
+    gpu(r.preview_frame(24.0).unwrap());
+    cpu(input);
+    let Some(Frame::Gpu(tex)) = tap.take() else {
+        panic!("newest texture");
+    };
+    assert_eq!(tex.pts, 24.0);
+    assert!(tap.take().is_none());
 }
 
 /// The compositor can move to the writer thread: the writer owns it there.

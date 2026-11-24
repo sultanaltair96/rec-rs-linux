@@ -24,6 +24,8 @@ mod install;
 mod linux_desktop;
 mod lock;
 mod preview;
+#[cfg(test)]
+pub(crate) use preview::{Frame as TestPreviewFrame, Tap as TestPreviewTap};
 mod preview_gpu;
 mod session;
 mod theme;
@@ -730,11 +732,9 @@ struct App {
     /// The tray starts on a thread: registering the status item talks to D-Bus,
     /// and a slow (or missing) watcher must not hold up the first frame.
     tray_rx: Option<Receiver<Option<tray::Handle>>>,
+    tray_watcher: Option<tray::Watcher>,
     tap: preview::Tap,
     tap_sink: FrameSink,
-    /// Where the writer's compositor publishes its texture (G10), and the sink
-    /// it calls. The slot holds only the newest frame, like the tap.
-    gpu_preview: Arc<Mutex<Option<crate::gpu::PreviewFrame>>>,
     gpu_preview_sink: crate::gpu::PreviewSink,
     last_tick: Instant,
     last_meter: Instant,
@@ -776,20 +776,7 @@ impl App {
         let (accent_tx, accent_rx) = std::sync::mpsc::channel();
         spawn_accent_fetch(accent_tx);
         let (tap, tap_sink) = preview::Tap::new(Arc::new(wake));
-        // G10: the compositor's texture, when it runs on this window's device.
-        // The writer calls this at the preview rate; the CPU tap's sink then
-        // wakes the window, so both are in place before the UI runs.
-        let gpu_preview: Arc<Mutex<Option<crate::gpu::PreviewFrame>>> = Arc::new(Mutex::new(None));
-        let gpu_preview_sink: crate::gpu::PreviewSink = {
-            let slot = gpu_preview.clone();
-            let wanted = Arc::new(wake);
-            Arc::new(move |frame| {
-                if let Ok(mut s) = slot.lock() {
-                    *s = Some(frame);
-                }
-                wanted();
-            })
-        };
+        let gpu_preview_sink = tap.gpu_sink();
         let lock = lock::LockWatcher::start(Arc::new(wake));
         // G9: 1B's watchers call back on their own thread; wake the loop and
         // reload in the tick. An unavailable backend simply has no watch.
@@ -819,12 +806,12 @@ impl App {
             st,
             tray: None,
             tray_rx: None,
+            tray_watcher: None,
             lock,
             _camera_watch: camera_watch,
             _audio_watch: audio_watch,
             tap,
             tap_sink,
-            gpu_preview,
             gpu_preview_sink,
             last_tick: Instant::now(),
             last_meter: Instant::now(),
@@ -1846,14 +1833,21 @@ impl App {
             updates: self.st.updates,
             hotkey_ok: self.st.hotkey_ok,
         };
-        if let Some(handle) = tray::poll_start(&mut self.tray_rx) {
-            self.tray = Some(handle);
+        if let Some(watcher) = &mut self.tray_watcher {
+            tray::poll_restart(
+                &mut self.tray,
+                &mut self.tray_rx,
+                watcher,
+                &view,
+                Arc::new(push),
+            );
         }
         if let Some(t) = &self.tray {
             if t.available() {
                 tray::update(t, view);
             } else {
-                self.tray = None;
+                // Retain the invalid handle so poll_restart can replace it
+                // after a watcher returns and registration is confirmed.
                 // A hidden app must not become unreachable when its host dies.
                 // Don't undo the deliberate capture hide (that would film Rec),
                 // or the explicit headless/background modes.
@@ -1925,47 +1919,50 @@ impl App {
             // The compositor's own texture first (G10: no readback, no
             // upload); the CPU frame is the fallback for a device that could
             // not be shared, and takes over again if the compositor is dropped.
-            let tex = self.gpu_preview.lock().ok().and_then(|mut s| s.take());
-            if let Some(tex) = tex {
-                let (pw, ph) = preview::target_size(
-                    tex.width as usize,
-                    tex.height as usize,
-                    self.st.preview_target,
-                    self.st.settings.preview_low_power,
-                );
-                self.st.preview_aspect = tex.width as f32 / tex.height.max(1) as f32;
-                self.st.preview_px = [pw as u32, ph as u32];
-                self.st.preview_frame = None;
-                self.st.frames_shown += 1;
-                if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
-                    // "preview frame" is what the self-test (and the audit)
-                    // greps for; the texture path says where it came from.
-                    eprintln!(
-                        "rec: debug: preview frame {}x{} at {:.3}s (the compositor's texture)",
-                        tex.width, tex.height, tex.pts
+            match self.tap.take() {
+                Some(preview::Frame::Gpu(tex)) => {
+                    let (pw, ph) = preview::target_size(
+                        tex.width as usize,
+                        tex.height as usize,
+                        self.st.preview_target,
+                        self.st.settings.preview_low_power,
                     );
+                    self.st.preview_aspect = tex.width as f32 / tex.height.max(1) as f32;
+                    self.st.preview_px = [pw as u32, ph as u32];
+                    self.st.preview_frame = None;
+                    self.st.frames_shown += 1;
+                    if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
+                        // "preview frame" is what the self-test (and the audit)
+                        // greps for; the texture path says where it came from.
+                        eprintln!(
+                            "rec: debug: preview frame {}x{} at {:.3}s (the compositor's texture)",
+                            tex.width, tex.height, tex.pts
+                        );
+                    }
+                    self.st.preview_tex = Some(Arc::new(tex));
                 }
-                self.st.preview_tex = Some(Arc::new(tex));
-            } else if let Some(frame) = self.tap.take() {
-                // Drawn from the GPU in `ui::preview`; the size the UI shows it
-                // at is the low-power target (half resolution), the texture
-                // stays the frame's (the GPU scales without a CPU copy).
-                let (pw, ph) = preview::target_size(
-                    frame.width,
-                    frame.height,
-                    self.st.preview_target,
-                    self.st.settings.preview_low_power,
-                );
-                self.st.preview_aspect = frame.width as f32 / frame.height as f32;
-                self.st.preview_px = [pw as u32, ph as u32];
-                let pts = frame.pts;
-                let (fw, fh) = (frame.width, frame.height);
-                self.st.preview_frame = Some(Arc::new(frame));
-                self.st.preview_tex = None;
-                self.st.frames_shown += 1;
-                if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
-                    eprintln!("rec: debug: preview frame {fw}x{fh} at {pts:.3}s");
+                Some(preview::Frame::Cpu(frame)) => {
+                    // Drawn from the GPU in `ui::preview`; the size the UI shows it
+                    // at is the low-power target (half resolution), the texture
+                    // stays the frame's (the GPU scales without a CPU copy).
+                    let (pw, ph) = preview::target_size(
+                        frame.width,
+                        frame.height,
+                        self.st.preview_target,
+                        self.st.settings.preview_low_power,
+                    );
+                    self.st.preview_aspect = frame.width as f32 / frame.height as f32;
+                    self.st.preview_px = [pw as u32, ph as u32];
+                    let pts = frame.pts;
+                    let (fw, fh) = (frame.width, frame.height);
+                    self.st.preview_frame = Some(Arc::new(frame));
+                    self.st.preview_tex = None;
+                    self.st.frames_shown += 1;
+                    if self.st.frames_shown == 1 && std::env::var_os("REC_DEBUG").is_some() {
+                        eprintln!("rec: debug: preview frame {fw}x{fh} at {pts:.3}s");
+                    }
                 }
+                None => {}
             }
         }
         let win = if is_main {
@@ -2079,23 +2076,9 @@ impl ApplicationHandler for App {
             );
             self.st.hotkey_ok = false;
         }
-        let view = tray::View {
-            has_last: false,
-            replay: self.st.replay_stats.is_some(),
-            updates: self.st.updates,
-            hotkey_ok: self.st.hotkey_ok,
-            ..Default::default()
-        };
-        // Never block the event loop on the status notifier.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("rec-tray-start".into())
-            .spawn(move || {
-                let _ = tx.send(tray::start(view, Arc::new(push)));
-                wake();
-            })
-            .ok();
-        self.tray_rx = Some(rx);
+        // The async NameOwnerChanged listener also handles a shell/extension
+        // that first appears after startup. No D-Bus work on the event loop.
+        self.tray_watcher = tray::Watcher::new();
         if std::env::var_os("REC_GUI_HIDDEN").is_some() {
             self.main_visible = false;
             self.tap.set_wanted(false);

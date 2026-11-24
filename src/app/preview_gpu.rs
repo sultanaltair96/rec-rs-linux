@@ -730,11 +730,12 @@ mod tests {
     }
 
     /// The frame drawn into `target` through one preview pass, as RGBA bytes.
+    /// With no composited frame, draw the existing CPU camera upload unchanged.
     fn draw_and_read(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         painter: &mut PreviewPainter,
-        frame: &crate::gpu::PreviewFrame,
+        frame: Option<&crate::gpu::PreviewFrame>,
         target: &wgpu::Texture,
         (w, h): (u32, u32),
     ) -> Vec<u8> {
@@ -746,7 +747,9 @@ mod tests {
         });
         let view = target.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&Default::default());
-        assert!(painter.texture_bind(device, frame), "bound the texture");
+        if let Some(frame) = frame {
+            assert!(painter.texture_bind(device, frame), "bound the texture");
+        }
         {
             let mut pass = enc
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -766,8 +769,14 @@ mod tests {
                     multiview_mask: None,
                 })
                 .forget_lifetime();
-            pass.set_pipeline(&painter.texture_pipeline);
-            pass.set_bind_group(0, &painter.texture_bound.as_ref().expect("bound").1, &[]);
+            if frame.is_some() {
+                pass.set_pipeline(&painter.texture_pipeline);
+                pass.set_bind_group(0, &painter.texture_bound.as_ref().expect("bound").1, &[]);
+            } else {
+                let uploaded = painter.uploaded.as_ref().expect("camera uploaded");
+                pass.set_pipeline(&painter.pipelines[uploaded.mode.index()]);
+                pass.set_bind_group(0, &uploaded.bind, &[]);
+            }
             pass.draw(0..3, 0..1);
         }
         enc.copy_texture_to_buffer(
@@ -994,7 +1003,7 @@ mod tests {
             pts: 1.0,
             generation: 1,
         };
-        let data = draw_and_read(&device, &queue, &mut painter, &frame, &target, (w, h));
+        let data = draw_and_read(&device, &queue, &mut painter, Some(&frame), &target, (w, h));
         let centre = (((h / 2) * w + w / 2) * 4) as usize;
         assert_eq!(
             &data[centre..centre + 4],
@@ -1005,8 +1014,60 @@ mod tests {
         assert_eq!(&data[0..4], &[10, 20, 30, 255]);
         // The same texture again: the cached bind group is reused (the
         // generation did not change), and it still draws.
-        let data = draw_and_read(&device, &queue, &mut painter, &frame, &target, (w, h));
+        let data = draw_and_read(&device, &queue, &mut painter, Some(&frame), &target, (w, h));
         assert_eq!(&data[centre..centre + 4], &[10, 20, 30, 255]);
+    }
+
+    /// An idle camera is uploaded once but painted on every preview redraw.
+    /// Compare full GPU readbacks so a blank second pass cannot go unnoticed.
+    #[test]
+    fn unchanged_camera_upload_draws_twice_without_flicker() {
+        let Some((device, queue)) = gpu() else {
+            eprintln!("SKIP: no wgpu adapter");
+            return;
+        };
+        let mut painter = PreviewPainter::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let (w, h) = (64, 32);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("unchanged camera preview target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let packed = VideoFrame::packed(
+            1.0,
+            w as usize,
+            h as usize,
+            PixelFormat::Bgra,
+            [30, 20, 10, 255].repeat((w * h) as usize),
+        );
+        let (r, g, b) = crate::app::preview::yuv_to_rgb(180, 60, 200);
+        for (camera, expected) in [
+            (packed, [10, 20, 30, 255]),
+            (nv12(w as usize, h as usize, 180, 60, 200), [r, g, b, 255]),
+        ] {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            assert!(painter.upload(&device, &mut encoder, &camera));
+            queue.submit([encoder.finish()]);
+            let first = draw_and_read(&device, &queue, &mut painter, None, &target, (w, h));
+            for pixel in first.chunks_exact(4) {
+                for (got, want) in pixel.iter().zip(expected) {
+                    assert!(got.abs_diff(want) <= 1, "camera colour: {pixel:?}");
+                }
+            }
+            // A separate submission clears and repaints the target without a
+            // new upload: the retained camera texture must still be sampled.
+            let second = draw_and_read(&device, &queue, &mut painter, None, &target, (w, h));
+            assert_eq!(second, first, "{:?} camera flickered", camera.format);
+        }
     }
 
     /// The shader, run for real: a 64×32 NV12 frame of one colour, drawn into a

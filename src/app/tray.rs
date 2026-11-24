@@ -8,15 +8,15 @@
 //! never invisible.
 //!
 //! The menu model, the title/tooltip mapping and the icon are pure functions
-//! (unit tested); only [`start`] talks to D-Bus, and it returns `None` when
-//! there is no StatusNotifierWatcher (a bare session), where the window and the
-//! hotkeys still work.
+//! (unit tested). [`start`] confirms registration; [`Watcher`] listens for
+//! NameOwnerChanged to recover after shell restarts or initial absence. Without
+//! a registered watcher/host the window and hotkeys still work.
 //!
 //! Adapted from rec-rs src/app/menubar.rs (MIT OR Apache-2.0), NSStatusItem
 //! replaced by ksni's StatusNotifierItem.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, ToolTip, Tray as KsniTray};
@@ -198,8 +198,9 @@ impl KsniTray for Tray {
         self.online.store(false, Ordering::Release);
         eprintln!("rec: warning: tray watcher lost; closing the window will quit Rec");
         super::wake();
-        // Stop rather than trusting watcher_online: ksni calls that before
-        // re-registration has succeeded, so it is not confirmation.
+        // ksni 0.3.7 service::run calls watcher_online BEFORE registration,
+        // and skips the host check on that path. Stop this service; poll_restart
+        // creates a fresh one whose spawn confirms both registration and host.
         false
     }
 
@@ -264,16 +265,28 @@ impl KsniTray for Tray {
 pub struct Handle {
     inner: ksni::blocking::Handle<Tray>,
     online: Arc<AtomicBool>,
+    generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.inner.shutdown();
+    }
 }
 
 impl Handle {
     pub fn available(&self) -> bool {
-        self.online.load(Ordering::Acquire) && !self.inner.is_closed()
+        self.online.load(Ordering::Acquire)
+            && !self.inner.is_closed()
+            && self
+                .generation
+                .as_ref()
+                .is_none_or(|(current, registered)| current.load(Ordering::Acquire) == *registered)
     }
 }
 
-/// Poll startup without blocking; a failed worker is terminal, just like a
-/// missing watcher. While pending, this returns no confirmed handle.
+/// Drain one registration attempt without blocking. Failure remains window-only
+/// until the next owner-change trigger; pending is not a confirmed handle.
 pub fn poll_start(
     pending: &mut Option<std::sync::mpsc::Receiver<Option<Handle>>>,
 ) -> Option<Handle> {
@@ -291,6 +304,135 @@ pub fn poll_start(
     }
 }
 
+/// One cancellable signal listener per app, including sessions that initially
+/// have no watcher. Name ownership is only a retry trigger, never availability.
+/// The generation also invalidates registrations whose reply races an owner change.
+pub struct Watcher {
+    generation: Arc<AtomicU64>,
+    present: Arc<AtomicBool>,
+    attempted: u64,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watcher {
+    pub fn new() -> Option<Self> {
+        use futures_util::StreamExt;
+        let generation = Arc::new(AtomicU64::new(0));
+        let present = Arc::new(AtomicBool::new(false));
+        let epoch = generation.clone();
+        let owned = present.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("rec-tray-watcher".into())
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    let listen = async {
+                        let conn = zbus::Connection::session().await?;
+                        let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+                        let name = "org.kde.StatusNotifierWatcher";
+                        // Install the match before the snapshot: a change during
+                        // the query is queued and invalidates that snapshot too.
+                        let mut changes = dbus
+                            .receive_name_owner_changed_with_args(&[(0, name)])
+                            .await?;
+                        owned.store(
+                            dbus.name_has_owner(name.try_into().unwrap()).await?,
+                            Ordering::Release,
+                        );
+                        epoch.fetch_add(1, Ordering::AcqRel);
+                        super::wake();
+                        while let Some(change) = changes.next().await {
+                            let args = change.args()?;
+                            owned.store(args.new_owner().is_some(), Ordering::Release);
+                            epoch.fetch_add(1, Ordering::AcqRel);
+                            super::wake();
+                        }
+                        Ok::<(), zbus::Error>(())
+                    };
+                    futures_util::pin_mut!(listen);
+                    // Dropping the app cancels even connection setup or a quiet
+                    // signal stream; join cannot leave a parked listener behind.
+                    let _ = futures_util::future::select(listen, stopped).await;
+                    owned.store(false, Ordering::Release);
+                    epoch.fetch_add(1, Ordering::AcqRel);
+                    super::wake();
+                });
+            })
+            .ok()?;
+        Some(Self {
+            generation,
+            present,
+            attempted: 0,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Drain async results on the UI thread. Registration is attempted only after
+/// the initial snapshot or NameOwnerChanged, not by polling D-Bus or a timer.
+pub fn poll_restart(
+    handle: &mut Option<Handle>,
+    pending: &mut Option<std::sync::mpsc::Receiver<Option<Handle>>>,
+    watcher: &mut Watcher,
+    view: &View,
+    send: Arc<dyn Fn(Cmd) + Send + Sync>,
+) {
+    if let Some(registered) = poll_start(pending) {
+        if registered.available() {
+            if handle.is_some() {
+                eprintln!("rec: tray watcher back; re-registered");
+            }
+            *handle = Some(registered);
+        }
+    }
+    let generation = watcher.generation.load(Ordering::Acquire);
+    if pending.is_some() || generation == watcher.attempted {
+        return;
+    }
+    watcher.attempted = generation;
+    if !watcher.present.load(Ordering::Acquire) {
+        return;
+    }
+    let view = view.clone();
+    let epoch = watcher.generation.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // At most one registration in flight, even during repeated shell restarts.
+    if let Err(e) = std::thread::Builder::new()
+        .name("rec-tray-register".into())
+        .spawn(move || {
+            let registered = start(view, send).map(|mut handle| {
+                handle.generation = Some((epoch, generation));
+                handle
+            });
+            let _ = tx.send(registered);
+            super::wake();
+        })
+    {
+        eprintln!("rec: warning: cannot restart tray worker ({e})");
+        return;
+    }
+    *pending = Some(rx);
+}
+
 /// Start the tray. `None` (with a warning) when the session has no
 /// StatusNotifierWatcher, so the app keeps working without one.
 pub fn start(view: View, send: Arc<dyn Fn(Cmd) + Send + Sync>) -> Option<Handle> {
@@ -306,7 +448,11 @@ pub fn start(view: View, send: Arc<dyn Fn(Cmd) + Send + Sync>) -> Option<Handle>
         online: online.clone(),
     };
     match tray.disable_dbus_name(flatpak).spawn() {
-        Ok(inner) => Some(Handle { inner, online }),
+        Ok(inner) => Some(Handle {
+            inner,
+            online,
+            generation: None,
+        }),
         Err(e) => {
             eprintln!("rec: warning: no tray item ({e}); closing the window will quit Rec");
             None
@@ -326,6 +472,7 @@ pub fn update(handle: &Handle, view: View) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn idle() -> View {
         View {
@@ -379,6 +526,255 @@ mod tests {
         };
         assert!(!tray.watcher_offline(ksni::OfflineReason::No));
         assert!(!online.load(Ordering::Acquire));
+    }
+
+    struct FakeWatcher {
+        calls: std::sync::mpsc::Sender<String>,
+        release: Arc<tokio::sync::Notify>,
+        reject: Arc<AtomicBool>,
+        host: Arc<AtomicBool>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+    impl FakeWatcher {
+        async fn register_status_notifier_item(&self, service: String) -> zbus::fdo::Result<()> {
+            self.calls.send(service).unwrap();
+            // A name owner alone must not make the tray available. Hold the
+            // method reply until the test explicitly accepts/rejects it.
+            self.release.notified().await;
+            if self.reject.load(Ordering::Acquire) {
+                Err(zbus::fdo::Error::Failed(
+                    "test registration rejected".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        #[zbus(property)]
+        fn is_status_notifier_host_registered(&self) -> bool {
+            self.host.load(Ordering::Acquire)
+        }
+    }
+
+    /// Each invocation owns its daemon; no process-global environment mutation,
+    /// shared desktop bus, sleeps as synchronization, or detached child daemon.
+    #[test]
+    fn private_bus_watcher_restart_confirms_registration_before_hiding() {
+        const CHILD: &str = "REC_TRAY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+            struct Bus(std::process::Child);
+            impl Drop for Bus {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut bus = Bus(Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start private dbus-daemon"));
+            let mut address = String::new();
+            std::io::BufReader::new(bus.0.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            assert!(!address.trim().is_empty());
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::tray::tests::private_bus_watcher_restart_confirms_registration_before_hiding", "--nocapture"])
+                .env(CHILD, "1")
+                .env("DBUS_SESSION_BUS_ADDRESS", address.trim())
+                .env_remove("FLATPAK_ID")
+                .status().unwrap();
+            assert!(status.success(), "private bus child failed: {status}");
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    let (calls_tx, calls) = std::sync::mpsc::channel();
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let reject = Arc::new(AtomicBool::new(false));
+                    let host = Arc::new(AtomicBool::new(true));
+                    let make_watcher = || FakeWatcher {
+                        calls: calls_tx.clone(),
+                        release: release.clone(),
+                        reject: reject.clone(),
+                        host: host.clone(),
+                    };
+                    let watcher = zbus::connection::Builder::session()
+                        .unwrap()
+                        .serve_at("/StatusNotifierWatcher", make_watcher())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    let name = "org.kde.StatusNotifierWatcher";
+                    let mut recovery = Watcher::new().unwrap();
+                    // Wait for the subscribed initial snapshot with no owner.
+                    while recovery.generation.load(Ordering::Acquire) == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(!recovery.present.load(Ordering::Acquire));
+                    let epoch = recovery.generation.clone();
+                    let mut poll_restart =
+                        |handle: &mut Option<Handle>,
+                         pending: &mut Option<std::sync::mpsc::Receiver<Option<Handle>>>,
+                         view: &View,
+                         send: Arc<dyn Fn(Cmd) + Send + Sync>| {
+                            super::poll_restart(handle, pending, &mut recovery, view, send);
+                        };
+                    // Initial absence must not disable later recovery.
+                    watcher.request_name(name).await.unwrap();
+                    let (commands_tx, commands) = std::sync::mpsc::channel();
+                    let send: Arc<dyn Fn(Cmd) + Send + Sync> = Arc::new(move |c| {
+                        commands_tx.send(c).unwrap();
+                    });
+                    let mut pending = None;
+                    let mut handle = None;
+                    // First registration is also unavailable until its reply.
+                    loop {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        if calls.try_recv().is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(handle.is_none());
+                    // Change ownership while the successful reply is held.
+                    // Even if ksni accepts it, that stale worker must never be
+                    // published as available for the replacement owner.
+                    let before = epoch.load(Ordering::Acquire);
+                    watcher.release_name(name).await.unwrap();
+                    watcher.request_name(name).await.unwrap();
+                    while epoch.load(Ordering::Acquire) < before + 2 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    release.notify_one();
+                    loop {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        assert!(handle.is_none());
+                        if calls.try_recv().is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    release.notify_one();
+                    while handle.is_none() {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(handle.as_ref().unwrap().available());
+                    // Close the connection entirely; the replacement below
+                    // has a different unique owner, like a restarted shell.
+                    watcher.close().await.unwrap();
+                    while handle.as_ref().unwrap().available() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(
+                        super::super::hide_action(true, handle.as_ref().unwrap().available()),
+                        super::super::HideAction::Quit
+                    );
+                    // No timer/probe should attempt registration while absent.
+                    poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                    while pending.is_some() {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(!handle.as_ref().unwrap().available());
+                    assert!(calls.try_recv().is_err());
+                    let watcher = zbus::connection::Builder::session()
+                        .unwrap()
+                        .serve_at("/StatusNotifierWatcher", make_watcher())
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    watcher.request_name(name).await.unwrap();
+                    // A returned watcher that rejects registration is not usable.
+                    reject.store(true, Ordering::Release);
+                    loop {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        if calls.try_recv().is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(!handle.as_ref().unwrap().available());
+                    assert!(pending.is_some());
+                    release.notify_one();
+                    while pending.is_some() {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(!handle.as_ref().unwrap().available());
+                    reject.store(false, Ordering::Release);
+                    // Even a successful registration needs a registered host.
+                    host.store(false, Ordering::Release);
+                    watcher.release_name(name).await.unwrap();
+                    watcher.request_name(name).await.unwrap();
+                    loop {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        if calls.try_recv().is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    release.notify_one();
+                    while pending.is_some() {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(!handle.as_ref().unwrap().available());
+                    host.store(true, Ordering::Release);
+                    watcher.release_name(name).await.unwrap();
+                    watcher.request_name(name).await.unwrap();
+                    let service = loop {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        if let Ok(service) = calls.try_recv() {
+                            break service;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
+                    assert!(!handle.as_ref().unwrap().available());
+                    release.notify_one();
+                    while !handle.as_ref().unwrap().available() {
+                        poll_restart(&mut handle, &mut pending, &idle(), send.clone());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(
+                        super::super::hide_action(true, handle.as_ref().unwrap().available()),
+                        super::super::HideAction::DestroyWindow
+                    );
+                    assert_eq!(
+                        super::super::hide_action(false, handle.as_ref().unwrap().available()),
+                        super::super::HideAction::SetInvisible
+                    );
+                    // Confirm the newly registered item is callable, not merely
+                    // a successful fake method reply or an old exported object.
+                    let item = zbus::Proxy::new(
+                        &watcher,
+                        service.as_str(),
+                        "/StatusNotifierItem",
+                        "org.kde.StatusNotifierItem",
+                    )
+                    .await
+                    .unwrap();
+                    item.call::<_, _, ()>("Activate", &(0i32, 0i32))
+                        .await
+                        .unwrap();
+                    assert_eq!(commands.try_recv().unwrap(), Cmd::ShowWindow);
+                    assert!(commands.try_recv().is_err());
+                    drop(handle);
+                })
+                .await
+                .expect("tray lifecycle timed out");
+            });
     }
 
     #[test]

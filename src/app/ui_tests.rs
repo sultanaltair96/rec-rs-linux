@@ -10,6 +10,7 @@
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
+use super::preview;
 use super::widgets::{self as w};
 
 /// Creating and destroying wgpu devices on Mesa's lavapipe from several
@@ -787,7 +788,7 @@ fn the_composited_preview_moves_the_overlay_after_set_pip() {
     let mut first = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
-        if let Some(f) = tap.take()
+        if let Some(preview::Frame::Cpu(f)) = tap.take()
             && red_share(&f, bottom_right) > 0.6
         {
             first = Some(f);
@@ -811,7 +812,7 @@ fn the_composited_preview_moves_the_overlay_after_set_pip() {
     let mut moved = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if let Some(f) = tap.take()
+        if let Some(preview::Frame::Cpu(f)) = tap.take()
             && f.pts > first.pts + 0.05
             && red_share(&f, top_left) > 0.6
         {
@@ -1052,7 +1053,7 @@ fn the_camera_is_handed_over_without_reopening_it() {
     ) -> Option<(Duration, crate::media_types::VideoFrame)> {
         let t0 = Instant::now();
         while t0.elapsed() < limit {
-            if let Some(f) = tap.take() {
+            if let Some(preview::Frame::Cpu(f)) = tap.take() {
                 return Some((t0.elapsed(), f));
             }
             std::thread::sleep(Duration::from_millis(5));
