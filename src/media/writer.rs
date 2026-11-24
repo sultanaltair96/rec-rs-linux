@@ -262,7 +262,8 @@ fn secs_ns(t: f64) -> u64 {
 
 /// Associate timestamps with frames, not output order: encoders may drop a
 /// frame or rewrite its PTS. ReferenceTimestampMeta is copied by GstVideoEncoder
-/// onto the corresponding output frame. There is deliberately no FIFO fallback.
+/// onto the corresponding output frame. Untagged encoders use the submission
+/// FIFO below; all configured encoders have B-frames disabled.
 /// Store running time so an encoder's shifted segment (e.g. x264's 1000 h)
 /// can be respected when restoring timestamps before the parser sees them.
 fn stamp_encoder_slot(
@@ -297,6 +298,15 @@ fn restore_encoder_slot(
         slots.next().is_none(),
         "ambiguous video encoder slot metadata"
     );
+    restore_slot_timing(buffer, time, duration, segment)
+}
+
+fn restore_slot_timing(
+    buffer: &mut gst::BufferRef,
+    time: gst::ClockTime,
+    duration: Option<gst::ClockTime>,
+    segment: Option<&gst::FormattedSegment<gst::ClockTime>>,
+) -> Result<()> {
     let pts = segment
         .context("video encoder output has no TIME segment")?
         .position_from_running_time(time)
@@ -310,15 +320,89 @@ fn restore_encoder_slot(
     Ok(())
 }
 
+/// Only submitted, not yet emitted inputs live here. Do not cap or evict this
+/// FIFO: silent eviction would shift every subsequent untagged association.
+/// Entries include internally lost inputs until a matching PTS resync or EOS;
+/// completed submissions never accumulate here.
+#[derive(Default)]
+struct PendingSlots {
+    slots: VecDeque<(u64, Option<gst::ClockTime>)>,
+    skipped: u64,
+    used_fifo: bool,
+}
+
+impl PendingSlots {
+    fn insert(&mut self, time: u64, duration: Option<gst::ClockTime>) {
+        self.slots.push_back((time, duration));
+    }
+
+    fn remove_tagged(&mut self, time: u64) -> Result<()> {
+        let index = self
+            .slots
+            .iter()
+            .position(|s| s.0 == time)
+            .context("video encoder tagged output has no submitted slot")?;
+        self.slots.remove(index);
+        Ok(())
+    }
+
+    /// An unchanged PTS is authoritative, including after an internal loss.
+    /// Otherwise associate by order, never by output sample index/grid slot.
+    fn untagged(&mut self, time: Option<u64>) -> Result<Option<(u64, Option<gst::ClockTime>)>> {
+        if let Some(index) = self.slots.iter().position(|s| Some(s.0) == time) {
+            self.skipped += index as u64;
+            self.slots.drain(..=index);
+            return Ok(None);
+        }
+        let slot = self
+            .slots
+            .pop_front()
+            .context("video encoder output has no submitted slot (timestamp FIFO empty)")?;
+        self.used_fifo = true;
+        Ok(Some(slot))
+    }
+
+    fn lost(&self) -> u64 {
+        self.skipped + self.slots.len() as u64
+    }
+
+    fn loss_report(&self) -> Option<String> {
+        let lost = self.lost();
+        if lost == 0 {
+            return None;
+        }
+        if self.used_fifo || !self.slots.is_empty() {
+            Some(format!(
+                "rec: warning: {lost} frames lost inside the encoder; sync after first loss may be off by up to {lost} frames"
+            ))
+        } else {
+            // Exact metadata/PTS matches self-heal: losses did not shift sync.
+            Some(format!(
+                "rec: {lost} frames lost inside the encoder (timestamps preserved)"
+            ))
+        }
+    }
+}
+
+fn running_time(
+    buffer: &gst::BufferRef,
+    segment: Option<&gst::FormattedSegment<gst::ClockTime>>,
+) -> Option<u64> {
+    segment?
+        .to_running_time(buffer.pts()?)
+        .map(|t| t.nseconds())
+}
+
 /// Install on the encoder itself: downstream parsers need the corrected PTS.
-/// If an encoder strips metadata, keep its own timestamp and count the degraded
-/// association rather than destroying the recording or guessing a slot.
+/// Untagged output first tries its own running PTS, then submission order.
+/// Queue operations never hold a segment lock or run while pushing a buffer.
 fn install_encoder_timing(
     encoder: &gst::Element,
     enc_in: Arc<std::sync::atomic::AtomicU64>,
     enc_out: Arc<std::sync::atomic::AtomicU64>,
     errors: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<()> {
+) -> Result<Arc<std::sync::Mutex<PendingSlots>>> {
+    let pending = Arc::new(std::sync::Mutex::new(PendingSlots::default()));
     for input in [true, false] {
         let pad = encoder
             .static_pad(if input { "sink" } else { "src" })
@@ -331,26 +415,53 @@ fn install_encoder_timing(
             enc_out.clone()
         };
         let errors = errors.clone();
+        let pending = pending.clone();
         pad.add_probe(
             gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
             move |_, info| {
-                let mut segment = segment.lock().unwrap();
                 if let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() {
-                    if let gst::EventView::Segment(event) = event.view() {
-                        *segment = event.segment().downcast_ref::<gst::ClockTime>().cloned();
+                    match event.view() {
+                        gst::EventView::Segment(event) => {
+                            *segment.lock().unwrap() = event.segment().downcast_ref::<gst::ClockTime>().cloned();
+                        }
+                        gst::EventView::Eos(_) if !input => {
+                            let report = pending.lock().unwrap().loss_report();
+                            if let Some(report) = report {
+                                eprintln!("{report}");
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+                    let segment = segment.lock().unwrap().clone();
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let result = if input {
-                        stamp_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
-                    } else {
-                        restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())
-                    };
+                    let result = (|| -> Result<()> {
+                        if input {
+                            stamp_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())?;
+                            let time = running_time(buffer, segment.as_ref())
+                                .context("video encoder input has no running PTS")?;
+                            pending.lock().unwrap().insert(time, buffer.duration());
+                        } else if buffer.iter_meta::<gst::ReferenceTimestampMeta>()
+                            .any(|meta| meta.reference() == reference.as_ref())
+                        {
+                            restore_encoder_slot(buffer.make_mut(), &reference, segment.as_ref())?;
+                            let time = running_time(buffer, segment.as_ref())
+                                .context("video encoder restored output has no running PTS")?;
+                            pending.lock().unwrap().remove_tagged(time)?;
+                        } else {
+                            let time = running_time(buffer, segment.as_ref());
+                            let slot = pending.lock().unwrap().untagged(time)?;
+                            if let Some((time, duration)) = slot {
+                                restore_slot_timing(buffer.make_mut(), gst::ClockTime::from_nseconds(time), duration, segment.as_ref())?;
+                            }
+                        }
+                        Ok(())
+                    })();
                     if let Err(error) = result
                         && errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
                     {
-                        eprintln!("rec: warning: video encoder timestamp association unavailable ({error:#}); keeping encoder timestamps, sync may drift");
+                        eprintln!("rec: error: video encoder timestamp association unavailable ({error:#}); keeping encoder timestamps, sync may drift");
                     }
                 }
                 gst::PadProbeReturn::Ok
@@ -358,7 +469,7 @@ fn install_encoder_timing(
         )
         .context("installing video encoder timestamp probe")?;
     }
-    Ok(())
+    Ok(pending)
 }
 
 /// Which track of the file an audio stream goes to.
@@ -2567,7 +2678,12 @@ mod tests {
     /// Exercise the real pad probes and streaming threads, not just helpers.
     /// identity models an encoder rewriting timestamps and losing one frame;
     /// software encoders also exercise GstVideoEncoder's metadata copying.
-    fn run_encoder_slot_pipeline(name: &str, lose_meta: bool) {
+    fn run_encoder_slot_pipeline(
+        name: &str,
+        lose_meta: bool,
+        preserve_pts: bool,
+        internal_loss: bool,
+    ) {
         use std::sync::atomic::{AtomicU64, Ordering};
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
@@ -2612,17 +2728,26 @@ mod tests {
                     }
                     if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
                         let i = index.fetch_add(1, Ordering::Relaxed);
-                        if i == 1 && !lose_meta {
+                        if i == 1 && internal_loss {
                             return gst::PadProbeReturn::Drop;
                         }
                         if lose_meta {
                             let mut replacement = gst::Buffer::with_size(1).unwrap();
                             let b = replacement.make_mut();
-                            let pts = gst::ClockTime::from_seconds(3_600_000)
-                                + gst::ClockTime::from_nseconds(slot_ns(i as i64, 30));
+                            let original = buffer.pts().unwrap();
+                            let pts = if preserve_pts {
+                                gst::ClockTime::from_seconds(3_600_000) + original
+                            } else {
+                                gst::ClockTime::from_seconds(3_600_001)
+                                    + gst::ClockTime::from_nseconds(slot_ns(i as i64, 30))
+                            };
                             b.set_pts(pts);
                             b.set_dts(pts);
-                            b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30)));
+                            b.set_duration(if preserve_pts {
+                                buffer.duration()
+                            } else {
+                                None
+                            });
                             *buffer = replacement;
                         } else {
                             buffer.make_mut().set_pts(gst::ClockTime::from_seconds(i));
@@ -2633,7 +2758,7 @@ mod tests {
                 },
             );
         }
-        install_encoder_timing(
+        let pending = install_encoder_timing(
             &encoder,
             count_in.clone(),
             count_out.clone(),
@@ -2650,7 +2775,7 @@ mod tests {
             let b = buffer.get_mut().unwrap();
             b.map_writable().unwrap().as_mut_slice().fill(128);
             b.set_pts(gst::ClockTime::from_nseconds(slot_ns(slot, 30)));
-            b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30)));
+            b.set_duration(gst::ClockTime::from_nseconds(slot_ns(1, 30) + slot as u64));
             source.push_buffer(buffer).unwrap();
         }
         source.end_of_stream().unwrap();
@@ -2669,9 +2794,13 @@ mod tests {
                     .nseconds(),
             );
             assert_eq!(buffer.dts(), buffer.pts(), "{name}");
+            let slot = slots
+                .iter()
+                .find(|&&s| slot_ns(s, 30) == *times.last().unwrap())
+                .unwrap();
             assert_eq!(
                 buffer.duration(),
-                Some(gst::ClockTime::from_nseconds(slot_ns(1, 30)))
+                Some(gst::ClockTime::from_nseconds(slot_ns(1, 30) + *slot as u64))
             );
         }
         let message = pipeline.bus().unwrap().timed_pop_filtered(
@@ -2683,13 +2812,25 @@ mod tests {
         assert_eq!(count_in.load(Ordering::Relaxed), 6);
         if lose_meta {
             assert!(matches!(message.view(), gst::MessageView::Eos(_)));
+            let expected: Vec<_> = if preserve_pts {
+                slots
+                    .into_iter()
+                    .filter(|s| !internal_loss || *s != 1)
+                    .map(|i| slot_ns(i, 30))
+                    .collect()
+            } else {
+                slots
+                    .into_iter()
+                    .take(if internal_loss { 5 } else { 6 })
+                    .map(|i| slot_ns(i, 30))
+                    .collect()
+            };
             assert_eq!(
-                times,
-                (0..6).map(|i| slot_ns(i, 30)).collect::<Vec<_>>(),
-                "fallback retains encoder timestamps, without guessing"
+                times, expected,
+                "fallback uses submitted slots, not a contiguous grid"
             );
-            assert_eq!(errors.load(Ordering::Relaxed), 6);
-            assert_eq!(count_out.load(Ordering::Relaxed), 6);
+            assert_eq!(errors.load(Ordering::Relaxed), 0);
+            assert_eq!(count_out.load(Ordering::Relaxed), times.len() as u64);
         } else {
             if let gst::MessageView::Error(error) = message.view() {
                 panic!("{name}: {} {:?}", error.error(), error.debug());
@@ -2697,22 +2838,135 @@ mod tests {
             assert_eq!(errors.load(Ordering::Relaxed), 0, "{name}");
             let expected: Vec<_> = slots
                 .into_iter()
-                .filter(|s| name != "identity" || *s != 1)
+                .filter(|s| !internal_loss || *s != 1)
                 .map(|s| slot_ns(s, 30))
                 .collect();
             assert_eq!(times, expected, "{name}");
             assert_eq!(count_out.load(Ordering::Relaxed), times.len() as u64);
         }
+        let pending = pending.lock().unwrap();
+        assert_eq!(pending.lost(), u64::from(internal_loss));
+        match pending.loss_report() {
+            None => assert!(!internal_loss),
+            Some(report) => {
+                assert!(report.contains("1 frames lost inside the encoder"));
+                if (lose_meta && !preserve_pts) || !pending.slots.is_empty() {
+                    assert!(report.contains("sync after first loss may be off by up to 1 frames"));
+                } else {
+                    assert!(!report.contains("warning"), "exact matches must self-heal");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_slot_pending_resync_counts_and_empty_error() {
+        let mut pending = PendingSlots::default();
+        let duration = Some(gst::ClockTime::from_nseconds(7));
+        pending.insert(10, duration);
+        pending.insert(30, duration);
+        pending.insert(50, duration);
+        // Tagged output removes only its own entry, not older entries.
+        pending.remove_tagged(30).unwrap();
+        assert_eq!(pending.untagged(Some(999)).unwrap(), Some((10, duration)));
+        assert_eq!(pending.untagged(Some(50)).unwrap(), None);
+        assert_eq!(pending.lost(), 0);
+        assert!(
+            pending
+                .untagged(None)
+                .unwrap_err()
+                .to_string()
+                .contains("FIFO empty")
+        );
+        assert!(pending.slots.is_empty());
+        assert!(pending.used_fifo);
+        assert!(pending.loss_report().is_none());
+
+        pending.insert(100, duration);
+        pending.insert(200, duration);
+        pending.insert(300, duration);
+        pending.untagged(Some(200)).unwrap();
+        // One skipped plus one still pending at EOS, never the slot distance.
+        assert_eq!(pending.skipped, 1);
+        assert_eq!(pending.lost(), 2);
+        assert!(pending.loss_report().unwrap().contains("up to 2 frames"));
+    }
+
+    #[test]
+    fn encoder_slot_empty_fifo_reports_error_and_retains_output() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let encoder = gst::ElementFactory::make("identity").build().unwrap();
+        let sink = gstreamer_app::AppSink::builder()
+            .sync(false)
+            .async_(false)
+            .build();
+        pipeline.add_many([&encoder, sink.upcast_ref()]).unwrap();
+        encoder.link(&sink).unwrap();
+        let errors = Arc::new(AtomicU64::new(0));
+        let count_out = Arc::new(AtomicU64::new(0));
+        let pending = install_encoder_timing(
+            &encoder,
+            Arc::new(AtomicU64::new(0)),
+            count_out.clone(),
+            errors.clone(),
+        )
+        .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        // An unsolicited output: nothing ever traversed the encoder sink.
+        let src = encoder.static_pad("src").unwrap();
+        assert!(src.push_event(gst::event::StreamStart::new("empty-fifo")));
+        assert!(
+            src.push_event(gst::event::Segment::new(&gst::FormattedSegment::<
+                gst::ClockTime,
+            >::new()))
+        );
+        let mut buffer = gst::Buffer::with_size(1).unwrap();
+        buffer.make_mut().set_pts(gst::ClockTime::from_seconds(7));
+        buffer.make_mut().set_dts(gst::ClockTime::from_seconds(6));
+        src.push(buffer).unwrap();
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(10))
+            .unwrap();
+        assert!(src.push_event(gst::event::Eos::new()));
+        assert_eq!(
+            sample.buffer().unwrap().pts(),
+            Some(gst::ClockTime::from_seconds(7))
+        );
+        assert_eq!(
+            sample.buffer().unwrap().dts(),
+            Some(gst::ClockTime::from_seconds(6))
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 1);
+        assert_eq!(count_out.load(Ordering::Relaxed), 1);
+        assert_eq!(pending.lock().unwrap().lost(), 0);
+        pipeline.set_state(gst::State::Null).unwrap();
     }
 
     #[test]
     fn encoder_slot_identity_retimestamp_and_lost_frame() {
-        run_encoder_slot_pipeline("identity", false);
+        run_encoder_slot_pipeline("identity", false, false, true);
     }
 
     #[test]
-    fn encoder_slot_missing_metadata_warns_counts_and_keeps_frames() {
-        run_encoder_slot_pipeline("identity", true);
+    fn encoder_slot_missing_metadata_restores_submission_fifo() {
+        run_encoder_slot_pipeline("identity", true, false, false);
+    }
+
+    #[test]
+    fn encoder_slot_untagged_matching_pts_is_accepted() {
+        run_encoder_slot_pipeline("identity", true, true, false);
+    }
+
+    #[test]
+    fn encoder_slot_fifo_internal_loss_reports_bounded_eos_count() {
+        run_encoder_slot_pipeline("identity", true, false, true);
+    }
+
+    #[test]
+    fn encoder_slot_unchanged_pts_internal_loss_self_heals() {
+        run_encoder_slot_pipeline("identity", true, true, true);
     }
 
     #[test]
@@ -2724,7 +2978,7 @@ mod tests {
             "avenc_prores_aw",
             "avenc_prores_ks",
         ] {
-            run_encoder_slot_pipeline(name, false);
+            run_encoder_slot_pipeline(name, false, false, false);
         }
     }
 
