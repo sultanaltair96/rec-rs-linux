@@ -35,6 +35,7 @@ mod cursor;
 mod format;
 mod pipewire;
 mod portal;
+pub(crate) use portal::available as portal_availability;
 mod selector;
 mod token;
 pub mod x11;
