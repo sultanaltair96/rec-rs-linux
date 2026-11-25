@@ -25,6 +25,7 @@ mod linux_desktop;
 mod lock;
 mod preview;
 mod recovery;
+mod sleep;
 #[cfg(test)]
 pub(crate) use preview::{Frame as TestPreviewFrame, Tap as TestPreviewTap};
 mod preview_gpu;
@@ -117,6 +118,7 @@ pub enum Cmd {
     SaveReplay,
     ToggleStream,
     CheckForUpdates,
+    SaveDiagnosticReport,
     /// Add this AppImage to the desktop's menu (self-integration).
     Integrate,
     Quit,
@@ -756,6 +758,8 @@ struct App {
     /// The screen is locked (G8): nothing is drawn and no preview frames are
     /// converted until it is unlocked.
     screen_locked: bool,
+    sleeping: bool,
+    sleep: Option<sleep::SleepWatcher>,
     /// The main window is covered or minimized (winit's occlusion event, which
     /// Wayland often does not send).
     main_occluded: bool,
@@ -810,6 +814,8 @@ struct App {
     update_rx: Receiver<std::result::Result<updater::Found, String>>,
     accent_rx: Receiver<Option<egui::Color32>>,
     accent_done: bool,
+    /// Both the native picker and collection run off the event loop.
+    diagnostic_rx: Option<Receiver<std::result::Result<Option<std::path::PathBuf>, String>>>,
 }
 
 impl App {
@@ -857,6 +863,8 @@ impl App {
             hidden_for_recording: false,
             capture_hide: None,
             screen_locked: false,
+            sleeping: false,
+            sleep: sleep::SleepWatcher::start(Arc::new(wake)),
             main_occluded: false,
             main_size: (1040.0, 660.0),
             main_pos: None,
@@ -893,6 +901,7 @@ impl App {
             update_rx,
             accent_rx,
             accent_done: false,
+            diagnostic_rx: None,
         }
     }
 
@@ -1350,6 +1359,7 @@ impl App {
         }
         // A taken session still owns its capture until the worker returns.
         if self.quitting
+            || self.sleeping
             || self.preview_cleanup.is_some()
             || self.pending_recording
             || self.starting.is_some()
@@ -1475,6 +1485,9 @@ impl App {
     }
 
     fn toggle_recording(&mut self, el: &ActiveEventLoop) {
+        if self.sleeping {
+            return;
+        }
         self.preview_recovery.expedite(Instant::now());
         if let Some(start) = &mut self.starting
             && start.file.is_some()
@@ -1499,7 +1512,7 @@ impl App {
 
     fn start_recording(&mut self, el: &ActiveEventLoop) {
         self.preview_recovery.expedite(Instant::now());
-        if self.st.recording.is_some() || self.st.finishing || self.quitting {
+        if self.st.recording.is_some() || self.st.finishing || self.quitting || self.sleeping {
             return;
         }
         self.check_preview_failure();
@@ -1969,6 +1982,9 @@ impl App {
     /// idle preview teardown is detached, not a prerequisite for exiting.
     /// Quit stays latched and no late command may start a session or window.
     fn poll_quit(&mut self, el: &ActiveEventLoop) {
+        // Stop accepting delegated work before checking the report fence.
+        self._listener.take();
+        self.poll_diagnostic_report();
         self.poll_preview_cleanup();
         let done = self.finished.lock().unwrap().take();
         if let Some((file, result)) = done {
@@ -1983,13 +1999,18 @@ impl App {
         // already own a file that still needs finalization.
         self.poll_quit_startup(Instant::now());
         self.poll_recording_start_cleanup();
-        if self.st.finishing || self.starting.is_some() || !self.recording_start_cleanup.is_empty()
+        if self.st.finishing
+            || self.starting.is_some()
+            || !self.recording_start_cleanup.is_empty()
+            || self.diagnostic_rx.is_some()
+            || control::report_in_progress()
         {
             el.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(20),
             ));
             return;
         }
+        self.release_sleep_delay_if_finalized();
         session::stop_all(&self.st.live);
         self.tray = None;
         // Before the loop ends: see `close_windows`.
@@ -1998,6 +2019,96 @@ impl App {
             eprintln!("rec: debug: quit: exiting the event loop");
         }
         el.exit();
+    }
+
+    fn save_diagnostic_report(&mut self) {
+        if self.diagnostic_rx.is_some() {
+            self.st.notice = Some((
+                "A diagnostic report is already in progress".into(),
+                Instant::now(),
+            ));
+            return;
+        }
+        eprintln!("The report includes device names (e.g. Bluetooth headset names); review before sharing.");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("diagnostic-report".into())
+            .spawn(move || {
+                let result = (|| {
+                    let folder = crate::util::videos_dir();
+                    std::fs::create_dir_all(&folder)
+                        .map_err(|e| format!("Could not prepare {}: {e}", folder.display()))?;
+                    let Some(path) = rfd::FileDialog::new()
+                        .set_title("Save diagnostic report (review before sharing)")
+                        .set_directory(&folder)
+                        .set_file_name(crate::util::timestamped("rec-diagnostics", "tar"))
+                        .add_filter("Diagnostic archive", &["tar"])
+                        .save_file()
+                    else {
+                        return Ok(None);
+                    };
+                    crate::diagnostics::write_report(&path).map_err(|e| {
+                        format!(
+                            "Could not save diagnostic report to {}: {e:#}",
+                            path.display()
+                        )
+                    })?;
+                    Ok(Some(path))
+                })();
+                // Also report to stderr if the window was closed while collecting.
+                match &result {
+                    Ok(Some(path)) => {
+                        eprintln!("rec: diagnostic report saved to {}", path.display())
+                    }
+                    Err(e) => eprintln!("rec: {e}"),
+                    Ok(None) => {}
+                }
+                let _ = tx.send(result);
+                wake();
+            });
+        match worker {
+            Ok(_) => {
+                self.diagnostic_rx = Some(rx);
+                self.st.notice = Some((
+                    "The report includes device names (e.g. Bluetooth headset names); review before sharing.".into(),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                let message = format!("Could not start diagnostic report: {e}");
+                eprintln!("rec: {message}");
+                self.st.error = Some(message);
+            }
+        }
+    }
+
+    fn poll_diagnostic_report(&mut self) {
+        let Some(rx) = &self.diagnostic_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Diagnostic report worker stopped unexpectedly".into())
+            }
+        };
+        self.diagnostic_rx = None;
+        match result {
+            Ok(Some(path)) => {
+                self.st.notice = Some((
+                    format!(
+                        "Diagnostic report saved to {} (review before sharing)",
+                        path.display()
+                    ),
+                    Instant::now(),
+                ))
+            }
+            Ok(None) => {
+                self.st.notice = Some(("Diagnostic report cancelled".into(), Instant::now()))
+            }
+            Err(e) => self.st.error = Some(e),
+        }
     }
 
     fn handle(&mut self, el: &ActiveEventLoop, c: Cmd) {
@@ -2036,6 +2147,7 @@ impl App {
             Cmd::SaveReplay => self.save_replay(),
             Cmd::ToggleStream => self.toggle_stream(),
             Cmd::CheckForUpdates => self.check_for_updates(),
+            Cmd::SaveDiagnosticReport => self.save_diagnostic_report(),
             Cmd::Integrate => self.integrate_appimage(),
             Cmd::Quit => self.quit(el),
         }
@@ -2057,11 +2169,56 @@ impl App {
         false
     }
 
+    /// Retire capture before suspend; never automatically restart a recording.
+    /// Upstream has no sleep observer: its stop/finalize precedent is quit in
+    /// reference/rec-rs/src/app/mod.rs:796-814 (MIT OR Apache-2.0).
+    fn prepare_for_sleep(&mut self, sleeping: bool) {
+        if self.sleeping == sleeping {
+            return;
+        }
+        self.sleeping = sleeping;
+        if sleeping {
+            let recording = self.st.recording.is_some()
+                || self.pending_recording
+                || self.starting.as_ref().is_some_and(|s| s.file.is_some());
+            self.start_recording = false;
+            self.cancel_recording_start();
+            self.stop_recording();
+            self.finish_preview_async();
+            self.st.spare_cam = None;
+            if recording {
+                self.st.notice = Some((
+                    "Recording stopped for system sleep; finalizing the file.".into(),
+                    Instant::now(),
+                ));
+            }
+        } else {
+            self.sync_preview();
+        }
+    }
+
+    fn release_sleep_delay_if_finalized(&self) {
+        if self.sleeping
+            && self.st.recording.is_none()
+            && !self.st.finishing
+            && self.starting.is_none()
+            && self.recording_start_cleanup.is_empty()
+        {
+            if let Some(watcher) = &self.sleep {
+                watcher.finalized();
+            }
+        }
+    }
+
     /// Periodic work: commands, signals, finished recordings, failures, tray,
     /// meters.
     fn tick(&mut self, el: &ActiveEventLoop) {
         if self.exit_if_requested(el) {
             return;
+        }
+        let sleep_events = self.sleep.as_ref().map(|s| s.drain()).unwrap_or_default();
+        for sleeping in sleep_events {
+            self.prepare_for_sleep(sleeping);
         }
         self.poll_preview_cleanup();
         self.poll_recording_start_cleanup();
@@ -2113,6 +2270,7 @@ impl App {
                 Err(e) => self.st.error = Some(format!("Recording failed: {e}")),
             }
         }
+        self.release_sleep_delay_if_finalized();
         let failed = self.st.recording.as_ref().is_some_and(|s| s.failed());
         if failed {
             let err = self
@@ -2166,6 +2324,7 @@ impl App {
                 }
             }
         }
+        self.poll_diagnostic_report();
         while let Ok(r) = self.update_rx.try_recv() {
             match r {
                 Ok(updater::Found::Newer(rel)) => {
@@ -2700,7 +2859,7 @@ impl App {
         self.tap.set_wanted(lock::preview_wanted(
             self.main_visible,
             self.main_occluded,
-            self.screen_locked,
+            self.screen_locked || self.sleeping,
         ));
     }
 
@@ -2771,6 +2930,7 @@ pub fn run(
     window: Option<u32>,
     test_pattern: bool,
 ) -> Result<()> {
+    crate::diagnostics::mark_gui_process();
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as usize);
         libc::signal(libc::SIGTERM, on_sigterm as *const () as usize);
@@ -2818,6 +2978,27 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn suspend_cancels_pending_capture_and_resume_never_restarts_recording() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = super::App::new(false, false, None, true, rx, None);
+        app.main_visible = false;
+        app.pending_recording = true;
+        app.start_recording = true;
+        app.prepare_for_sleep(true);
+        assert!(app.sleeping);
+        assert!(!app.pending_recording);
+        assert!(!app.start_recording);
+        assert!(app.st.notice.as_ref().unwrap().0.contains("system sleep"));
+        app.prepare_for_sleep(true);
+        app.sync_preview();
+        assert!(app.starting.is_none());
+        app.prepare_for_sleep(false);
+        assert!(!app.sleeping);
+        assert!(!app.pending_recording);
+        assert!(app.st.recording.is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -2849,6 +3030,41 @@ mod tests {
             assert!(app.st.preview_reconnecting.is_none());
             assert!(app.st.error.is_some());
         }
+    }
+
+    #[test]
+    fn diagnostic_completion_is_nonblocking_and_handles_all_outcomes() {
+        let (_control_tx, control_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(false, false, None, true, control_rx, None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.diagnostic_rx = Some(rx);
+        app.poll_diagnostic_report();
+        assert!(app.diagnostic_rx.is_some());
+        tx.send(Ok(Some(std::path::PathBuf::from("report.tar"))))
+            .unwrap();
+        app.poll_diagnostic_report();
+        assert!(app.diagnostic_rx.is_none());
+        assert!(app.st.notice.as_ref().unwrap().0.contains("report.tar"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.diagnostic_rx = Some(rx);
+        tx.send(Ok(None)).unwrap();
+        app.poll_diagnostic_report();
+        assert!(app.st.notice.as_ref().unwrap().0.contains("cancelled"));
+        assert!(app.st.error.is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.diagnostic_rx = Some(rx);
+        tx.send(Err("write failed".into())).unwrap();
+        app.poll_diagnostic_report();
+        assert_eq!(app.st.error.as_deref(), Some("write failed"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.diagnostic_rx = Some(rx);
+        drop(tx);
+        app.poll_diagnostic_report();
+        assert!(app.diagnostic_rx.is_none());
+        assert!(app.st.error.as_ref().unwrap().contains("unexpectedly"));
     }
 
     #[test]

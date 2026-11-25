@@ -12,6 +12,7 @@ mod app;
 mod capture;
 mod cli;
 mod compose;
+pub mod diagnostics;
 mod gpu;
 mod hotkey;
 mod live;
@@ -66,6 +67,9 @@ enum Cmd {
         #[arg(long, hide = true)]
         test_pattern: bool,
     },
+    /// Export a privacy-filtered diagnostics archive (never includes recordings).
+    #[command(name = "report", visible_alias = "diagnostics")]
+    Diagnostics(cli::DiagnosticsArgs),
     /// List displays, windows, cameras and microphones.
     Devices,
     /// Stop a running recording (CLI or app) and print its file.
@@ -132,7 +136,9 @@ fn record(a: RecordArgs) -> Result<()> {
     let out = opts.output.clone();
     let quiet = opts.quiet;
     let wrote = opts.write;
+    diagnostics::record(diagnostics::Event::RecordingStarted);
     let stats = record::run(opts)?;
+    diagnostics::record(diagnostics::Event::RecordingStopped);
     if !wrote {
         if !quiet {
             eprintln!(
@@ -290,6 +296,14 @@ fn permissions(request: bool, wait: u64) -> Result<()> {
 }
 
 fn main() {
+    // BEGIN diagnostics stderr tee (process-local, fail-closed retention).
+    // Install before library threads. fd 2 remains blocking; an independent
+    // reader drains it even when the original terminal stops accepting output.
+    if let Err(e) = diagnostics::install_stderr_tee() {
+        eprintln!("rec: warning: stderr diagnostics unavailable: {e}");
+    }
+    // END diagnostics stderr tee.
+    diagnostics::record(diagnostics::Event::AppStarted);
     // Behave like a normal CLI when piped into `head` etc.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     // GStreamer is used by the writer and the probe; initialise it once.
@@ -320,6 +334,30 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             test_pattern,
         } => app::run(start_recording, settings, window, test_pattern),
         Cmd::Record(a) => record(a),
+        Cmd::Diagnostics(args) => {
+            let path = args
+                .path
+                .or(args.output)
+                .unwrap_or_else(|| util::videos_dir().join(util::timestamped("rec-report", "tar")));
+            // Resolve relative destinations here, not in the GUI's working directory.
+            let path = std::path::absolute(path)?;
+            eprintln!(
+                "The report includes device names (e.g. Bluetooth headset names); review before sharing."
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Only an absent GUI permits fallback. A failed/lost completion reply
+            // must not trigger a second export or hide the original error.
+            if !app::control::request_report(&path)? {
+                eprintln!(
+                    "rec: no running GUI; report contains local diagnostics only, without a running app's log ring."
+                );
+                diagnostics::write_report(&path)?;
+            }
+            println!("{}", path.display());
+            Ok(())
+        }
         Cmd::Devices => devices(),
         // Control over the shared runtime-directory socket, so these work from
         // a second Flatpak instance (its PID namespace hides the recorder's
@@ -348,6 +386,17 @@ fn dispatch(cmd: Cmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_command_parses() {
+        let parsed =
+            Cli::try_parse_from(["rec-rs", "diagnostics", "--output", "/tmp/report.tar"]).unwrap();
+        assert!(
+            matches!(parsed.cmd, Some(Cmd::Diagnostics(cli::DiagnosticsArgs { output: Some(output), .. })) if output == std::path::Path::new("/tmp/report.tar"))
+        );
+        assert!(Cli::try_parse_from(["rec-rs", "report"]).is_ok());
+        assert!(Cli::try_parse_from(["rec-rs", "report", "/tmp/report.tar"]).is_ok());
+    }
 
     #[test]
     fn goal_command_line_parses() {

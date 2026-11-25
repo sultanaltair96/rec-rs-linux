@@ -89,9 +89,11 @@ pub fn begin_live(live: &Live, system: bool, mic: bool) -> Result<(), String> {
 fn destination_key(url: &str, key: &str) -> Result<String, String> {
     let key = key.trim();
     if !key.is_empty() {
+        crate::diagnostics::register_secret(key);
         return Ok(key.to_string());
     }
     if let Some(stored) = live::keyring::get(url) {
+        crate::diagnostics::register_secret(&stored);
         return Ok(stored);
     }
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -169,7 +171,14 @@ pub fn has_stream_key(url: &str) -> bool {
         return false;
     }
     let env = std::env::var("REC_STREAM_KEY").ok();
-    has_stream_key_from(env.as_deref(), url) || live::keyring::get(url).is_some()
+    if let Some(key) = &env {
+        crate::diagnostics::register_secret(key);
+    }
+    has_stream_key_from(env.as_deref(), url)
+        || live::keyring::get(url).is_some_and(|key| {
+            crate::diagnostics::register_secret(&key);
+            true
+        })
 }
 
 /// [`has_stream_key`] with the environment given (tests): WHIP endpoints may
@@ -190,6 +199,7 @@ pub fn save_stream_key(url: &str, key: &str) -> Result<(), String> {
     if url.is_empty() || key.trim().is_empty() {
         return Err("a destination URL and a key are needed".into());
     }
+    crate::diagnostics::register_secret(key.trim());
     live::keyring::set(url, key.trim()).map_err(|e| format!("{e:#}"))
 }
 

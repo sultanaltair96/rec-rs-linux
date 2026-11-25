@@ -19,7 +19,55 @@
 //! and is created 0600: one user's control channel. The pidfile stays for the
 //! file path and for the signal fallback (`kill -USR1`, SIGTERM, SIGRTMIN+1).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+static REPORTS: AtomicUsize = AtomicUsize::new(0);
+
+struct ReportGuard;
+impl Drop for ReportGuard {
+    fn drop(&mut self) {
+        REPORTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn report_in_progress() -> bool {
+    REPORTS.load(Ordering::SeqCst) != 0
+}
+
+/// Delegate to the GUI. Only a missing/refused socket permits local fallback;
+/// any other error (including a lost completion reply) must be shown to the user.
+/// Paths must be absolute, so the GUI's working directory cannot change them.
+pub fn request_report(path: &Path) -> std::io::Result<bool> {
+    request_report_at(&socket_path(), path)
+}
+
+fn request_report_at(socket: &Path, path: &Path) -> std::io::Result<bool> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::other("report path must be absolute"));
+    }
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    let path = serde_json::to_string(path).map_err(std::io::Error::other)?;
+    writeln!(stream, "report {path}")?;
+    let mut reply = String::new();
+    BufReader::new(stream).take(65536).read_line(&mut reply)?;
+    let result: Result<(), String> = serde_json::from_str(&reply).map_err(std::io::Error::other)?;
+    result.map_err(std::io::Error::other)?;
+    Ok(true)
+}
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -103,11 +151,16 @@ pub type Handler = Arc<dyn Fn(Control) -> bool + Send + Sync>;
 /// A socket that answers control commands, and the thread serving it.
 pub struct Server {
     path: PathBuf,
-    _thread: std::thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -124,6 +177,10 @@ pub fn serve_recorder(handler: Handler) -> std::io::Result<Server> {
 /// failed, so a live listener is never stolen); a *live* listener makes this
 /// fail with `AddrInUse`, which is how a second recorder refuses to start.
 pub fn serve_with(path: &Path, handler: Handler) -> std::io::Result<Server> {
+    serve_inner(path, handler, false)
+}
+
+fn serve_inner(path: &Path, handler: Handler, reports: bool) -> std::io::Result<Server> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -145,19 +202,76 @@ pub fn serve_with(path: &Path, handler: Handler) -> std::io::Result<Server> {
     // One user's control channel: 0600 (the directory is already 0700 in the
     // /tmp fallback, and shared within a Flatpak sandbox otherwise).
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let path_owned = path.to_path_buf();
+    listener.set_nonblocking(true)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
     let thread = std::thread::Builder::new()
         .name("rec-control".into())
         .spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(mut conn) = conn else { continue };
+            while !stopped.load(Ordering::SeqCst) {
+                let mut conn = match listener.accept() {
+                    Ok((conn, _)) => conn,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+                let _ = conn.set_write_timeout(Some(Duration::from_secs(2)));
                 let mut line = String::new();
                 let read = {
                     let mut r = BufReader::new(&conn);
-                    r.read_line(&mut line)
+                    r.by_ref().take(65536).read_line(&mut line)
                 };
                 if read.is_err() {
                     continue;
+                }
+                if reports && let Some(path) = line.strip_prefix("report ") {
+                    let path = serde_json::from_str::<PathBuf>(path.trim());
+                    if let Ok(path) = path
+                        && path.is_absolute()
+                    {
+                        if REPORTS
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            let reply = serde_json::to_string(&Err::<(), _>(
+                                "a delegated report is already in progress",
+                            ))
+                            .unwrap();
+                            let _ = writeln!(conn, "{reply}");
+                            continue;
+                        }
+                        let mut reply_conn = match conn.try_clone() {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                drop(ReportGuard);
+                                let reply =
+                                    serde_json::to_string(&Err::<(), _>(e.to_string())).unwrap();
+                                let _ = writeln!(conn, "{reply}");
+                                continue;
+                            }
+                        };
+                        let spawned = std::thread::Builder::new()
+                            .name("delegated-report".into())
+                            .spawn(move || {
+                                let _guard = ReportGuard;
+                                let result = crate::diagnostics::write_report(&path)
+                                    .map_err(|e| format!("{e:#}"));
+                                if let Ok(reply) = serde_json::to_string(&result) {
+                                    let _ = writeln!(reply_conn, "{reply}");
+                                }
+                            });
+                        if let Err(e) = spawned {
+                            drop(ReportGuard);
+                            let reply = serde_json::to_string(&Err::<(), _>(format!(
+                                "could not start delegated report: {e}"
+                            )))
+                            .unwrap();
+                            let _ = writeln!(conn, "{reply}");
+                        }
+                        continue;
+                    }
                 }
                 match Control::parse(&line) {
                     Some(c) if (handler)(c) => {
@@ -168,11 +282,11 @@ pub fn serve_with(path: &Path, handler: Handler) -> std::io::Result<Server> {
                     }
                 }
             }
-            let _ = path_owned;
         })?;
     Ok(Server {
         path: path.to_path_buf(),
-        _thread: thread,
+        stop,
+        thread: Some(thread),
     })
 }
 
@@ -217,7 +331,7 @@ pub fn claim_at(path: &Path, cmd: Control) -> Claim {
         return Claim::AlreadyRunning;
     }
     let handler: Handler = Arc::new(move |c| tx.send(c).is_ok());
-    match serve_with(path, handler) {
+    match serve_inner(path, handler, true) {
         Ok(server) => Claim::Listening {
             listener: Listener { server },
             rx,
@@ -288,6 +402,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("control.sock")
+    }
+
+    #[test]
+    fn reports_complete_in_the_serving_process_and_propagate_errors() {
+        gstreamer::init().unwrap();
+        let socket = temp_path("reports");
+        let (listener, _rx) = match claim_at(&socket, Control::Show) {
+            Claim::Listening { listener, rx } => (listener, rx),
+            _ => panic!("must own socket"),
+        };
+        crate::diagnostics::record(crate::diagnostics::Event::AppStarted);
+        let output = socket.with_file_name("report with spaces.tar");
+        REPORTS
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap();
+        let guard = ReportGuard;
+        let error = request_report_at(&socket, &output).unwrap_err();
+        assert!(error.to_string().contains("already in progress"));
+        assert!(!output.exists());
+        drop(guard);
+        assert!(request_report_at(&socket, &output).unwrap());
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(
+            bytes
+                .windows(b"app_started".len())
+                .any(|w| w == b"app_started")
+        );
+        assert!(
+            request_report_at(&socket, &output).is_err(),
+            "never overwrite"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        drop(listener);
+        assert!(!request_report_at(&socket, &output).unwrap());
+        assert!(request_report_at(&socket, Path::new("relative.tar")).is_err());
+        std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
     }
 
     #[test]

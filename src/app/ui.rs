@@ -236,6 +236,16 @@ fn app_menu(ui: &mut Ui, st: &mut State) {
         ui.close();
     }
     ui.separator();
+    ui.menu_button("Help", |ui| {
+        if ui
+            .button("Save diagnostic report…")
+            .on_hover_text("Save a local report; review it before sharing. Existing files are never overwritten.")
+            .clicked()
+        {
+            st.cmds.push(Cmd::SaveDiagnosticReport);
+            ui.close();
+        }
+    });
     if ui.button("Quit Rec").clicked() {
         st.cmds.push(Cmd::Quit);
         ui.close();

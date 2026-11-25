@@ -57,6 +57,44 @@ rec-rs stop         # SIGINT: finalizes, prints the file
 rec-rs save-replay  # SIGRTMIN+1 (the replay buffer is phase 1D)
 ```
 
+## Diagnostics
+
+```sh
+rec-rs report                      # timestamped archive in Videos; prints path
+rec-rs report /tmp/rec-support.tar  # chosen path (--output also supported)
+```
+
+Creates a new **0600**, uncompressed tar; refuses to overwrite files or symlinks.
+Review `report.json` before sharing. Nothing is uploaded. Every CLI export prints:
+“The report includes device names (e.g. Bluetooth headset names); review before sharing.”
+The destination is printed after export completes.
+
+`report` (alias `diagnostics`) asks the running GUI to write the archive, including
+its memory-only log ring. Relative destinations are resolved in the CLI's working
+directory. If no GUI is listening, it exports local diagnostics and explicitly warns
+that the running app's log ring is unavailable. Other control/export errors are
+reported, not silently retried locally. No previous-crash history is available.
+
+Includes app version, OS/architecture, normalized session type, Flatpak presence,
+GStreamer version, allowlisted encoder availability, sanitized numeric/boolean
+persisted settings, typed lifecycle events, filtered device names, and up to five
+numeric ffprobe summaries of recent recordings (not the recordings or filenames).
+Encoder presence does not guarantee working hardware; `collection_status` describes
+collection limits and unavailable sections.
+
+Stderr is teed unchanged to the terminal and asynchronously captured in a bounded,
+process-local ring of the last 5000 filtered lines, including native library warnings.
+Credential/URL-bearing lines are redacted before retention; oversized lines and
+queue overload are dropped and counted. Filtering is **best effort**: personal paths,
+device names and arbitrary private text may remain. No environment dump or recorded
+media is included. Unknown session values become `unknown`. **Review before sharing.**
+
+App integration: call `diagnostics::record(Event::...)` for safe lifecycle events,
+`diagnostics::snapshot()` for a bounded view, and `diagnostics::write_report(path)`
+on a worker thread after the user chooses a destination. Do not add arbitrary text
+or errors to the event vocabulary. A failed write may leave a partial private archive;
+remove it and retry with a new path. Tar is supported; ZIP is not currently offered.
+
 ## Packaging
 
 Two installable packages are built from this repository by scripts in `packaging/`. Both run the
