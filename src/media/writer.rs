@@ -1712,7 +1712,14 @@ impl Writer {
     /// Flush video up to `end` (host seconds), finalise the file and return the
     /// stats. Blocks until the movie is written.
     pub fn finish(mut self, end: f64) -> Result<Stats> {
-        let failed = self.failed.clone();
+        // A bus error may already have been consumed during capture. Do not
+        // submit EOS and wait for a message that will never arrive on a failed
+        // pipeline, or attempt an in-place rewrite on an unavailable volume.
+        self.check_bus();
+        if let Some(error) = self.failed.clone() {
+            self.suspend_failed_output();
+            bail!("writer failed: {error}");
+        }
         if self.t0.is_none() {
             self.abort();
             bail!("no video frames were captured, nothing written");
@@ -1726,6 +1733,11 @@ impl Writer {
         // The last pieces of audio, then the end of the streams.
         self.drain_mix(true);
         self.drain_live(true);
+        self.check_bus();
+        if let Some(error) = self.failed.clone() {
+            self.suspend_failed_output();
+            bail!("writer failed: {error}");
+        }
         let Some(mut sink) = self.sink.take() else {
             // Preview-only session.
             return Ok(self.stats.clone());
@@ -1805,11 +1817,11 @@ impl Writer {
             // Keep the file: a fragmented recording is playable up to the last
             // fragment even when the muxer or an encoder failed.
             eprintln!("rec: warning: the movie could not be finalized: {e}");
-            eprintln!("rec: warning: {} is still playable", sink.path.display());
-            if let Some(e) = failed {
-                bail!("writer failed: {e}");
-            }
-            return Ok(self.stats.clone());
+            eprintln!(
+                "rec: warning: preserving {} (completed fragments may be recoverable)",
+                sink.path.display()
+            );
+            return Err(anyhow!("writer failed: {e}"));
         }
         // The last step: a regular movie instead of fragments, plus the track
         // layout (alternate group, enabled flags, AAC priming edit lists).
@@ -1860,15 +1872,24 @@ impl Writer {
                     "rec: warning: could not turn the fragmented file into a regular movie ({e})"
                 );
                 eprintln!(
-                    "rec: warning: {} is complete up to its last fragment and still plays",
+                    "rec: warning: preserving {} (completed fragments may be recoverable)",
                     sink.path.display()
                 );
+                return Err(e.context("finalizing the recording"));
             }
         }
-        if let Some(e) = failed {
-            bail!("writer failed: {e}");
-        }
         Ok(self.stats.clone())
+    }
+
+    /// Stop without deleting completed fragments after a storage/encode error.
+    fn suspend_failed_output(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            let _ = sink.pipeline.set_state(gst::State::Null);
+            eprintln!(
+                "rec: warning: preserving {} (completed fragments may be recoverable)",
+                sink.path.display()
+            );
+        }
     }
 
     /// Stop the pipeline and remove a partial file (start failure, or an error
@@ -3302,6 +3323,52 @@ mod tests {
 
     fn frame(pts: f64) -> VideoFrame {
         VideoFrame::packed(pts, 4, 2, PixelFormat::Bgra, vec![0; 32])
+    }
+
+    #[test]
+    fn consumed_output_error_does_not_wait_for_eos_or_delete_fragments() {
+        gst::init().unwrap();
+        let path = std::env::temp_dir().join(format!("rec-writer-failure-{}", std::process::id()));
+        std::fs::write(&path, b"completed fragments").unwrap();
+        let pipeline = gst::Pipeline::new();
+        let mut writer = test_writer();
+        writer.t0 = Some(1.0);
+        writer.sink = Some(Sink {
+            bus: pipeline.bus().unwrap(),
+            pipeline,
+            video_src: AppSrc::builder().build(),
+            tracks: vec![],
+            path: path.clone(),
+            encoder: String::new(),
+            enc_in: Arc::default(),
+            enc_out: Arc::default(),
+            timing_errors: Arc::default(),
+            layout: mp4::Layout::default(),
+            video_max_bytes: 0,
+        });
+        writer
+            .sink
+            .as_ref()
+            .unwrap()
+            .bus
+            .post(
+                gst::message::Error::builder(
+                    gst::ResourceError::Write,
+                    "output disconnected: ENODEV",
+                )
+                .build(),
+            )
+            .unwrap();
+        // Capture normally drains this message before finish; reproduce that
+        // path explicitly so finish must use the remembered failure.
+        writer.check_bus();
+        assert!(writer.failed.is_some());
+        let start = std::time::Instant::now();
+        let error = writer.finish(2.0).unwrap_err();
+        assert!(error.to_string().contains("ENODEV"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(std::fs::read(&path).unwrap(), b"completed fragments");
+        std::fs::remove_file(path).unwrap();
     }
 
     fn test_writer() -> Writer {

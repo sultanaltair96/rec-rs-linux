@@ -1296,6 +1296,28 @@ fn kill_now() -> ! {
     std::process::abort();
 }
 
+// Until the append is durable, never touch the existing fragment headers.
+// ENOSPC can leave a partial moov at EOF; remove only those new bytes so
+// readers can still scan all completed fragments. A disconnected device may
+// reject rollback too: preserve the original error and leave recovery to the
+// caller rather than trying more writes to existing media.
+fn append_transaction(
+    file: &mut File,
+    append: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<()> {
+    let len = file.metadata()?.len();
+    if let Err(error) = append(file) {
+        let rollback = file.set_len(len).and_then(|()| file.sync_all());
+        return match rollback {
+            Ok(()) => Err(error).context("appending movie index; original fragments preserved"),
+            Err(rollback) => Err(error).context(format!(
+                "appending movie index; could not remove partial index: {rollback}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 /// Turn a fragmented recording into a regular movie, in place, and apply the
 /// track layout. Media bytes are never moved or rewritten.
 ///
@@ -1432,8 +1454,10 @@ pub fn finalize(
     // 1. Append the regular moov. Until the flip, the file has two moovs and
     //    players read the fragmented one.
     let mut appended = OpenOptions::new().append(true).open(path)?;
-    appended.write_all(&new_moov)?;
-    appended.sync_all()?;
+    append_transaction(&mut appended, |file| {
+        file.write_all(&new_moov)?;
+        file.sync_all()
+    })?;
     drop(appended);
     if crash_at == CrashAt::BeforeFlip {
         kill_now();
