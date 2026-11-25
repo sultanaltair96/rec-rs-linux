@@ -534,7 +534,10 @@ fn resolve_target(
                         "rec: debug: screen core.error: id {id}, seq {seq}, res {res}: {message}"
                     );
                 }
-                set_error(&error, format!("PipeWire remote error: {message}"));
+                set_error(
+                    &error,
+                    format!("PipeWire stopped or its remote failed: {message}"),
+                );
                 main.quit();
             }
         })

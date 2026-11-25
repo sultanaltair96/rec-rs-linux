@@ -71,6 +71,16 @@ static DROP_SAW_REACTOR: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// inside a runtime — the runtime's own worker, or a future that drops a
 /// `Prepared` — `block_on` would panic ("Cannot start a runtime from within a
 /// runtime"), so the work is spawned there instead.
+/// A portal backend may stop answering Close after PipeWire dies.
+async fn close_session(session: &Session<'static, Screencast<'static>>) {
+    if tokio::time::timeout(Duration::from_millis(500), session.close())
+        .await
+        .is_err()
+    {
+        eprintln!("rec: warning: screen portal did not close within 500 ms");
+    }
+}
+
 fn runtime_scope<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -207,7 +217,7 @@ impl Drop for PortalOwner {
                 DROPS_ON_RUNTIME.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             if let Some(session) = session {
-                let _ = session.close().await;
+                close_session(&session).await;
                 drop(session);
             }
             drop(screencast);
@@ -370,13 +380,13 @@ fn prepare_session(
         let streams = match start_cancellable(&screencast, &session, portal_wait, cancel).await {
             Ok(streams) => streams,
             Err(error) => {
-                let _ = session.close().await;
+                close_session(&session).await;
                 return Err(error);
             }
         };
         let Some(stream) = streams.streams().first().cloned() else {
             // Drop the session here, on the runtime, before the error escapes.
-            let _ = session.close().await;
+            close_session(&session).await;
             return Err(anyhow!(
                 "the portal started a screen-cast session without a stream"
             ));
