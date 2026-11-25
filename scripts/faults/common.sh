@@ -67,9 +67,43 @@ fault_audio_start() {
 fault_audio_stop() {
     fault_stop pulse; fault_stop wireplumber; fault_stop pipewire
 }
-# Surrogate dock devices, not physical hotplug. No hardware or default changes.
+# Synthetic dock devices on the private server, never physical hotplug.
 fault_dock_output_add() {
     FAULT_SINK=$(pactl load-module module-null-sink sink_name=rec_fault_dock)
+    pactl set-default-sink rec_fault_dock
+    [[ $(pactl get-default-sink) == rec_fault_dock ]]
+}
+fault_screen_start() {
+    fault_spawn screen gst-launch-1.0 -q videotestsrc is-live=true pattern=smpte \
+        '!' video/x-raw,format=RGBx,width=1280,height=720,framerate=30/1 \
+        '!' pipewiresink mode=provide \
+        'stream-properties=props,node.name=rec_fault_screen,media.class=Video/Source,media.role=Screen'
+}
+# Registry predicates inspect node properties, not arbitrary substring matches.
+fault_node_wait() {
+    local name=$1 expected=$2 class=${3:-} i
+    for ((i=0; i<100; i++)); do
+        if pw-dump | python3 -c '
+import json,sys
+name,expected,cls=sys.argv[1:]
+nodes=[o for o in json.load(sys.stdin) if o.get("type")=="PipeWire:Interface:Node" and o.get("info",{}).get("props",{}).get("node.name")==name]
+assert (len(nodes)==1 and (not cls or nodes[0]["info"]["props"].get("media.class")==cls)) if expected=="present" else not nodes
+' "$name" "$expected" "$class" 2>/dev/null; then return 0; fi
+        sleep .1
+    done
+    echo "faults: registry timeout $name $expected $class" >&2
+    return 1
+}
+fault_dock_video_add() {
+    fault_screen_start; fault_camera_start
+    fault_node_wait rec_fault_screen present Video/Source
+    fault_node_wait rec_fault_camera present Video/Source
+    fault_owned screen; fault_owned camera
+}
+fault_dock_video_remove() {
+    fault_stop screen; fault_stop camera
+    fault_node_wait rec_fault_screen absent
+    fault_node_wait rec_fault_camera absent
 }
 fault_dock_input_add() {
     fault_spawn dock-mic pw-loopback \

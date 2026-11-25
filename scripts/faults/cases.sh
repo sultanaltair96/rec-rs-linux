@@ -3,7 +3,8 @@
 # processes by name (the developer's desktop must remain untouched).
 set -eu
 if [ "${1:-}" != --inside ]; then
-    mode=${1:?cli or gui}
+    mode=${1:?cli, gui or idle}
+    case "$mode" in cli|gui|idle) ;; *) exit 2;; esac
     failed=0
     for fault in node-remove pipewire-stop portal-stop; do
         d="${OUT_DIR:?}/faults-$mode/$fault"
@@ -13,7 +14,7 @@ if [ "${1:-}" != --inside ]; then
             timeout 180 scripts/screen/headless.sh sh scripts/faults/cases.sh --inside "$mode" "$fault" \
             >"$d/session.log" 2>&1 || rc=$?
         if [ "$rc" -eq 0 ]; then
-            echo "PASS  faults-$mode-$fault (verified injection, bounded teardown, decoded file)"
+            echo "PASS  faults-$mode-$fault (see session.log for verified assertions)"
         else
             echo "FAIL  faults-$mode-$fault (exit $rc; see $d/session.log)"
             failed=1
@@ -31,7 +32,7 @@ python3 - "$@" <<'PY'
 import json, os, pathlib, signal, socket, subprocess, sys, time
 
 mode, fault = sys.argv[1:]
-assert mode in ('cli', 'gui')
+assert mode in ('cli', 'gui', 'idle')
 binary = os.environ['REC_BIN']
 out = pathlib.Path(os.environ['OUT_DIR'])
 rt = pathlib.Path(os.environ['XDG_RUNTIME_DIR'])
@@ -55,7 +56,7 @@ def control(cmd):
         assert s.recv(128) == b'ok\n', cmd
 
 env = dict(os.environ, REC_DEBUG='1')
-if mode == 'gui':
+if mode in ('gui', 'idle'):
     settings = out / 'settings.json'
     settings.write_text(json.dumps(dict(output_dir=str(out), resolution='720p', fps=30,
                                        mic_enabled=False, system_audio=False, scene='screen')))
@@ -67,13 +68,15 @@ with logpath.open('w') as f:
     app = subprocess.Popen([binary] + args, env=env, stdout=f, stderr=subprocess.STDOUT)
 try:
     frame_marker = 0
-    if mode == 'gui':
+    if mode in ('gui', 'idle'):
         wait(lambda: (rt / 'rec-rs-control.sock').exists() and
              'first screen frame delivered' in log(), 'GUI preview and control socket', 90)
         frame_marker = log().count('first screen frame delivered')
-        control('start-recording')
-    wait(lambda: log().count('first screen frame delivered') > frame_marker and
-         (rt / 'rec-rs-recorder.sock').exists(), 'recording first frame', 90)
+        if mode == 'gui':
+            control('start-recording')
+    if mode != 'idle':
+        wait(lambda: log().count('first screen frame delivered') > frame_marker and
+             (rt / 'rec-rs-recorder.sock').exists(), 'recording first frame', 90)
     time.sleep(2)
     text = log()
     node = int([l.split()[-1] for l in text.splitlines() if 'screen stream connected to node' in l][-1])
@@ -84,6 +87,12 @@ try:
         return any(o['id'] == node and str(o.get('info', {}).get('props', {}).get('object.serial')) == serial
                    for o in registry())
     assert present(), 'capture node identity mismatch'
+    # Only export the runtime/display after startup: exporting the display
+    # before startup lets the container's locked keyring show a blocking dialog.
+    # xdpw can exit on producer destruction and needs these on reactivation.
+    subprocess.run(['dbus-update-activation-environment', 'XDG_RUNTIME_DIR',
+                    'WAYLAND_DISPLAY', 'XDG_CURRENT_DESKTOP', 'XDG_SESSION_TYPE',
+                    'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'], check=True, timeout=5)
     if fault == 'node-remove':
         subprocess.run(['pw-cli', 'destroy', str(node)], check=True, capture_output=True, timeout=5)
         assert not present(), 'node destruction rejected'
@@ -114,6 +123,20 @@ try:
         # SIGKILL is not merely a requested graceful shutdown.
         print(f'injected {fault}: private service pid {pid}', flush=True)
     start = time.monotonic()
+    if mode == 'idle':
+        # Only node-remove has a live portal service available for reacquisition.
+        # Service-stop cases deliberately cannot recover without a restart.
+        if fault == 'node-remove':
+            wait(lambda: log().count('first screen frame delivered') > frame_marker,
+                 'idle preview reacquired a frame after source removal', 60)
+        assert not (rt / 'rec-rs-recorder.sock').exists(), 'idle started a recorder'
+        assert not list(out.glob('*.mp4')), 'idle created a recording'
+        control('quit')
+        assert app.wait(timeout=5) == 0, log()
+        assert 'panicked' not in log(), log()
+        print(f'verified idle {fault}: bounded shutdown' +
+              (' and preview recovery' if fault == 'node-remove' else '; recovery not claimed'), flush=True)
+        sys.exit(0)
     if mode == 'cli':
         assert app.wait(timeout=30) == 0, log()
     else:

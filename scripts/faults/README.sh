@@ -18,9 +18,21 @@
 # Consumer logs are transient under REC_FAULT_ROOT; copy evidence elsewhere
 # from your driver before exiting. Do not store recordings in the repository.
 #
-# Dock: private null sink + loopback mic, three rapid remove/restore cycles.
-# Both removal and restoration use the named order. This is graph churn, NOT
-# USB/udev unplug, device selection/fallback, or an assertion of app recovery.
+# Dock: actual GStreamer screen (SMPTE RGBx 1280x720@30) and camera
+# Video/Source producers plus a private null sink made the default. Three
+# remove/restore cycles verify disappearance, reappearance, media classes,
+# producer liveness and default-sink restoration. Output-first = sink then
+# video producers; input-first = video producers then sink, in both directions.
+# This is graph churn, NOT USB/udev unplug, a portal screen grant, decoded-frame
+# validation, device selection/fallback, or an assertion of app recovery.
+# Idle preview integration (real portal node destruction, not synthetic screen):
+#   REC_BIN=... OUT_DIR=... sh scripts/faults/cases.sh idle
+# Run inside dev.sh; evidence goes to OUT_DIR outside the repo. Node removal
+# must deliver a fresh preview first-frame marker with no recorder/output file.
+# Service-stop cases assert idle bounded shutdown only, NOT recovery. Delayed
+# D-Bus activation environment export allows portal restart without a blocking
+# container keyring dialog at startup. Outstanding/in-flight portal request
+# cancellation is not injected: no deterministic request barrier exists here.
 # Restart: the entire owned PipeWire/Pulse/WirePlumber stack, not host services.
 # Camera: GStreamer ball, YUY2 640x480@30, PipeWire Video/Source node named
 # rec_fault_camera. Synthetic fallback for tests without a camera; NOT a V4L2
