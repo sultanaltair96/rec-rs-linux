@@ -145,7 +145,7 @@ for fault in preflight low-water enospc folder-disappearance; do
         # or decode a test-generated recovered copy to turn corruption into PASS.
         if ! ffprobe -v error -show_streams -show_format -of json "$file" \
             >"$OUT/$fault.probe.json" 2>"$OUT/$fault.probe.log"; then good=0; fi
-        if ! ffmpeg -v error -xerror -i "$file" -map 0:v:0 -f null - \
+        if ! ffmpeg -v error -xerror -i "$file" -f null - \
             >"$OUT/$fault.decode.log" 2>&1; then good=0; fi
     fi
     if ((good)); then echo "PASS $fault";
