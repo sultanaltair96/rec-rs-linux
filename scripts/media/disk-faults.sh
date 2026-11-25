@@ -7,7 +7,7 @@ if [[ ${1:-} != --run ]]; then
     echo 'SKIP disk-faults (opt in: DEV_SMALL_TMPFS=96m scripts/dev.sh bash scripts/media/disk-faults.sh --run)'
     exit 0
 fi
-for tool in python3 ffmpeg timeout findmnt; do
+for tool in python3 ffprobe ffmpeg timeout findmnt find; do
     command -v "$tool" >/dev/null || { echo "FAIL disk-faults (missing $tool)" >&2; exit 1; }
 done
 mountpoint=/mnt/rec-small
@@ -69,6 +69,9 @@ fail=0
 for fault in preflight low-water enospc folder-disappearance; do
     mkdir "$work/output"
     file="$work/output/recording.mov"
+    # Rescue output must not leak into the user's normal recording directory.
+    export REC_OUTPUT_DIR="$OUT/$fault-rescue"
+    mkdir "$REC_OUTPUT_DIR"
     good=1
     ready=0
     injected=0
@@ -95,12 +98,10 @@ for fault in preflight low-water enospc folder-disappearance; do
                 low-water) fill 4194304 >"$OUT/$fault.fill.log" && injected=1 ;;
                 enospc) fill 0 >"$OUT/$fault.fill.log" && injected=1 ;;
                 folder-disappearance)
-                    # Preserve a hard link for inspection, then actually
-                    # remove the output directory while filesink holds the fd.
-                    ln "$file" "$work/retained.mov"
+                    # No retained hard link: the recorder must rescue its own
+                    # open, unlinked file into the isolated REC_OUTPUT_DIR.
                     rm -rf -- "$work/output"
-                    file="$work/retained.mov"
-                    [[ ! -e $work/output ]] && injected=1 ;;
+                    [[ ! -e $work/output && ! -e $file ]] && injected=1 ;;
             esac
         fi
     else
@@ -128,23 +129,28 @@ for fault in preflight low-water enospc folder-disappearance; do
                 grep -Fq 'No space left on the resource.' "$OUT/$fault.log" || good=0
                 if grep -Fq 'low disk space:' "$OUT/$fault.log"; then good=0; fi ;;
             folder-disappearance)
-                grep -Fq 'rec: error during recording: output directory disappeared; an unlinked recording may be unrecoverable' "$OUT/$fault.log" || good=0 ;;
+                [[ ! -e $work/output ]] || good=0
+                mapfile -d '' -t rescue_files < <(find "$REC_OUTPUT_DIR" -type f -print0)
+                if ((${#rescue_files[@]} == 1)); then
+                    file=${rescue_files[0]}
+                    [[ -s $file && ! -L $file ]] || good=0
+                    grep -Fq "rec: recording stopped: the output folder $work/output was removed. Saved the first " "$OUT/$fault.log" || good=0
+                    grep -Fq " to $file." "$OUT/$fault.log" || good=0
+                else
+                    echo "Expected exactly one rescued recording in $REC_OUTPUT_DIR; found ${#rescue_files[@]}" >&2
+                    good=0
+                fi ;;
         esac
-        if [[ $fault == low-water ]]; then
-            # Normal low-water stop finalizes to a regular MP4; its moofs are
-            # intentionally converted to free boxes, not left fragmented.
-            if ! ffmpeg -v error -xerror -i "$OUT/$fault.raw.mov" -map 0:v:0 -f null - >"$OUT/$fault.decode.log" 2>&1; then good=0; fi
-        elif ! python3 "$HERE/fragments.py" verify "$OUT/$fault.raw.mov" \
-            "$OUT/$fault.before.json" "$OUT/$fault.recovered.mov" >"$OUT/$fault.fragments.log" 2>&1; then
-            good=0
-        elif ! ffmpeg -v error -xerror -i "$OUT/$fault.recovered.mov" \
-            -map 0:v:0 -f null - >"$OUT/$fault.decode.log" 2>&1; then
-            good=0
-        fi
+        # Validate the recorder's output directly: never reconstruct fragments
+        # or decode a test-generated recovered copy to turn corruption into PASS.
+        if ! ffprobe -v error -show_streams -show_format -of json "$file" \
+            >"$OUT/$fault.probe.json" 2>"$OUT/$fault.probe.log"; then good=0; fi
+        if ! ffmpeg -v error -xerror -i "$file" -map 0:v:0 -f null - \
+            >"$OUT/$fault.decode.log" 2>&1; then good=0; fi
     fi
     if ((good)); then echo "PASS $fault";
     else echo "FAIL $fault (see $OUT)"; fail=$((fail+1)); fi
-    rm -rf -- "$work/output" "$work/retained" "$work/retained.mov" "$work/filler"
+    rm -rf -- "$work/output" "$work/filler"
 done
 echo "disk-faults: $((4-fail)) passed, $fail failed, 0 skipped"
 ((fail == 0))
