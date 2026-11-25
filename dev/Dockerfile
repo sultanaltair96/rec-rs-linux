@@ -118,4 +118,8 @@ ENV HOME=/home/dev \
 
 WORKDIR /home/dev
 
+# Diagnostic tooling for bounded fault-injection stack capture.
+RUN dnf -y install --setopt=install_weak_deps=False gdb elfutils python3-gobject-base \
+    && dnf -y clean all
+
 CMD ["bash"]
