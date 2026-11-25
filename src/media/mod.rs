@@ -5,6 +5,7 @@
 //! MP4/MOV, finalised into a regular movie) and the probe live here; anything
 //! in this module must keep working for the CLI's self-tests.
 
+pub mod disk;
 pub mod mp4;
 pub mod pauses;
 pub mod probe;

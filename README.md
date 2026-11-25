@@ -57,6 +57,27 @@ rec-rs stop         # SIGINT: finalizes, prints the file
 rec-rs save-replay  # SIGRTMIN+1 (the replay buffer is phase 1D)
 ```
 
+## Advanced settings
+
+Recording disk safeguards can be tuned with environment variables (positive whole
+numbers in decimal MB, 1 MB = 1,000,000 bytes):
+
+- `REC_MIN_FREE_MB`: free space required before recording starts. Default: the
+  larger of 2 GB and five minutes at the requested video bitrate.
+- `REC_LOW_WATER_MB`: stop and finalize when available space falls below this
+  threshold, checked every five seconds outside the writer lock. Default: at
+  least 1 GB, and at least four times the 128 MiB movie-index limit plus one
+  fragment and five seconds at the maximum bitrate (80 Mb/s video plus three
+  320 kb/s audio tracks, or the requested bitrate if higher). The fragment
+  allowance follows `REC_FRAGMENT_SECS` (default two seconds; this existing
+  muxer override uses milliseconds despite its name).
+
+Explicit values replace these defaults; invalid, zero or overflowing values fail
+before recording starts. Admission always requires at least the low watermark.
+Lowering the reserves risks running out of space during finalization, especially
+with variable-bitrate encoders, ProRes or other concurrent filesystem writers.
+Only space available to the current user counts. Live-only sessions skip these checks.
+
 ## Packaging
 
 Two installable packages are built from this repository by scripts in `packaging/`. Both run the
