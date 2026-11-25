@@ -22,7 +22,7 @@
 //! Recording grant this replaces.
 
 use std::os::fd::OwnedFd;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -63,14 +63,59 @@ static DROPS_ON_RUNTIME: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 #[cfg(test)]
 static DROP_SAW_REACTOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Run `fut` on the portal runtime from wherever the caller is.
-///
-/// Only the destructors of ashpd/zbus objects need this (see [`Prepared`]):
-/// they reach for the Tokio reactor when the proxy is dropped, and a panic in a
-/// destructor while unwinding aborts the process. If the caller is already
-/// inside a runtime — the runtime's own worker, or a future that drops a
-/// `Prepared` — `block_on` would panic ("Cannot start a runtime from within a
-/// runtime"), so the work is spawned there instead.
+type CloseWait = futures_util::future::Shared<futures_util::future::BoxFuture<'static, ()>>;
+
+/// Register synchronously, before spawning: a subsequent preparation must see
+/// even a cleanup whose worker has not yet been polled. Completed entries are
+/// pruned only under this lock, never by an older worker clearing newer work.
+#[derive(Default)]
+struct CloseCoordinator {
+    pending: Mutex<Vec<CloseWait>>,
+    handshake: tokio::sync::Mutex<()>,
+}
+
+impl CloseCoordinator {
+    fn start<F>(&self, cleanup: F, hard_limit: Duration) -> CloseWait
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use futures_util::FutureExt;
+        let (done, mut receiver) = tokio::sync::watch::channel(false);
+        let wait = async move {
+            let _ = receiver.wait_for(|finished| *finished).await;
+        }
+        .boxed()
+        .shared();
+        self.pending.lock().unwrap().push(wait.clone());
+        // Always use the process-lifetime runtime, not the caller's possibly
+        // short-lived runtime. Dropping the waiter never cancels this task.
+        let deadline = tokio::time::Instant::now() + hard_limit;
+        runtime().spawn(async move {
+            if tokio::time::timeout_at(deadline, cleanup).await.is_err() {
+                eprintln!("rec: warning: screen portal close reached its hard deadline");
+            }
+            let _ = done.send(true);
+        });
+        wait
+    }
+
+    async fn wait(&self) {
+        let pending = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|wait| wait.peek().is_none());
+            pending.clone()
+        };
+        futures_util::future::join_all(pending).await;
+    }
+}
+
+fn closes() -> &'static CloseCoordinator {
+    static CLOSES: OnceLock<CloseCoordinator> = OnceLock::new();
+    CLOSES.get_or_init(CloseCoordinator::default)
+}
+
+/// Destructors must run on the portal reactor. Never block a caller already
+/// inside a runtime (including unwinding from a portal handshake).
 fn runtime_scope<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -194,23 +239,34 @@ impl Drop for PortalOwner {
         // The portal conversation ends here, on the runtime: close the session
         // (which stops the compositor capturing) and then drop both objects
         // where their destructors can reach the Tokio reactor.
+        let wait = closes().start(
+            async move {
+                #[cfg(test)]
+                {
+                    // Inside this future we are on the portal runtime by
+                    // construction; recording it lets the test prove the drop did
+                    // not happen on the caller's bare thread.
+                    DROP_SAW_REACTOR.store(
+                        tokio::runtime::Handle::try_current().is_ok(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    DROPS_ON_RUNTIME.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Some(session) = session {
+                    let _ = session.close().await;
+                    drop(session);
+                }
+                drop(screencast);
+            },
+            Duration::from_secs(5),
+        );
         runtime_scope(async move {
-            #[cfg(test)]
+            if tokio::time::timeout(Duration::from_millis(500), wait)
+                .await
+                .is_err()
             {
-                // Inside this future we are on the portal runtime by
-                // construction; recording it lets the test prove the drop did
-                // not happen on the caller's bare thread.
-                DROP_SAW_REACTOR.store(
-                    tokio::runtime::Handle::try_current().is_ok(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-                DROPS_ON_RUNTIME.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("rec: warning: screen portal still closing in background");
             }
-            if let Some(session) = session {
-                let _ = session.close().await;
-                drop(session);
-            }
-            drop(screencast);
         });
     }
 }
@@ -291,6 +347,18 @@ fn prepare_session(
         .is_ok();
     let mut saved = token::load();
     let result = runtime().block_on(async {
+        // Serialize handshakes as well as waiting for all previously registered
+        // closes. The lock is released on every error/cancellation path.
+        let ready = async {
+            let guard = closes().handshake.lock().await;
+            closes().wait().await;
+            guard
+        };
+        let _handshake = match select(Box::pin(ready), Box::pin(cancel.cancelled())).await {
+            Either::Left((guard, _)) => guard,
+            Either::Right(_) => bail!("screen capture startup cancelled"),
+        };
+        cancel.check()?;
         let screencast = Screencast::new().await.map_err(portal_error)?;
         // Ask what this desktop can actually do before asking it to do it: a
         // session created with an unsupported source type or cursor mode is
@@ -332,11 +400,19 @@ fn prepare_session(
         let (cursor, cursor_note) = choose_cursor(available, opts);
         let types = BitFlags::from(mode_wanted);
         let session = screencast.create_session().await.map_err(portal_error)?;
+        // Own immediately: every later error (including SelectSources and
+        // OpenPipeWireRemote) must explicitly close, not just drop a proxy.
+        let owner = PortalOwner {
+            screencast: Some(screencast),
+            session: Some(session),
+        };
+        let screencast = owner.screencast.as_ref().unwrap();
+        let session = owner.session.as_ref().unwrap();
         // A stale token is retried without: the portal then asks again, which
         // is recoverable, while failing the recording is not.
         let mut select = screencast
             .select_sources(
-                &session,
+                session,
                 cursor,
                 types,
                 false,
@@ -357,7 +433,7 @@ fn prepare_session(
             );
             select = screencast
                 .select_sources(
-                    &session,
+                    session,
                     cursor,
                     types,
                     false,
@@ -367,16 +443,14 @@ fn prepare_session(
                 .await;
         }
         select.map_err(portal_error)?;
-        let streams = match start_cancellable(&screencast, &session, portal_wait, cancel).await {
+        let streams = match start_cancellable(screencast, session, portal_wait, cancel).await {
             Ok(streams) => streams,
             Err(error) => {
-                let _ = session.close().await;
                 return Err(error);
             }
         };
         let Some(stream) = streams.streams().first().cloned() else {
             // Drop the session here, on the runtime, before the error escapes.
-            let _ = session.close().await;
             return Err(anyhow!(
                 "the portal started a screen-cast session without a stream"
             ));
@@ -385,7 +459,7 @@ fn prepare_session(
         // second `block_on` used to leave the session and its proxy alive
         // across the boundary, to be dropped on a plain thread.
         let fd = screencast
-            .open_pipe_wire_remote(&session)
+            .open_pipe_wire_remote(session)
             .await
             .map_err(portal_error)
             .context("opening the portal's PipeWire remote")?;
@@ -395,14 +469,10 @@ fn prepare_session(
         // blocking other graph links (including the camera). Close a separate
         // portal connection completely before starting any capture streams.
         let probe_fd = screencast
-            .open_pipe_wire_remote(&session)
+            .open_pipe_wire_remote(session)
             .await
             .map_err(portal_error)
             .context("opening the portal's PipeWire probe remote")?;
-        let owner = PortalOwner {
-            screencast: Some(screencast),
-            session: Some(session),
-        };
         Ok::<_, anyhow::Error>((owner, streams, stream, fd, probe_fd, cursor_note))
     });
     // The owner guards the session and proxy immediately upon leaving the
@@ -495,7 +565,7 @@ impl PendingRequest {
 }
 
 async fn close_request(request: zbus::Proxy<'static>) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
         let _: zbus::Result<()> = request.call("Close", &()).await;
     })
     .await;
@@ -710,6 +780,78 @@ fn probed_hook(forced: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stalled_close_survives_waiter_timeout_and_blocks_next_handshake() {
+        super::runtime().block_on(async {
+            let coordinator = super::CloseCoordinator::default();
+            let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+            let wait = coordinator.start(
+                async move {
+                    let _ = stalled.await;
+                },
+                std::time::Duration::from_secs(5),
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, wait)
+                    .await
+                    .is_err()
+            );
+            // Poll deterministically: no sleeps or scheduler-order assumptions.
+            use futures_util::FutureExt;
+            assert!(coordinator.wait().now_or_never().is_none());
+            release.send(()).unwrap();
+            coordinator.wait().await;
+        });
+    }
+
+    #[test]
+    fn hard_deadline_releases_stalled_close_and_drops_on_reactor() {
+        super::runtime().block_on(async {
+            struct OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.store(
+                        tokio::runtime::Handle::try_current().is_ok(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            }
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let guard = OnDrop(dropped.clone());
+            let coordinator = super::CloseCoordinator::default();
+            drop(coordinator.start(
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                },
+                std::time::Duration::ZERO,
+            ));
+            coordinator.wait().await;
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn older_close_cannot_clear_a_newer_pending_close() {
+        super::runtime().block_on(async {
+            let coordinator = super::CloseCoordinator::default();
+            coordinator
+                .start(async {}, std::time::Duration::from_secs(5))
+                .await;
+            let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+            drop(coordinator.start(
+                async move {
+                    let _ = stalled.await;
+                },
+                std::time::Duration::from_secs(5),
+            ));
+            use futures_util::FutureExt;
+            assert!(coordinator.wait().now_or_never().is_none());
+            release.send(()).unwrap();
+            coordinator.wait().await;
+        });
+    }
+
     use super::*;
 
     #[test]

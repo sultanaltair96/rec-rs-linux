@@ -697,7 +697,7 @@ impl Source {
     fn halt(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            super::join_capture(t, "X11 screen capture");
         }
         let e = self.error.lock().unwrap().take();
         match e {

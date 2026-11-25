@@ -15,26 +15,32 @@ if [[ $# -gt 0 ]]; then fault_spawn consumer "$@"; fi
 sleep 1
 case $case in
     dock-*)
-        fault_dock_output_add; fault_dock_input_add
-        sleep 1
-        # Partial audio-only surrogate: not the screen/camera/sink dock burst.
-        # Disconnect and restore in the selected order, repeated three times.
+        # A stable fallback lets us verify default migration on every unplug.
+        FAULT_BASE=$(pactl load-module module-null-sink sink_name=rec_fault_base)
+        fault_dock_output_add; fault_dock_video_add
+        # Output means default sink; input means the screen + camera producers.
+        # Removal and restoration use both orders in the two matrix cases.
         for round in 1 2 3; do
             if [[ $case == dock-output-first ]]; then
-                fault_dock_output_remove; fault_dock_input_remove
+                fault_dock_output_remove; fault_dock_video_remove
+                [[ $(pactl get-default-sink) != rec_fault_dock ]]
+                fault_node_wait rec_fault_dock absent
                 sleep .2
-                fault_dock_output_add; fault_dock_input_add
+                fault_dock_output_add; fault_dock_video_add
             else
-                fault_dock_input_remove; fault_dock_output_remove
+                fault_dock_video_remove; fault_dock_output_remove
+                [[ $(pactl get-default-sink) != rec_fault_dock ]]
+                fault_node_wait rec_fault_dock absent
                 sleep .2
-                fault_dock_input_add; fault_dock_output_add
+                fault_dock_video_add; fault_dock_output_add
             fi
             sleep 1
-            pw-dump | grep 'rec_fault_mic' >/dev/null
-            pactl list short sinks | grep rec_fault_dock >/dev/null
-            echo "PASS audio-only fixture $case round=$round (not the full dock fault)"
+            fault_node_wait rec_fault_dock present Audio/Sink
+            [[ $(pactl get-default-sink) == rec_fault_dock ]]
+            echo "PASS dock graph fixture $case round=$round (screen + camera Video/Source + default sink restored)"
         done
-        fault_dock_input_remove; fault_dock_output_remove
+        fault_dock_video_remove; fault_dock_output_remove
+        pactl unload-module "$FAULT_BASE"
         ;;
     daemon-restart)
         fault_audio_stop
@@ -49,11 +55,7 @@ case $case in
         ;;
     camera-fallback)
         fault_camera_start
-        for ((i=0; i<100; i++)); do
-            if pw-dump | grep rec_fault_camera >/dev/null; then break; fi
-            sleep .1
-        done
-        pw-dump | grep rec_fault_camera >/dev/null
+        fault_node_wait rec_fault_camera present Video/Source
         fault_owned camera
         echo 'PASS camera-fallback: synthetic PipeWire camera advertised'
         ;;

@@ -235,7 +235,7 @@ impl Stream {
             .context("spawning the screen frame thread")?;
         self.thread = Some(std::thread::spawn(move || {
             let r = run(node_id, fd, tx, quit_rx, &stop, &error);
-            let _ = worker.join();
+            super::join_capture(worker, "screen frame processing");
             if let Err(e) = r {
                 let mut slot = error2.lock().unwrap();
                 if slot.is_none() {
@@ -260,7 +260,7 @@ impl Stream {
             let _ = quit.send(());
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            super::join_capture(t, "screen PipeWire capture");
         }
         let e = self.error.lock().unwrap().take();
         match e {
@@ -434,7 +434,8 @@ impl TargetState {
 
     fn removed_message(&self, event: &str) -> String {
         format!(
-            "PipeWire screen-cast node {} (serial {}) was removed ({event})",
+            "the shared screen may have gone away (display disconnected or sharing ended): \
+             PipeWire screen-cast node {} (serial {}) was removed ({event})",
             self.node_id,
             self.serial.as_deref().unwrap_or("unknown")
         )
@@ -534,7 +535,7 @@ fn resolve_target(
                         "rec: debug: screen core.error: id {id}, seq {seq}, res {res}: {message}"
                     );
                 }
-                set_error(&error, format!("PipeWire remote error: {message}"));
+                set_error(&error, remote_failed_message(message));
                 main.quit();
             }
         })
@@ -580,6 +581,10 @@ fn resolve_target(
             state,
         },
     ))
+}
+
+fn remote_failed_message(message: &str) -> String {
+    format!("PipeWire stopped or its remote failed: {message}")
 }
 
 fn on_state(data: &mut StreamData, old: pw::stream::StreamState, new: pw::stream::StreamState) {
@@ -1026,7 +1031,7 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
     drop(stream);
     drop(context);
     drop(main);
-    let _ = watcher.join();
+    super::join_capture(watcher, "screen probe watchdog");
     if let Some(e) = error.lock().unwrap().take() {
         bail!("the portal's PipeWire stream failed: {e}");
     }
@@ -1179,6 +1184,20 @@ mod tests {
     }
 
     #[test]
+    fn stop_detaches_a_stuck_capture_worker() {
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let mut stream = Stream::new(1, fd, None, CaptureOptions::default(), "test".into());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        stream.thread = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        let start = std::time::Instant::now();
+        stream.halt().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        release.send(()).unwrap();
+    }
+
+    #[test]
     fn registry_and_proxy_loss_callbacks_publish_the_exact_target() {
         pw::init();
         let main = pw::main_loop::MainLoopRc::new(None).unwrap();
@@ -1197,6 +1216,26 @@ mod tests {
             assert!(message.contains(event));
             assert!(!state.borrow().present);
         }
+    }
+
+    #[test]
+    fn pipewire_death_and_display_loss_have_distinct_messages() {
+        let remote = remote_failed_message("connection reset");
+        assert_eq!(
+            remote,
+            "PipeWire stopped or its remote failed: connection reset"
+        );
+        assert!(!remote.contains("display disconnected"));
+        let target = TargetState {
+            node_id: 42,
+            serial: Some("1234".into()),
+            present: false,
+        };
+        let removed = target.removed_message("registry.global_remove");
+        assert!(removed.starts_with(
+            "the shared screen may have gone away (display disconnected or sharing ended):"
+        ));
+        assert!(!removed.contains("PipeWire stopped"));
     }
 
     #[test]
