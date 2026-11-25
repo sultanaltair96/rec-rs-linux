@@ -90,6 +90,7 @@ pub struct WhipOutput {
 
 impl WhipOutput {
     pub fn start(url: &str, key: &str) -> Result<WhipOutput> {
+        crate::diagnostics::register_secret(key);
         let parsed = parse_http_url(url)?;
         let name = format!("whip://{}", parsed.host);
         let shared = Arc::new((
@@ -239,6 +240,7 @@ struct HttpUrl {
 }
 
 fn parse_http_url(url: &str) -> Result<HttpUrl> {
+    super::register_url_secrets(url);
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow!("WHIP URL needs http:// or https://"))?;
@@ -310,6 +312,7 @@ fn agent(host: &str) -> ureq::Agent {
 
 /// POST the offer; returns the answer and the session resource URL.
 fn post_offer(url: &str, key: &str, offer: &str) -> Result<(String, Option<String>)> {
+    crate::diagnostics::register_secret(key);
     let endpoint = parse_http_url(url)?;
     let mut req = agent(&endpoint.host)
         .post(url)
@@ -324,6 +327,9 @@ fn post_offer(url: &str, key: &str, offer: &str) -> Result<(String, Option<Strin
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(|l| resource_url(&endpoint, l));
+    if let Some(resource) = &location {
+        super::register_url_secrets(resource);
+    }
     let body = resp.body_mut().read_to_string().unwrap_or_default();
     match status {
         200 | 201 => Ok((body, location)),
@@ -336,6 +342,7 @@ fn post_offer(url: &str, key: &str, offer: &str) -> Result<(String, Option<Strin
 }
 
 fn delete_resource(url: &str, key: &str) {
+    crate::diagnostics::register_secret(key);
     let host = parse_http_url(url).map(|u| u.host).unwrap_or_default();
     let mut req = agent(&host).delete(url);
     if !key.is_empty() {

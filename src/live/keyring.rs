@@ -31,6 +31,7 @@ pub trait Store: Send + Sync {
 /// Account name for a destination (service id or server URL), like upstream's
 /// Keychain account.
 pub fn account(dest: &str) -> String {
+    super::register_url_secrets(dest);
     dest.trim().trim_end_matches('/').to_string()
 }
 
@@ -39,9 +40,13 @@ pub struct SecretService;
 
 impl Store for SecretService {
     fn get(&self, account: &str) -> Option<String> {
+        super::register_url_secrets(account);
         let entry = keyring::Entry::new(SERVICE, account).ok()?;
         match entry.get_password() {
-            Ok(key) => Some(key),
+            Ok(key) => {
+                crate::diagnostics::register_secret(&key);
+                Some(key)
+            }
             Err(keyring::Error::NoEntry) => None,
             Err(e) => {
                 if std::env::var_os("REC_DEBUG").is_some() {
@@ -53,6 +58,8 @@ impl Store for SecretService {
     }
 
     fn set(&self, account: &str, key: &str) -> Result<()> {
+        super::register_url_secrets(account);
+        crate::diagnostics::register_secret(key);
         let entry = keyring::Entry::new(SERVICE, account).map_err(|e| {
             anyhow!(
                 "the Secret Service is not available ({e}); start a keyring daemon \
@@ -68,6 +75,7 @@ impl Store for SecretService {
     }
 
     fn delete(&self, account: &str) -> Result<()> {
+        super::register_url_secrets(account);
         let entry = keyring::Entry::new(SERVICE, account).map_err(|e| {
             anyhow!("the Secret Service is not available ({e}); nothing was deleted")
         })?;
@@ -88,10 +96,15 @@ pub struct Memory(Mutex<HashMap<String, String>>);
 
 impl Store for Memory {
     fn get(&self, account: &str) -> Option<String> {
-        self.0.lock().unwrap().get(account).cloned()
+        let key = self.0.lock().unwrap().get(account).cloned();
+        if let Some(key) = &key {
+            crate::diagnostics::register_secret(key);
+        }
+        key
     }
 
     fn set(&self, account: &str, key: &str) -> Result<()> {
+        crate::diagnostics::register_secret(key);
         if key.is_empty() {
             return Err(anyhow!("the stream key is empty"));
         }

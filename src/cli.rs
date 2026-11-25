@@ -21,6 +21,17 @@ use crate::mixer::Volume;
 use crate::record::{MicBackend, Options};
 use crate::util::{even, timestamped, videos_dir};
 
+/// Export a local, privacy-filtered support report.
+#[derive(Args)]
+pub struct DiagnosticsArgs {
+    /// New archive path (.tar). Existing files are never overwritten.
+    #[arg(short, long, value_name = "REPORT.tar")]
+    pub output: Option<PathBuf>,
+    /// New archive path; defaults to a timestamped report in Videos.
+    #[arg(value_name = "PATH", conflicts_with = "output")]
+    pub path: Option<PathBuf>,
+}
+
 /// `rec-rs record` arguments.
 #[derive(Args)]
 pub struct RecordArgs {
