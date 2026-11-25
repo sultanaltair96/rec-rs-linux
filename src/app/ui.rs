@@ -104,9 +104,12 @@ pub fn main_window(ui: &mut Ui, st: &mut State) {
                     };
                     pill(ui, &text, RED, Color32::WHITE);
                 }
-                if let Some((text, at)) = &st.notice
-                    && at.elapsed().as_secs_f32() < 4.0
-                {
+                let status = st.preview_reconnecting.as_ref().or_else(|| {
+                    st.notice
+                        .as_ref()
+                        .and_then(|(text, at)| (at.elapsed().as_secs_f32() < 4.0).then_some(text))
+                });
+                if let Some(text) = status {
                     ui.add_space(6.0);
                     // Cut to fit, leaving room for the buttons on the right.
                     let w = (ui.available_width() - 160.0).max(40.0);
