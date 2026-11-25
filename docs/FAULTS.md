@@ -16,9 +16,31 @@ only the assertions listed here, not the complete release gate.
 | PipeWire and WirePlumber restart | Consumers recover or stop/finalize; GUI quits under 2 s | Fixture-only in isolated `session.sh`; recorder and GUI recovery not tested |
 | Portal frontend restart | Same | NOT IMPLEMENTED; existing portal-stop case kills the wlr backend instead |
 | PipeWire SIGSTOP 30 s / SIGCONT | No hang; recover or stop/finalize; GUI quits under 2 s | Fixture-only, not coupled to recorder or GUI assertions |
-| ENOSPC on a small tmpfs | Writer reports failure without hang; retain playable data where possible | Fixture requires unprivileged mount namespace; unavailable in the tested container. Writer behaviour belongs to 1G; not tested here |
+| ENOSPC | Writer reports failure without hang; retain playable data where possible | Owned by phase 1G (writer). The namespace/tmpfs fixture was removed from this harness; no ENOSPC coverage is claimed here |
 | v4l2loopback hotplug | Camera disappears/returns safely | NOT TESTED: no module/host access; fixture offers a synthetic PipeWire camera instead, not V4L2 hotplug |
 | GNOME lock, GNOME portal picker, restore grant, session Closed, monitor unplug | No hang, one outstanding picker, correct recovery/finalization | NOT TESTED: GNOME Shell and GNOME portal start headlessly, but no automated picker consent or saved grant. `--virtual-monitor` creates the initial monitor; runtime removal/re-add was not established. No simulated lock or fake picker is claimed |
+
+## Selftest output safety
+
+`scripts/selftest.sh` takes a nonblocking exclusive `flock` on
+`${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/.selftest.lock` before deleting or
+creating its worktree-specific output tree. Concurrent runs sharing that base
+fail immediately with `selftest: REC_TEST_DIR is busy`, preserving the active
+run's evidence. Use separate `REC_TEST_DIR` values for independent runs. The
+lock file is persistent: do not delete it while a run is active. The descriptor
+is held for the run and inherited by children, so surviving children also keep
+output protected; process exit releases it without stale PID-file cleanup.
+`--list` does not lock or clear output.
+
+Container verification with a blocking mock recorder: **5 passed, 0 failed**:
+concurrent same-directory invocation rejected without deleting a sentinel;
+`--list` preserved it while locked; a distinct directory ran concurrently;
+after the first runner exited, the next run acquired the lock and cleared its
+output; `sh -n scripts/selftest.sh` passed. This tests harness exclusion, not
+recording or writer fault handling.
+
+Older ENOSPC invocation examples in
+`scripts/faults/README.sh` are obsolete; writer fault coverage belongs to 1G.
 
 `scripts/screen/gnome-headless.sh` starts actual GNOME Shell/Mutter, its
 ScreenCast portal, a private bus and PipeWire. Portal property readiness is

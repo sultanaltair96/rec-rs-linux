@@ -10,6 +10,8 @@
 # dir): inside the dev container every worktree shares $HOME, so a fixed name
 # would make parallel runs collide ("already exists" on every case). Cases that
 # need a later phase print "SKIP <name> (phase 1X)".
+# Runs sharing REC_TEST_DIR are mutually exclusive (nonblocking flock). The
+# persistent lock lives outside the disposable output tree; never unlink it.
 #
 # The writer cases check the file's track layout (video, mix, system stem, mic
 # stem; alternate group and enabled flags; AAC priming edit lists), the codec
@@ -38,7 +40,6 @@ OUT="${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}/selftest-$repo_hash"
 # Every recorder run is bounded: a hung capture device or encoder must fail the
 # case, not the whole run (the dev container also has a ceiling, see dev.sh).
 TIMEOUT="${REC_TIMEOUT:-120}"
-rm -rf "$OUT"; mkdir -p "$OUT"
 pass=0; fail=0; skip=0
 only=" $* "
 only_clean=$(echo "$only" | tr -d ' ')
@@ -77,6 +78,18 @@ case "${1:-}" in
         echo "skipped: pattern-webcam scene-webcam"
         exit 0 ;;
 esac
+
+# Lock the shared base, not the worktree's disposable output directory. Open
+# without truncation and retain fd 9 for the run (including child processes).
+# --list above is read-only and neither locks nor clears existing evidence.
+TEST_ROOT="${REC_TEST_DIR:-$HOME/Videos/rec-rs-tests}"
+mkdir -p "$TEST_ROOT"
+exec 9>>"$TEST_ROOT/.selftest.lock"
+if ! flock -n 9; then
+    echo "selftest: REC_TEST_DIR is busy: $TEST_ROOT (another selftest holds the lock)" >&2
+    exit 1
+fi
+rm -rf "$OUT"; mkdir -p "$OUT"
 
 # fail NAME WHY: record a failure with a one-line reason. It does not fail the
 # shell (`set -e`), so the remaining cases still run.
