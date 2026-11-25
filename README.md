@@ -72,8 +72,10 @@ numbers in decimal MB, 1 MB = 1,000,000 bytes):
   allowance follows `REC_FRAGMENT_SECS` (default two seconds; this existing
   muxer override uses milliseconds despite its name).
 
-Explicit values replace these defaults; invalid, zero or overflowing values fail
-before recording starts. Admission always requires at least the low watermark.
+Explicit values replace these defaults; invalid or overflowing values fail before
+recording starts. `REC_LOW_WATER_MB=0` disables the periodic low-space stop;
+this is unsafe and intended for fault testing. `REC_DISK_CHECK_MS` overrides the
+poll interval (minimum 10 ms). Admission always requires at least the low watermark.
 Lowering the reserves risks running out of space during finalization, especially
 with variable-bitrate encoders, ProRes or other concurrent filesystem writers.
 Only space available to the current user counts. Live-only sessions skip these checks.

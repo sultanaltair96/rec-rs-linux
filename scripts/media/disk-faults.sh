@@ -95,8 +95,11 @@ for fault in preflight low-water enospc folder-disappearance; do
                 low-water) fill 4194304 >"$OUT/$fault.fill.log" && injected=1 ;;
                 enospc) fill 0 >"$OUT/$fault.fill.log" && injected=1 ;;
                 folder-disappearance)
-                    mv "$work/output" "$work/retained"
-                    file="$work/retained/recording.mov"
+                    # Preserve a hard link for inspection, then actually
+                    # remove the output directory while filesink holds the fd.
+                    ln "$file" "$work/retained.mov"
+                    rm -rf -- "$work/output"
+                    file="$work/retained.mov"
                     [[ ! -e $work/output ]] && injected=1 ;;
             esac
         fi
@@ -125,7 +128,7 @@ for fault in preflight low-water enospc folder-disappearance; do
                 grep -Fq 'No space left on the resource.' "$OUT/$fault.log" || good=0
                 if grep -Fq 'low disk space:' "$OUT/$fault.log"; then good=0; fi ;;
             folder-disappearance)
-                grep -Fxq 'rec: error during recording: checking output filesystem free space' "$OUT/$fault.log" || good=0 ;;
+                grep -Fq 'rec: error during recording: output directory disappeared; an unlinked recording may be unrecoverable' "$OUT/$fault.log" || good=0 ;;
         esac
         if [[ $fault == low-water ]]; then
             # Normal low-water stop finalizes to a regular MP4; its moofs are
@@ -141,7 +144,7 @@ for fault in preflight low-water enospc folder-disappearance; do
     fi
     if ((good)); then echo "PASS $fault";
     else echo "FAIL $fault (see $OUT)"; fail=$((fail+1)); fi
-    rm -rf -- "$work/output" "$work/retained" "$work/filler"
+    rm -rf -- "$work/output" "$work/retained" "$work/retained.mov" "$work/filler"
 done
 echo "disk-faults: $((4-fail)) passed, $fail failed, 0 skipped"
 ((fail == 0))

@@ -326,6 +326,7 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     pacer: Option<std::thread::JoinHandle<()>>,
     disk_monitor: Option<std::thread::JoinHandle<()>>,
+    disk_failed: Arc<AtomicBool>,
     video: Option<Box<dyn VideoSource>>,
     camera: Option<Camera>,
     /// What the camera reported (its device name), for the start log and the app.
@@ -610,6 +611,7 @@ impl Session {
             stop,
             pacer: None,
             disk_monitor: None,
+            disk_failed: Arc::new(AtomicBool::new(false)),
             video: Some(opened.video),
             camera: None,
             camera_desc: String::new(),
@@ -667,10 +669,12 @@ impl Session {
         }));
         if let Some((directory, low_water)) = disk {
             let shared = shared.clone();
+            let disk_failed = sess.disk_failed.clone();
             // Never statvfs under the writer lock or on the frame pacing thread.
             sess.disk_monitor = Some(std::thread::spawn(move || {
                 while !shared.stop.load(Ordering::SeqCst) {
                     if let Err(error) = crate::media::disk::check(&directory, low_water) {
+                        disk_failed.store(true, Ordering::SeqCst);
                         shared.fail(error.to_string());
                         break;
                     }
@@ -894,8 +898,10 @@ impl Session {
         };
         if let Some(e) = self.shared.error.lock().unwrap().take() {
             eprintln!("rec: error during recording: {e}");
-            result?;
-            bail!("{e}");
+            if self.disk_failed.load(Ordering::SeqCst) {
+                result?;
+                bail!("{e}");
+            }
         }
         result
     }

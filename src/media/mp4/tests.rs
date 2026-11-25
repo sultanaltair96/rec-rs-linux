@@ -142,7 +142,7 @@ fn two_hour_60fps_three_aac_tracks_index_sizes() {
     for wide in [false, true] {
         let mut plans = Vec::new();
         let mut table_bytes = Vec::new();
-        for track in 0..4 {
+        for (track, track_info) in tracks.iter().enumerate() {
             let video = track == 0;
             let count = if video { VIDEO_SAMPLES } else { AUDIO_SAMPLES };
             let mut samples = Vec::with_capacity(count as usize);
@@ -179,7 +179,7 @@ fn two_hour_60fps_three_aac_tracks_index_sizes() {
             assert_eq!(tables.stss.len(), if video { 3600 } else { 0 });
             table_bytes.push(stbl_table_boxes(&tables, count).len());
             plans.push(TrakPlan {
-                media_duration: Some(u64::from(SECONDS * tracks[track].timescale)),
+                media_duration: Some(u64::from(SECONDS * track_info.timescale)),
                 tkhd_duration: Some(u64::from(SECONDS * 1000)),
                 edits: Some(vec![Edit {
                     segment_duration: u64::from(SECONDS * 1000),

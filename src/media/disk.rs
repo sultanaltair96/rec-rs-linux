@@ -98,8 +98,13 @@ pub fn check(path: &Path, required: u64) -> Result<()> {
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: path is NUL terminated and stats points to writable storage.
     if unsafe { libc::statvfs(path_c.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("checking output filesystem free space");
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            bail!(
+                "output directory disappeared; an unlinked recording may be unrecoverable ({error})"
+            );
+        }
+        return Err(error).context("checking output filesystem free space");
     }
     // SAFETY: successful statvfs initialized stats.
     let stats = unsafe { stats.assume_init() };
