@@ -505,7 +505,7 @@ impl PendingRequest {
 }
 
 async fn close_request(request: zbus::Proxy<'static>) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
         let _: zbus::Result<()> = request.call("Close", &()).await;
     })
     .await;
