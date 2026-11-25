@@ -911,6 +911,22 @@ pub(crate) fn warn_once(message: &str) {
     eprintln!("rec: warning: {message}");
 }
 
+/// A stuck driver or callback cannot be cancelled safely. Detach its owned
+/// thread after a bounded grace period rather than blocking application quit.
+fn join_capture(thread: std::thread::JoinHandle<()>, name: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(750);
+    while !thread.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("rec: warning: {name} did not stop within 750 ms; detaching worker");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if thread.join().is_err() {
+        eprintln!("rec: warning: {name} worker panicked");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

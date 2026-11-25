@@ -235,7 +235,7 @@ impl Stream {
             .context("spawning the screen frame thread")?;
         self.thread = Some(std::thread::spawn(move || {
             let r = run(node_id, fd, tx, quit_rx, &stop, &error);
-            let _ = worker.join();
+            super::join_capture(worker, "screen frame processing");
             if let Err(e) = r {
                 let mut slot = error2.lock().unwrap();
                 if slot.is_none() {
@@ -260,7 +260,7 @@ impl Stream {
             let _ = quit.send(());
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            super::join_capture(t, "screen PipeWire capture");
         }
         let e = self.error.lock().unwrap().take();
         match e {
@@ -1031,7 +1031,7 @@ fn probe_once(fd: OwnedFd, node_id: u32, wait: Duration) -> Result<(usize, usize
     drop(stream);
     drop(context);
     drop(main);
-    let _ = watcher.join();
+    super::join_capture(watcher, "screen probe watchdog");
     if let Some(e) = error.lock().unwrap().take() {
         bail!("the portal's PipeWire stream failed: {e}");
     }
@@ -1181,6 +1181,20 @@ mod tests {
                 .unwrap()
                 .contains("producer failed")
         );
+    }
+
+    #[test]
+    fn stop_detaches_a_stuck_capture_worker() {
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let mut stream = Stream::new(1, fd, None, CaptureOptions::default(), "test".into());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        stream.thread = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        let start = std::time::Instant::now();
+        stream.halt().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        release.send(()).unwrap();
     }
 
     #[test]
