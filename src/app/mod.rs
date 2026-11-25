@@ -2029,7 +2029,9 @@ impl App {
             ));
             return;
         }
-        eprintln!("The report includes device names (e.g. Bluetooth headset names); review before sharing.");
+        eprintln!(
+            "The report includes device names (e.g. Bluetooth headset names); review before sharing."
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("diagnostic-report".into())
