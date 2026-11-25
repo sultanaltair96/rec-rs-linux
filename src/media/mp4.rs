@@ -25,7 +25,8 @@
 //!   and some `moof` boxes are `free`. The leftover `moof` boxes are unknown
 //!   boxes at the top level and are ignored; the regular moov plays.
 //!
-//! Nothing is ever deleted or truncated: a failure leaves whatever was on disk.
+//! Finalisation never deletes or truncates data. Explicit recovery can discard
+//! an incomplete tail, or copy the complete prefix to a new rescue file.
 //!
 //! # Track layout
 //!
@@ -284,6 +285,110 @@ fn scan_with(path: &Path, tolerant: bool) -> Result<(File, Vec<BoxRef>, u64)> {
         at += size;
     }
     Ok((file, boxes, len))
+}
+
+/// Complete recoverable prefix of an open fragmented recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub input_bytes: u64,
+    /// Includes complete trailing index/free boxes, but never an orphan moof.
+    pub complete_bytes: u64,
+    pub last_fragment_end: u64,
+    pub fragments: usize,
+}
+
+/// Inspect the existing descriptor, including a torn ordinary or extended header.
+/// The caller must stop the writer first. File position is preserved; I/O errors
+/// propagate rather than being mistaken for a torn tail. Size-zero boxes cannot
+/// prove that a write completed, so recovery stops before them.
+pub fn inspect_recovery(file: &File) -> Result<RecoveryReport> {
+    use std::os::unix::fs::FileExt;
+    let len = file.metadata()?.len();
+    let mut report = RecoveryReport {
+        input_bytes: len,
+        complete_bytes: 0,
+        last_fragment_end: 0,
+        fragments: 0,
+    };
+    let mut at = 0;
+    let mut pending = false;
+    let mut init = false;
+    while len - at >= 8 {
+        let mut hdr = [0; 16];
+        file.read_exact_at(&mut hdr[..8], at)?;
+        let small = u32::from_be_bytes(hdr[..4].try_into().unwrap());
+        let kind: [u8; 4] = hdr[4..8].try_into().unwrap();
+        let (size, header) = match small {
+            0 => break,
+            1 if len - at < 16 => break,
+            1 => {
+                file.read_exact_at(&mut hdr[8..], at + 8)?;
+                (u64::from_be_bytes(hdr[8..].try_into().unwrap()), 16)
+            }
+            n => (u64::from(n), 8),
+        };
+        if size < header || size > len - at {
+            break;
+        }
+        if kind == *b"moof" {
+            if pending || !init {
+                break;
+            }
+            pending = true;
+        } else if kind == *b"mdat" {
+            if !pending {
+                break;
+            }
+            pending = false;
+            report.fragments += 1;
+            report.last_fragment_end = at + size;
+        } else if pending {
+            break;
+        } else if kind == *b"moov" {
+            init = true;
+        }
+        at += size;
+        if !pending {
+            report.complete_bytes = at;
+        }
+    }
+    if report.fragments == 0 {
+        bail!("recording has no complete moof/mdat fragments to recover");
+    }
+    Ok(report)
+}
+
+/// Discard only the incomplete suffix, without appending a regular index (so
+/// ENOSPC recovery needs no additional allocation). No change if already whole.
+pub fn truncate_recovery(file: &File) -> Result<RecoveryReport> {
+    let report = inspect_recovery(file)?;
+    if report.complete_bytes < report.input_bytes {
+        file.set_len(report.complete_bytes)?;
+        file.sync_all()?;
+    }
+    Ok(report)
+}
+
+/// Rescue from the still-open source descriptor, even if its path disappeared.
+/// Never overwrites an existing destination. The source and its cursor are not
+/// modified. A failed copy may leave a partial destination for diagnosis.
+pub fn copy_recovery(file: &File, destination: &Path) -> Result<RecoveryReport> {
+    use std::os::unix::fs::FileExt;
+    let report = inspect_recovery(file)?;
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut at = 0;
+    while at < report.complete_bytes {
+        let count = (report.complete_bytes - at).min(buffer.len() as u64) as usize;
+        file.read_exact_at(&mut buffer[..count], at)?;
+        out.write_all(&buffer[..count])?;
+        at += count as u64;
+    }
+    out.sync_all()?;
+    Ok(report)
 }
 
 fn read_at(file: &mut File, offset: u64, size: u64) -> Result<Vec<u8>> {

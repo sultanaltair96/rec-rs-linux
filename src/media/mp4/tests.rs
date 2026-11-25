@@ -8,6 +8,92 @@
 use super::*;
 
 #[test]
+fn recovery_torn_fragments_and_exact_boundary() {
+    let (bytes, _) = fragmented_fixture();
+    let fixture = write_temp("recovery-fixture", &bytes);
+    let (_, boxes, _) = scan(&fixture).unwrap();
+    let moofs: Vec<_> = boxes.iter().filter(|b| b.kind == MOOF).collect();
+    let mdats: Vec<_> = boxes.iter().filter(|b| b.kind == *b"mdat").collect();
+    let first_end = mdats[0].start + mdats[0].size;
+    for end in [
+        moofs[1].start + 3, // torn header
+        moofs[1].start + moofs[1].header + 3,
+        mdats[1].start + 3,
+        mdats[1].start + mdats[1].header + 3,
+        first_end,
+        mdats[1].start + mdats[1].size,
+    ] {
+        let path = write_temp("recovery-tail", &bytes[..end as usize]);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(5)).unwrap();
+        let expected = if end == mdats[1].start + mdats[1].size {
+            end
+        } else {
+            first_end
+        };
+        let report = inspect_recovery(&file).unwrap();
+        assert_eq!(report.complete_bytes, expected);
+        assert_eq!(report.last_fragment_end, expected);
+        assert_eq!(file.stream_position().unwrap(), 5);
+        // Rescue must work from an fd whose name is gone.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(copy_recovery(&file, &path).unwrap(), report);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes[..expected as usize]);
+        assert!(copy_recovery(&file, &path).is_err());
+        assert_eq!(file.metadata().unwrap().len(), end);
+        assert_eq!(truncate_recovery(&file).unwrap(), report);
+        assert_eq!(file.metadata().unwrap().len(), expected);
+        assert_eq!(inspect_recovery(&file).unwrap().complete_bytes, expected);
+        std::fs::remove_file(path).unwrap();
+    }
+    let path = write_temp("recovery-empty", &bytes[..first_end as usize - 1]);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(truncate_recovery(&file).is_err());
+    assert_eq!(file.metadata().unwrap().len(), first_end - 1);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(fixture).unwrap();
+}
+
+#[test]
+fn recovery_preserves_complete_suffix_and_tolerates_torn_extended_header() {
+    let (mut bytes, _) = fragmented_fixture();
+    bytes.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
+    let complete = bytes.len() as u64;
+    // Both an incomplete large-size field and a fully written large-size
+    // field whose declared payload is missing must stop at the same prefix.
+    for tail in [
+        vec![0, 0, 0, 1, b'm', b'o', b'o', b'f', 0, 0],
+        [
+            vec![0, 0, 0, 1, b'm', b'o', b'o', b'f'],
+            100u64.to_be_bytes().to_vec(),
+        ]
+        .concat(),
+    ] {
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&tail);
+        let path = write_temp("recovery-extended", &torn);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let report = truncate_recovery(&file).unwrap();
+        assert_eq!(report.complete_bytes, complete);
+        assert!(report.last_fragment_end < complete);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn failed_index_append_preserves_completed_fragments() {
     for errno in [libc::ENOSPC, libc::EIO, libc::ENODEV] {
         let (bytes, _) = fragmented_fixture();

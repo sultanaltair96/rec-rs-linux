@@ -512,6 +512,8 @@ struct Sink {
     video_src: AppSrc,
     tracks: Vec<AudioTrack>,
     path: PathBuf,
+    /// Independent ownership keeps an unlinked recording available for rescue.
+    file: Option<std::fs::File>,
     encoder: String,
     /// Debug counters: buffers into and out of the video encoder.
     enc_in: Arc<std::sync::atomic::AtomicU64>,
@@ -1684,6 +1686,12 @@ impl Writer {
 
     /// Drain the pipeline bus without blocking and remember the first error.
     fn check_bus(&mut self) {
+        if let Some(sink) = &self.sink
+            && output_folder_removed(&sink.path)
+            && self.failed.is_none()
+        {
+            self.failed = Some("output folder was removed".into());
+        }
         let Some(bus) = self.sink.as_ref().map(|s| s.bus.clone()) else {
             return;
         };
@@ -1691,10 +1699,13 @@ impl Writer {
             use gst::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
-                    if self.failed.is_none() {
-                        let src = err.src().map(|s| s.name().to_string()).unwrap_or_default();
-                        let debug = err.debug().map(|d| format!(" ({d})")).unwrap_or_default();
-                        self.failed = Some(format!("{src}: {}{debug}", err.error()));
+                    let src = err.src().map(|s| s.name().to_string()).unwrap_or_default();
+                    let debug = err.debug().map(|d| format!(" ({d})")).unwrap_or_default();
+                    let error = format!("{src}: {}{debug}", err.error());
+                    // A streaming refusal can beat the sink's ENOSPC onto the
+                    // bus. Keep the actionable storage cause in that case.
+                    if self.failed.is_none() || disk_full(&error) {
+                        self.failed = Some(error);
                     }
                 }
                 MessageView::Warning(w) if std::env::var_os("REC_DEBUG").is_some() => {
@@ -1813,14 +1824,14 @@ impl Writer {
                 "rec: warning: {timing_errors} video encoder buffers used unverified timestamps"
             );
         }
+        if output_folder_removed(&sink.path) {
+            recover_output(&sink, "output folder was removed");
+            bail!("output folder was removed");
+        }
         if let Err(e) = &result {
-            // Keep the file: a fragmented recording is playable up to the last
-            // fragment even when the muxer or an encoder failed.
-            eprintln!("rec: warning: the movie could not be finalized: {e}");
-            eprintln!(
-                "rec: warning: preserving {} (completed fragments may be recoverable)",
-                sink.path.display()
-            );
+            if !recover_output(&sink, &e.to_string()) {
+                eprintln!("rec: warning: the movie could not be finalized: {e}");
+            }
             return Err(anyhow!("writer failed: {e}"));
         }
         // The last step: a regular movie instead of fragments, plus the track
@@ -1867,14 +1878,11 @@ impl Writer {
                 }
             }
             Err(e) => {
-                // Never delete or truncate: the fragmented file still plays.
-                eprintln!(
-                    "rec: warning: could not turn the fragmented file into a regular movie ({e})"
-                );
-                eprintln!(
-                    "rec: warning: preserving {} (completed fragments may be recoverable)",
-                    sink.path.display()
-                );
+                if !recover_output(&sink, &e.to_string()) {
+                    eprintln!(
+                        "rec: warning: could not turn the fragmented file into a regular movie ({e})"
+                    );
+                }
                 return Err(e.context("finalizing the recording"));
             }
         }
@@ -1885,10 +1893,14 @@ impl Writer {
     fn suspend_failed_output(&mut self) {
         if let Some(sink) = self.sink.take() {
             let _ = sink.pipeline.set_state(gst::State::Null);
-            eprintln!(
-                "rec: warning: preserving {} (completed fragments may be recoverable)",
-                sink.path.display()
-            );
+            if !recover_output(&sink, self.failed.as_deref().unwrap_or_default())
+                && !output_folder_removed(&sink.path)
+            {
+                eprintln!(
+                    "rec: warning: preserving {} (completed fragments may be recoverable)",
+                    sink.path.display()
+                );
+            }
         }
     }
 
@@ -1900,6 +1912,135 @@ impl Writer {
             let _ = std::fs::remove_file(&sink.path);
         }
     }
+}
+
+fn output_folder_removed(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        std::fs::metadata(parent).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// Called only after the pipeline has stopped, so no writes race recovery.
+fn recover_output(sink: &Sink, error: &str) -> bool {
+    let removed = output_folder_removed(&sink.path);
+    let full = disk_full(error);
+    if !removed && !full {
+        return false;
+    }
+    let recovered = (|| -> Result<(PathBuf, u64)> {
+        let file = sink
+            .file
+            .as_ref()
+            .context("original recording descriptor unavailable")?;
+        mp4::inspect_recovery(file)?;
+        let destination = if removed {
+            let mut folders = vec![crate::settings::Settings::load().output_dir];
+            if let Some(dir) = std::env::var_os("XDG_VIDEOS_DIR") {
+                folders.push(PathBuf::from(dir));
+            }
+            if let Some(dir) = std::env::var_os("HOME") {
+                folders.push(PathBuf::from(dir));
+            }
+            let mut name = sink
+                .path
+                .file_stem()
+                .context("recording has no filename")?
+                .to_os_string();
+            name.push("-rescued.mov");
+            let mut last_error = None;
+            let mut saved = None;
+            for folder in folders {
+                let destination = folder.join(&name);
+                let result = std::fs::create_dir_all(&folder)
+                    .context("creating rescue folder")
+                    .and_then(|()| mp4::copy_recovery(file, &destination).map(|_| ()));
+                match result {
+                    Ok(()) => {
+                        saved = Some(destination);
+                        break;
+                    }
+                    Err(e) => last_error = Some(e),
+                }
+            }
+            saved.ok_or_else(|| {
+                last_error.unwrap_or_else(|| anyhow!("no rescue folder available"))
+            })?
+        } else {
+            mp4::truncate_recovery(file)?;
+            // Read the retained inode, not a replacement that appeared at its path.
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        };
+        // The fragment prefix is independently playable. Best-effort index
+        // creation may fail on a full filesystem; finalise rolls back a failed
+        // append, leaving that prefix intact.
+        let filesystem = if removed {
+            destination.parent()
+        } else {
+            sink.path.parent()
+        };
+        if filesystem.is_some_and(|dir| crate::media::disk::check(dir, 1_000_000_000).is_ok()) {
+            let _ = mp4::finalize(&destination, &sink.layout, mp4::CrashAt::None, None, None);
+        }
+        let movie = mp4::read(&destination)?;
+        let video = movie
+            .tracks
+            .iter()
+            .find(|t| t.handler == mp4::Handler::Video && t.samples > 0)
+            .context("no complete video samples in recovered recording")?;
+        anyhow::ensure!(video.timescale != 0, "invalid video timescale");
+        let seconds = video.duration / u64::from(video.timescale);
+        Ok((
+            if removed {
+                destination
+            } else {
+                sink.path.clone()
+            },
+            seconds,
+        ))
+    })();
+    match recovered {
+        Ok((path, seconds)) => {
+            let reason = if removed {
+                format!(
+                    "the output folder {} was removed",
+                    sink.path.parent().unwrap_or(Path::new(".")).display()
+                )
+            } else {
+                "the disk is full".into()
+            };
+            eprintln!(
+                "rec: recording stopped: {reason}. Saved the first {}:{:02} to {}.",
+                seconds / 60,
+                seconds % 60,
+                path.display()
+            );
+            true
+        }
+        Err(error) if removed => {
+            eprintln!(
+                "Recording lost: the output folder was removed and Rec could not save a copy ({error})."
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "rec: warning: disk is full; preserving partial recording {} ({error})",
+                sink.path.display()
+            );
+            false
+        }
+    }
+}
+
+fn disk_full(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("enospc") || error.contains("no space left") || error.contains("disk is full")
 }
 
 impl Drop for Writer {
@@ -2537,8 +2678,14 @@ fn open_sink(
     if fragment > 0 {
         set(&mux, "fragment-duration", fragment);
     }
-    let filesink = gst::ElementFactory::make("filesink").build()?;
-    filesink.set_property("location", path.to_string_lossy().to_string());
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let filesink = gst::ElementFactory::make("fdsink").build()?;
+    filesink.set_property("fd", file.as_raw_fd());
     filesink.set_property("sync", false);
 
     let mut chain: Vec<gst::Element> = vec![
@@ -2655,6 +2802,7 @@ fn open_sink(
         video_src,
         tracks,
         path: path.to_path_buf(),
+        file: Some(file),
         encoder,
         enc_in,
         enc_out,
@@ -2667,6 +2815,41 @@ fn open_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_error_classification_is_specific() {
+        assert!(disk_full("write failed: ENOSPC"));
+        assert!(disk_full("No space left on resource"));
+        assert!(!disk_full("Permission denied"));
+        assert!(!disk_full("output disconnected: ENODEV"));
+    }
+
+    #[test]
+    fn removed_folder_is_detected_and_original_inode_stays_readable() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("rec-folder-rescue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("take.mov");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"partial recording").unwrap();
+        assert!(!output_folder_removed(&path));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(output_folder_removed(&path));
+        assert!(mp4::truncate_recovery(&file).is_err());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            bytes, b"partial recording",
+            "an unvalidated partial must not be truncated"
+        );
+    }
 
     #[test]
     fn encoder_slot_metadata_maps_segments_and_preserves_duration() {
@@ -3339,6 +3522,7 @@ mod tests {
             video_src: AppSrc::builder().build(),
             tracks: vec![],
             path: path.clone(),
+            file: None,
             encoder: String::new(),
             enc_in: Arc::default(),
             enc_out: Arc::default(),
@@ -3466,6 +3650,7 @@ mod tests {
                         after_filler: false,
                     }],
                     path: PathBuf::new(),
+                    file: None,
                     encoder: String::new(),
                     enc_in: Arc::default(),
                     enc_out: Arc::default(),
