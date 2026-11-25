@@ -182,6 +182,7 @@ pub struct RtmpUrl {
 }
 
 pub fn parse_url(url: &str) -> Result<RtmpUrl> {
+    super::register_url_secrets(url);
     let (tls, rest) = if let Some(r) = url.strip_prefix("rtmps://") {
         (true, r)
     } else if let Some(r) = url.strip_prefix("rtmp://") {
@@ -917,6 +918,7 @@ const MAX_AV_SKEW_MS: u32 = 120;
 
 impl RtmpOutput {
     pub fn start(url: &str, key: &str) -> Result<RtmpOutput> {
+        crate::diagnostics::register_secret(key);
         let u = parse_url(url)?;
         let name = format!("{}://{}", if u.tls { "rtmps" } else { "rtmp" }, u.host);
         let shared = Arc::new((

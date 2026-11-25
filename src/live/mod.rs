@@ -1204,6 +1204,7 @@ fn warn_about_insecure_tls_once(host: &str) {
 
 /// Redact a secret (stream key) from text meant for logs and the UI.
 pub fn redact(text: &str, secret: &str) -> String {
+    crate::diagnostics::register_secret(secret);
     if secret.len() < 4 {
         text.to_string()
     } else {
@@ -1211,9 +1212,71 @@ pub fn redact(text: &str, secret: &str) -> String {
     }
 }
 
+/// Register credential-bearing URL components before parsing or reporting errors.
+/// Paths and query values are opaque at this boundary (providers put keys in
+/// either); never register the host or query parameter names as secrets.
+pub(crate) fn register_url_secrets(url: &str) {
+    visit_url_secrets(url, crate::diagnostics::register_secret);
+}
+
+fn visit_url_secrets(url: &str, mut register: impl FnMut(&str)) {
+    fn component(value: &str, register: &mut impl FnMut(&str)) {
+        if value.is_empty() {
+            return;
+        }
+        register(value);
+        // Libraries can report either the escaped wire value or decoded text.
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(a), Some(b)) = (
+                    (bytes[i + 1] as char).to_digit(16),
+                    (bytes[i + 2] as char).to_digit(16),
+                )
+            {
+                decoded.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+        if let Ok(decoded) = String::from_utf8(decoded)
+            && decoded != value
+        {
+            register(&decoded);
+        }
+    }
+    let Some((_, rest)) = url.trim().split_once("://") else {
+        return;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some((credentials, _)) = rest[..authority_end].rsplit_once('@') {
+        for value in credentials.split(':') {
+            component(value, &mut register);
+        }
+    }
+    let tail = &rest[authority_end..];
+    let (path_query, fragment) = tail.split_once('#').unwrap_or((tail, ""));
+    component(fragment, &mut register);
+    let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
+    for value in path.split('/') {
+        component(value, &mut register);
+    }
+    for pair in query.split('&') {
+        if let Some((_, value)) = pair.split_once('=') {
+            component(value, &mut register);
+        }
+    }
+}
+
 /// Stream URL for a destination: a service id (`youtube`, `twitch`, `kick`)
 /// expands to its RTMPS ingest URL; anything else is used as given.
 pub fn destination_url(dest: &str) -> String {
+    register_url_secrets(dest);
     let dest = dest.trim();
     SERVICES
         .iter()
@@ -1323,6 +1386,7 @@ pub fn resolve_destination(dest: &str) -> Result<(String, String)> {
     }
     let key = std::env::var("REC_STREAM_KEY")
         .ok()
+        .inspect(|k| crate::diagnostics::register_secret(k))
         .filter(|k| !k.is_empty())
         .or_else(|| keyring::get(dest));
     match key {
@@ -1340,6 +1404,8 @@ pub fn resolve_destination(dest: &str) -> Result<(String, String)> {
 
 /// Start an output for `url` (rtmp://, rtmps:// or http(s):// WHIP).
 pub fn start_output(url: &str, key: &str) -> Result<Box<dyn Output>> {
+    register_url_secrets(url);
+    crate::diagnostics::register_secret(key);
     if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
         Ok(Box::new(rtmp::RtmpOutput::start(url, key)?))
     } else if url.starts_with("http://") || url.starts_with("https://") {
@@ -1353,6 +1419,47 @@ pub fn start_output(url: &str, key: &str) -> Result<Box<dyn Output>> {
 mod tests {
     use super::*;
     use crate::media_types::PixelFormat;
+
+    #[test]
+    fn url_secret_components_include_short_and_escaped_credentials() {
+        let mut secrets = Vec::new();
+        visit_url_secrets(
+            "https://u:p@example.test/live/a/ab/abc/long%2Dkey?token=x&key=%C3%A9#z",
+            |value| secrets.push(value.to_string()),
+        );
+        for expected in [
+            "u",
+            "p",
+            "a",
+            "ab",
+            "abc",
+            "long%2Dkey",
+            "long-key",
+            "x",
+            "%C3%A9",
+            "é",
+            "z",
+        ] {
+            assert!(secrets.iter().any(|s| s == expected), "missing {expected}");
+        }
+        for public in ["https", "example.test", "token", "key"] {
+            assert!(!secrets.iter().any(|s| s == public));
+        }
+    }
+
+    #[test]
+    fn url_secret_components_handle_rtmp_and_malformed_urls() {
+        let mut secrets = Vec::new();
+        visit_url_secrets("rtmp://host/live/short?auth=ab", |s| {
+            secrets.push(s.to_owned())
+        });
+        assert_eq!(secrets, ["live", "short", "ab"]);
+        secrets.clear();
+        visit_url_secrets("youtube", |s| secrets.push(s.to_owned()));
+        assert!(secrets.is_empty());
+        visit_url_secrets("rtmps://host/live/%zz", |s| secrets.push(s.to_owned()));
+        assert_eq!(secrets, ["live", "%zz"]);
+    }
 
     #[test]
     fn platform_presets() {
