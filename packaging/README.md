@@ -17,7 +17,7 @@ only requirement.
 | Test | `packaging/flatpak/test-flatpak.sh` | `packaging/appimage/test-appimage.sh` |
 | Base | `org.gnome.Platform` 49 (freedesktop 25.08) + rust-stable, llvm21 SDK extensions | `ubuntu:24.04` container, glibc 2.39 floor |
 | GStreamer | the runtime's 1.26 + `codecs-extra` | bundled 1.24 (base/good/bad/ugly/libav) |
-| Size | 11,545,120 bytes (runtime shared) | 110,017,016 bytes (GStreamer inside) |
+| Size | 11,524,264 bytes (runtime shared) | 110,017,016 bytes (GStreamer inside) |
 
 `REC_PKG_OUT` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/rec-rs-linux-packaging`.
 Nothing is written inside the repository.
@@ -135,6 +135,7 @@ writer's candidate order picks the same encoders everywhere.
 | `--filesystem=xdg-videos:create` | the default recording folder (`$XDG_VIDEOS_DIR`, else `~/Videos`) |
 | `--talk-name=org.freedesktop.secrets` | stream keys in the Secret Service |
 | `--talk-name=org.kde.StatusNotifierWatcher` | the tray icon (StatusNotifierItem) |
+| `--system-talk-name=org.freedesktop.login1` | receive logind's `PrepareForSleep` to stop and finalize a recording before suspend |
 
 Deliberately *not* granted: `--device=all`, the home directory, any other
 filesystem, and the session bus.
@@ -195,7 +196,7 @@ WHIP; the test pattern synthesizes the system-audio beeps, so no device is
 needed), the replay buffer fills, and `stream-key` stores and deletes a key
 through `org.freedesktop.secrets`.
 
-Bundle size: **11.5 MB** (`rec.flatpak`, 11,545,120 bytes) — the runtime is shared. The manifest
+Bundle size: **11.5 MB** (`rec.flatpak`, 11,524,264 bytes) — the runtime is shared. The manifest
 also produces an `io.github.sultanaltair96.Rec.Debug` ref (22 MB of debug info
 from `[profile.release] debug = 1`), which stays in the repository and is not
 part of the bundle.

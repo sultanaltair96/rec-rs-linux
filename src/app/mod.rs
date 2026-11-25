@@ -24,6 +24,7 @@ mod install;
 mod linux_desktop;
 mod lock;
 mod preview;
+mod recovery;
 #[cfg(test)]
 pub(crate) use preview::{Frame as TestPreviewFrame, Tap as TestPreviewTap};
 mod preview_gpu;
@@ -287,6 +288,8 @@ pub struct State {
     key_saved: HashMap<String, bool>,
     /// A short confirmation (replay saved) and when it was shown.
     pub notice: Option<(String, Instant)>,
+    /// Persistent capture recovery status, independent of expiring notices.
+    pub preview_reconnecting: Option<String>,
     /// Flatpak updates the app itself, so there is no "Check for Updates…".
     pub updates: bool,
     /// The mic the running session opened (None = system default) and the
@@ -332,6 +335,7 @@ impl State {
             key_inputs: Default::default(),
             key_saved: Default::default(),
             notice: None,
+            preview_reconnecting: None,
             updates: install::updates_self(),
             mic_in_use: None,
             mic_warned: None,
@@ -794,6 +798,9 @@ struct App {
     /// Preview teardown is not recording finalization: it must not publish a
     /// file, remove the recorder pidfile/socket, or restore hidden windows.
     preview_cleanup: Option<std::thread::JoinHandle<()>>,
+    preview_recovery: recovery::Recovery,
+    recovery_scene: Scene,
+    monitor_set: Vec<String>,
     /// Cancelled recording startups can already own a file. Keep their
     /// finalizers even after Starting has gone away, including across Quit.
     recording_start_cleanup: Vec<std::thread::JoinHandle<()>>,
@@ -876,6 +883,9 @@ impl App {
             test_pattern,
             finished: Arc::new(Mutex::new(None)),
             preview_cleanup: None,
+            preview_recovery: recovery::Recovery::default(),
+            recovery_scene: Scene::default(),
+            monitor_set: Vec::new(),
             recording_start_cleanup: Vec::new(),
             starting: None,
             pending_recording: false,
@@ -1329,6 +1339,15 @@ impl App {
     /// recording; restart it when the settings change.
     fn sync_preview(&mut self) {
         self.check_preview_failure();
+        let now = Instant::now();
+        if self.recovery_scene != self.st.settings.scene {
+            self.recovery_scene = self.st.settings.scene;
+            self.preview_recovery.expedite(now);
+        }
+        if self.st.recording.is_some() {
+            self.preview_recovery.reset();
+            self.st.preview_reconnecting = None;
+        }
         // A taken session still owns its capture until the worker returns.
         if self.quitting
             || self.preview_cleanup.is_some()
@@ -1358,6 +1377,9 @@ impl App {
                 self.finish_preview_async();
             }
             // Do not open another capture until the old worker releases it.
+            return;
+        }
+        if self.preview_recovery.active() && !self.preview_recovery.due(now) {
             return;
         }
         if want && self.st.preview.is_none() && self.st.error.is_none() {
@@ -1440,14 +1462,20 @@ impl App {
                 if let Some(a) = s.cam_aspect() {
                     self.st.cam_aspect = a;
                 }
+                self.preview_recovery.reset();
+                self.st.preview_reconnecting = None;
                 self.st.preview = Some(s);
                 self.st.preview_settings = Some(start.settings.clone());
             }
-            Err(e) => self.st.error = Some(session::preview_error(&e)),
+            Err(e) => {
+                let error = session::preview_error(&e);
+                self.preview_failed(&error);
+            }
         }
     }
 
     fn toggle_recording(&mut self, el: &ActiveEventLoop) {
+        self.preview_recovery.expedite(Instant::now());
         if let Some(start) = &mut self.starting
             && start.file.is_some()
         {
@@ -1470,6 +1498,7 @@ impl App {
     }
 
     fn start_recording(&mut self, el: &ActiveEventLoop) {
+        self.preview_recovery.expedite(Instant::now());
         if self.st.recording.is_some() || self.st.finishing || self.quitting {
             return;
         }
@@ -1801,12 +1830,24 @@ impl App {
         }
     }
 
+    fn preview_failed(&mut self, error: &str) {
+        if !self.test_pattern && recovery::retryable_screen_error(error) {
+            self.st.error = None;
+            self.preview_recovery.failed(Instant::now());
+            self.st.preview_reconnecting = Some(format!("Reconnecting screen preview… {error}"));
+        } else {
+            self.preview_recovery.reset();
+            self.st.preview_reconnecting = None;
+            self.st.error = Some(error.into());
+        }
+    }
+
     fn check_preview_failure(&mut self) {
         if let Some(s) = self.st.preview.as_ref()
             && s.failed()
         {
             let err = s.error().unwrap_or_default();
-            self.st.error = Some(format!("Preview stopped: {err}"));
+            self.preview_failed(&format!("Preview stopped: {err}"));
             if std::env::var_os("REC_DEBUG").is_some() {
                 eprintln!("rec: debug: preview failed; cleaning up asynchronously: {err}");
             }
@@ -2087,6 +2128,28 @@ impl App {
         if self.st.refresh_devices {
             self.st.refresh_devices = false;
             load_devices(&mut self.st);
+        }
+        // Poll winit's desktop monitor set too: audio/video device watchers do
+        // not report display hotplug. Never open capture from this path.
+        if let Some(window) = self.main.as_ref() {
+            let mut monitors: Vec<_> = window
+                .window
+                .available_monitors()
+                .map(|m| {
+                    format!(
+                        "{:?}:{:?}:{:?}:{:?}",
+                        m.name(),
+                        m.position(),
+                        m.size(),
+                        m.scale_factor()
+                    )
+                })
+                .collect();
+            monitors.sort();
+            if monitors != self.monitor_set {
+                self.monitor_set = monitors;
+                self.preview_recovery.expedite(Instant::now());
+            }
         }
         // G9: a device was plugged in or removed.
         if DEVICES_CHANGED.swap(false, Ordering::SeqCst) {
@@ -2756,6 +2819,37 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_scene_screen_loss_recovers_across_scene_switch_without_overlap() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(false, false, None, false, rx, None);
+        app.st.settings.scene = Scene::Cam;
+        app.recovery_scene = Scene::Cam;
+        app.preview_failed("screen capture stopped: display disconnected");
+        assert!(app.st.error.is_none());
+        assert!(app.st.preview_reconnecting.is_some());
+        assert!(!app.preview_recovery.due(Instant::now()));
+        // An old worker still owns capture; even an expedited scene switch
+        // must not launch another portal request until cleanup completes.
+        app.preview_cleanup = Some(std::thread::spawn(|| {}));
+        app.st.settings.scene = Scene::ScreenCam;
+        app.sync_preview();
+        assert!(app.preview_recovery.due(Instant::now()));
+        assert!(app.starting.is_none());
+        assert!(app.st.error.is_none());
+        assert!(app.st.preview_reconnecting.is_some());
+        for error in [
+            "screen capture was cancelled in the system dialog",
+            "screen capture permission denied",
+            "camera did not deliver a frame",
+        ] {
+            app.preview_failed(error);
+            assert!(!app.preview_recovery.active());
+            assert!(app.st.preview_reconnecting.is_none());
+            assert!(app.st.error.is_some());
+        }
+    }
 
     #[test]
     fn quit_bounds_preview_startup_but_gives_picker_time_to_close() {

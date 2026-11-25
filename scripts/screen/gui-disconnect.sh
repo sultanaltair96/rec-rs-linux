@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run inside headless.sh with REC_BIN and OUT_DIR. Real portal-node removal,
-# retry recording, preview restart, then bounded control-quit/SIGTERM (10 each).
+# automatic idle-preview recovery, retry recording, preview restart, then bounded
+# control-quit/SIGTERM (10 each; GUI_DISCONNECT_REPEATS overrides for smoke runs).
 set -eu
 python3 - <<'PY'
 import atexit, json, os, pathlib, signal, socket, subprocess, time
@@ -82,13 +83,34 @@ for mode in ('control', 'sigterm'):
             subprocess.run(['pw-cli', 'destroy', str(node)], check=True, capture_output=True)
             assert not target_present(), 'portal target not removed'
             wait_for(lambda: 'preview failed; cleaning up asynchronously' in log(), 'failed preview cleanup', app)
+            # No control commands, window interaction or recording may rescue
+            # this preview: restarting the backend alone must yield new frames.
+            # Take a fresh baseline so stale first-frame messages cannot pass.
+            frames_before_restart = log().count('first screen frame delivered')
             restart_backend(d)
+            def idle_recovered():
+                assert not (rt / 'rec-rs-recorder.sock').exists(), 'unexpected recording during idle recovery'
+                assert not list(d.glob('*.mov')) + list(d.glob('*.mp4')), 'unexpected file during idle recovery'
+                return log().count('first screen frame delivered') > frames_before_restart
+            wait_for(idle_recovered, 'automatic idle preview recovery (no user action)', app, seconds=90)
+            text = log()
+            recovered_node = int([l.split()[-1] for l in text.splitlines()
+                                  if 'screen stream connected to node' in l][-1])
+            recovered_serial = [l.split('"')[1] for l in text.splitlines()
+                                if 'screen target registry.global:' in l][-1]
+            assert (recovered_node, recovered_serial) != (node, serial), 'reused removed stream'
+            assert any(o['id'] == recovered_node and
+                       str(o.get('info', {}).get('props', {}).get('object.serial')) == recovered_serial
+                       for o in registry()), 'recovered preview target missing'
+            recovered_frames = log().count('first screen frame delivered')
+            # Scene changes have no control-socket command; do not simulate one
+            # by editing settings on disk (the running GUI does not reload it).
             # Send explicit Start twice: idempotent even while teardown owns
             # the old session. It must not be lost or toggle the new file off.
             control('start-recording')
             control('start-recording')
             wait_for(lambda: (rt / 'rec-rs-recorder.sock').exists(), 'retry recording socket', app)
-            wait_for(lambda: log().count('first screen frame delivered') >= 2, 'retry first frame', app)
+            wait_for(lambda: log().count('first screen frame delivered') > recovered_frames, 'retry first frame', app)
             time.sleep(2)
             control('stop')
             wait_for(lambda: not (rt / 'rec-rs-recorder.sock').exists(), 'retry finalized', app)
@@ -99,7 +121,7 @@ for mode in ('control', 'sigterm'):
             subprocess.run(['ffmpeg', '-v', 'error', '-i', str(files[0]), '-f', 'null', '-'], check=True)
             # Recording completion restores the preview: prove a third real
             # stream delivered frames, not just that the control thread acks.
-            wait_for(lambda: log().count('first screen frame delivered') >= 3, 'preview restarted', app)
+            wait_for(lambda: log().count('first screen frame delivered') >= recovered_frames + 2, 'preview restarted', app)
             # Kill that idle preview too, then quit during its cleanup.
             text = log()
             node = int([l.split()[-1] for l in text.splitlines()
@@ -121,7 +143,7 @@ for mode in ('control', 'sigterm'):
             assert 'panicked' not in log()
             assert not (rt / 'rec-rs.pid').exists()
             assert not (rt / 'rec-rs-recorder.sock').exists()
-            print(f'PASS gui-disconnect {mode} {iteration}: 2 real disconnects, retry decoded, preview restarted, exit {elapsed:.3f}s', flush=True)
+            print(f'PASS gui-disconnect {mode} {iteration}: 2 real disconnects, automatic idle recovery before user action, retry decoded, preview restarted, exit {elapsed:.3f}s', flush=True)
         finally:
             if app.poll() is None:
                 app.kill()
