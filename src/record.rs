@@ -325,6 +325,8 @@ pub struct Session {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     pacer: Option<std::thread::JoinHandle<()>>,
+    disk_monitor: Option<std::thread::JoinHandle<()>>,
+    disk_failed: Arc<AtomicBool>,
     video: Option<Box<dyn VideoSource>>,
     camera: Option<Camera>,
     /// What the camera reported (its device name), for the start log and the app.
@@ -448,6 +450,14 @@ impl Session {
     /// settled instead of waiting the 2 s cold-camera gate. A camera the
     /// options no longer want is stopped.
     pub fn start_with_camera(o: &Options, cam: Option<Camera>) -> Result<Session> {
+        // Disk admission precedes devices and file creation. Live-only sessions
+        // neither require a destination nor touch its filesystem.
+        let interval = crate::media::disk::check_interval()?;
+        let disk = if o.write {
+            Some(crate::media::disk::preflight(&o.output, o.bitrate)?)
+        } else {
+            None
+        };
         let (w, h) = o.size;
         let spec = VideoSpec {
             width: w,
@@ -600,6 +610,8 @@ impl Session {
             shared: shared.clone(),
             stop,
             pacer: None,
+            disk_monitor: None,
+            disk_failed: Arc::new(AtomicBool::new(false)),
             video: Some(opened.video),
             camera: None,
             camera_desc: String::new(),
@@ -655,6 +667,21 @@ impl Session {
                 std::thread::sleep(period);
             }
         }));
+        if let Some((directory, low_water)) = disk {
+            let shared = shared.clone();
+            let disk_failed = sess.disk_failed.clone();
+            // Never statvfs under the writer lock or on the frame pacing thread.
+            sess.disk_monitor = Some(std::thread::spawn(move || {
+                while !shared.stop.load(Ordering::SeqCst) {
+                    if let Err(error) = crate::media::disk::check(&directory, low_water) {
+                        disk_failed.store(true, Ordering::SeqCst);
+                        shared.fail(error.to_string());
+                        break;
+                    }
+                    std::thread::park_timeout(interval);
+                }
+            }));
+        }
         sess.started = Instant::now();
         Ok(sess)
     }
@@ -856,6 +883,10 @@ impl Session {
     pub fn finish(mut self) -> Result<Stats> {
         let end = media_types::now();
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(monitor) = self.disk_monitor.take() {
+            monitor.thread().unpark();
+            let _ = monitor.join();
+        }
         if let Some(p) = self.pacer.take() {
             let _ = p.join();
         }
@@ -867,6 +898,10 @@ impl Session {
         };
         if let Some(e) = self.shared.error.lock().unwrap().take() {
             eprintln!("rec: error during recording: {e}");
+            if self.disk_failed.load(Ordering::SeqCst) {
+                result?;
+                bail!("{e}");
+            }
         }
         result
     }

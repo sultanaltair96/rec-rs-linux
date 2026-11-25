@@ -26,7 +26,17 @@
 # Anything that can block is additionally run under `timeout` *inside* the
 # container (DEV_TIMEOUT, default 30 minutes, 0 = no limit), because a host-side
 # timeout can only kill the client.
+# DEV_SMALL_TMPFS=96m opts into a dedicated bounded /mnt/rec-small tmpfs.
+# Its pages count against the container's memory ceiling.
 set -eu
+
+small_tmpfs=${DEV_SMALL_TMPFS:-}
+if [ -n "$small_tmpfs" ]; then
+    case "$small_tmpfs" in *[!0-9mM]* | *[!mM] | m | M) echo 'dev.sh: DEV_SMALL_TMPFS must be 1m to 128m' >&2; exit 1 ;; esac
+    size_mb=${small_tmpfs%?}
+    case "$size_mb" in '' | *[!0-9]*) echo 'dev.sh: invalid DEV_SMALL_TMPFS' >&2; exit 1 ;; esac
+    [ "$size_mb" -ge 1 ] && [ "$size_mb" -le 128 ] || { echo 'dev.sh: DEV_SMALL_TMPFS must be 1m to 128m' >&2; exit 1; }
+fi
 
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 IMAGE_BASE=rec-rs-linux-dev
@@ -178,6 +188,12 @@ fi
 mem=${DEV_MEMORY:-4g}
 if [ "$mem" != "0" ]; then
     caps="$caps --memory $mem --memory-swap $mem"
+fi
+
+# Keep large build/test scratch files off RAM unless explicitly requested.
+# Never use Docker's uncapped tmpfs default (half the host's RAM).
+if [ -n "$small_tmpfs" ]; then
+    caps="$caps --tmpfs /mnt/rec-small:rw,nosuid,nodev,size=$small_tmpfs,uid=$UID_HOST,gid=$GID_HOST,mode=0700"
 fi
 
 # shellcheck disable=SC2086 # $envs is a list of -e NAME=value pairs

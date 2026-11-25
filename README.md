@@ -95,6 +95,29 @@ on a worker thread after the user chooses a destination. Do not add arbitrary te
 or errors to the event vocabulary. A failed write may leave a partial private archive;
 remove it and retry with a new path. Tar is supported; ZIP is not currently offered.
 
+## Advanced settings
+
+Recording disk safeguards can be tuned with environment variables (positive whole
+numbers in decimal MB, 1 MB = 1,000,000 bytes):
+
+- `REC_MIN_FREE_MB`: free space required before recording starts. Default: the
+  larger of 2 GB and five minutes at the requested video bitrate.
+- `REC_LOW_WATER_MB`: stop and finalize when available space falls below this
+  threshold, checked every five seconds outside the writer lock. Default: at
+  least 1 GB, and at least four times the 128 MiB movie-index limit plus one
+  fragment and five seconds at the maximum bitrate (80 Mb/s video plus three
+  320 kb/s audio tracks, or the requested bitrate if higher). The fragment
+  allowance follows `REC_FRAGMENT_SECS` (default two seconds; this existing
+  muxer override uses milliseconds despite its name).
+
+Explicit values replace these defaults; invalid or overflowing values fail before
+recording starts. `REC_LOW_WATER_MB=0` disables the periodic low-space stop;
+this is unsafe and intended for fault testing. `REC_DISK_CHECK_MS` overrides the
+poll interval (minimum 10 ms). Admission always requires at least the low watermark.
+Lowering the reserves risks running out of space during finalization, especially
+with variable-bitrate encoders, ProRes or other concurrent filesystem writers.
+Only space available to the current user counts. Live-only sessions skip these checks.
+
 ## Packaging
 
 Two installable packages are built from this repository by scripts in `packaging/`. Both run the

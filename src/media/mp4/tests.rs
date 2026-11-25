@@ -7,6 +7,327 @@
 
 use super::*;
 
+#[test]
+fn recovery_torn_fragments_and_exact_boundary() {
+    let (bytes, _) = fragmented_fixture();
+    let fixture = write_temp("recovery-fixture", &bytes);
+    let (_, boxes, _) = scan(&fixture).unwrap();
+    let moofs: Vec<_> = boxes.iter().filter(|b| b.kind == MOOF).collect();
+    let mdats: Vec<_> = boxes.iter().filter(|b| b.kind == *b"mdat").collect();
+    let first_end = mdats[0].start + mdats[0].size;
+    for end in [
+        moofs[1].start + 3, // torn header
+        moofs[1].start + moofs[1].header + 3,
+        mdats[1].start + 3,
+        mdats[1].start + mdats[1].header + 3,
+        first_end,
+        mdats[1].start + mdats[1].size,
+    ] {
+        let path = write_temp("recovery-tail", &bytes[..end as usize]);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(5)).unwrap();
+        let expected = if end == mdats[1].start + mdats[1].size {
+            end
+        } else {
+            first_end
+        };
+        let report = inspect_recovery(&file).unwrap();
+        assert_eq!(report.complete_bytes, expected);
+        assert_eq!(report.last_fragment_end, expected);
+        assert_eq!(file.stream_position().unwrap(), 5);
+        // Rescue must work from an fd whose name is gone.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(copy_recovery(&file, &path).unwrap(), report);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes[..expected as usize]);
+        assert!(copy_recovery(&file, &path).is_err());
+        assert_eq!(file.metadata().unwrap().len(), end);
+        assert_eq!(truncate_recovery(&file).unwrap(), report);
+        assert_eq!(file.metadata().unwrap().len(), expected);
+        assert_eq!(inspect_recovery(&file).unwrap().complete_bytes, expected);
+        std::fs::remove_file(path).unwrap();
+    }
+    let path = write_temp("recovery-empty", &bytes[..first_end as usize - 1]);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(truncate_recovery(&file).is_err());
+    assert_eq!(file.metadata().unwrap().len(), first_end - 1);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(fixture).unwrap();
+}
+
+#[test]
+fn recovery_preserves_complete_suffix_and_tolerates_torn_extended_header() {
+    let (mut bytes, _) = fragmented_fixture();
+    bytes.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
+    let complete = bytes.len() as u64;
+    // Both an incomplete large-size field and a fully written large-size
+    // field whose declared payload is missing must stop at the same prefix.
+    for tail in [
+        vec![0, 0, 0, 1, b'm', b'o', b'o', b'f', 0, 0],
+        [
+            vec![0, 0, 0, 1, b'm', b'o', b'o', b'f'],
+            100u64.to_be_bytes().to_vec(),
+        ]
+        .concat(),
+    ] {
+        let mut torn = bytes.clone();
+        torn.extend_from_slice(&tail);
+        let path = write_temp("recovery-extended", &torn);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let report = truncate_recovery(&file).unwrap();
+        assert_eq!(report.complete_bytes, complete);
+        assert!(report.last_fragment_end < complete);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn failed_index_append_preserves_completed_fragments() {
+    for errno in [libc::ENOSPC, libc::EIO, libc::ENODEV] {
+        let (bytes, _) = fragmented_fixture();
+        let path = write_temp(&format!("append-failure-{errno}"), &bytes);
+        let before = read(&path).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let error = append_transaction(&mut file, |file| {
+            file.write_all(&[0, 0, 1, 0, b'm', b'o', b'o', b'v'])?;
+            Err(std::io::Error::from_raw_os_error(errno))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(errno)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let after = read(&path).unwrap();
+        assert_eq!(after.tracks.len(), before.tracks.len());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// A streaming sink: accept short writes up to an exact byte budget, then
+/// report a real device I/O error (rather than synthesizing a closure error).
+struct EioAfterBytes {
+    file: File,
+    remaining: usize,
+    writes: usize,
+}
+
+impl Write for EioAfterBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        // Force write_all to retry short writes, including at the fault edge.
+        let count = bytes.len().min(self.remaining).min(7);
+        let written = self.file.write(&bytes[..count])?;
+        self.remaining -= written;
+        self.writes += 1;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[test]
+fn streaming_eio_preserves_completed_moof_mdat() {
+    let (bytes, payloads) = fragmented_fixture();
+    let fixture = write_temp("streaming-eio-fixture", &bytes);
+    let (_, boxes, _) = scan(&fixture).unwrap();
+    let mdats: Vec<_> = boxes.iter().filter(|b| b.kind == *b"mdat").collect();
+    let moofs: Vec<_> = boxes.iter().filter(|b| b.kind == *b"moof").collect();
+    assert_eq!(mdats.len(), 2);
+    assert_eq!(moofs.len(), 2);
+    let completed_end = (mdats[0].start + mdats[0].size) as usize;
+
+    // Lose the device during either the next fragment header or its payload.
+    for failing_box in [moofs[1], mdats[1]] {
+        let limit = (failing_box.start + failing_box.header + 3) as usize;
+        let path = write_temp("streaming-eio", &[]);
+        let mut sink = EioAfterBytes {
+            file: File::create(&path).unwrap(),
+            remaining: limit,
+            writes: 0,
+        };
+        let result: std::io::Result<()> =
+            bytes.chunks(23).try_for_each(|chunk| sink.write_all(chunk));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(sink.remaining, 0);
+        assert!(sink.writes > limit / 7);
+        sink.flush().unwrap();
+        drop(sink);
+
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(saved.len(), limit);
+        assert_eq!(saved, bytes[..limit]);
+        assert_eq!(saved[..completed_end], bytes[..completed_end]);
+        let (_, surviving, _) = scan_with(&path, true).unwrap();
+        assert!(
+            surviving.iter().any(|b| b.kind == *b"moof"
+                && b.start == moofs[0].start
+                && b.size == moofs[0].size)
+        );
+        let surviving_mdats: Vec<_> = surviving.iter().filter(|b| b.kind == *b"mdat").collect();
+        assert_eq!(surviving_mdats.len(), 1);
+        let mdat = surviving_mdats[0];
+        assert_eq!(
+            &saved[(mdat.start + mdat.header) as usize..(mdat.start + mdat.size) as usize],
+            payloads[0].as_slice()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_file(fixture).unwrap();
+}
+
+/// Index-only workload: no raw frames, encoding, or multi-GB media allocation.
+/// Variable compressed packet sizes deliberately exercise per-sample stsz;
+/// 2-second chunks, closed GOPs (one video sync sample per chunk), no B frames,
+/// 48 kHz AAC-LC with 1024 samples/packet, and no encoder priming/padding.
+/// The opaque fixture stsd is NOT a real codec configuration: these totals are
+/// exact for this fixture, not a prediction of every encoder's output.
+#[test]
+fn two_hour_60fps_three_aac_tracks_index_sizes() {
+    const SECONDS: u32 = 7200;
+    const FRAGMENTS: u32 = SECONDS / 2;
+    const VIDEO_SAMPLES: u32 = SECONDS * 60;
+    const AUDIO_SAMPLES: u32 = SECONDS * 48000 / 1024;
+    assert_eq!(VIDEO_SAMPLES, 432_000);
+    assert_eq!(AUDIO_SAMPLES, 337_500);
+    assert_eq!(AUDIO_SAMPLES * 1024, SECONDS * 48000);
+
+    let tracks: Vec<_> = (0..4)
+        .map(|i| TrackFixture {
+            id: i + 1,
+            handler: if i == 0 { *b"vide" } else { *b"soun" },
+            timescale: if i == 0 { 60000 } else { 48000 },
+            duration: 0,
+            flags: 3,
+            tables: empty_tables(),
+        })
+        .collect();
+    let init = init_moov(1000, &tracks);
+    for wide in [false, true] {
+        let mut plans = Vec::new();
+        let mut table_bytes = Vec::new();
+        for (track, track_info) in tracks.iter().enumerate() {
+            let video = track == 0;
+            let count = if video { VIDEO_SAMPLES } else { AUDIO_SAMPLES };
+            let mut samples = Vec::with_capacity(count as usize);
+            // All chunk offsets fit stco in the first case; all need co64 in
+            // the second. These are virtual payload offsets, not file writes.
+            let mut offset = if wide { 1u64 << 32 } else { 4096 };
+            let mut n = 0;
+            for fragment in 0..FRAGMENTS {
+                let end = if video {
+                    (fragment + 1) * 120
+                } else {
+                    (fragment + 1) * 96000 / 1024
+                };
+                while n < end {
+                    let size = if video { 1000 } else { 400 } + n % 2;
+                    samples.push(Sample {
+                        offset,
+                        size,
+                        duration: if video { 1000 } else { 1024 },
+                        sync: !video || n == fragment * 120,
+                        cts: 0,
+                    });
+                    offset += u64::from(size);
+                    n += 1;
+                }
+                offset += 4096; // fragment headers / other tracks separate chunks
+            }
+            assert_eq!(n, count);
+            let tables = build_tables(&samples);
+            assert_eq!(tables.chunks.len(), FRAGMENTS as usize);
+            assert_eq!(tables.co64, wide);
+            assert_eq!(tables.stts.len(), 1);
+            assert_eq!(tables.sizes.len(), count as usize);
+            assert_eq!(tables.stss.len(), if video { 3600 } else { 0 });
+            table_bytes.push(stbl_table_boxes(&tables, count).len());
+            plans.push(TrakPlan {
+                media_duration: Some(u64::from(SECONDS * track_info.timescale)),
+                tkhd_duration: Some(u64::from(SECONDS * 1000)),
+                edits: Some(vec![Edit {
+                    segment_duration: u64::from(SECONDS * 1000),
+                    media_time: 0,
+                }]),
+                tables: Some((tables, count)),
+                ..Default::default()
+            });
+        }
+        let moov = rebuild_moov(&init, &plans, u64::from(SECONDS * 1000)).unwrap();
+        assert_eq!(parse_moov(&moov).unwrap().tracks.len(), 4);
+        assert_eq!(
+            table_bytes,
+            if wide {
+                vec![1_771_304, 1_400_476, 1_400_476, 1_400_476]
+            } else {
+                vec![1_756_904, 1_386_076, 1_386_076, 1_386_076]
+            }
+        );
+        assert_eq!(moov.len(), if wide { 5_974_016 } else { 5_916_416 });
+
+        // A specification-shaped mfra estimate, NOT a production muxer path:
+        // version-1 tfra, one entry per track per 2s fragment, 64-bit time and
+        // moof offset, one-byte traf/trun/sample numbers, plus mfro. Real qtmux
+        // may choose different entry counts/widths or omit audio tfra entirely.
+        let mut mfra_body = Vec::new();
+        for track in 0..4u32 {
+            let mut body = (track + 1).to_be_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_be_bytes()); // three widths = 1 byte
+            body.extend_from_slice(&FRAGMENTS.to_be_bytes());
+            for fragment in 0..FRAGMENTS {
+                let time = u64::from(fragment * 2 * tracks[track as usize].timescale);
+                body.extend_from_slice(&time.to_be_bytes());
+                body.extend_from_slice(&((1u64 << 32) + u64::from(fragment) * 4096).to_be_bytes());
+                body.extend_from_slice(&[(track + 1) as u8, 1, 1]);
+            }
+            mfra_body.extend_from_slice(&full_flags(b"tfra", 1, 0, &body));
+        }
+        let mfra_size = 8 + mfra_body.len() + 16;
+        mfra_body.extend_from_slice(&full_flags(
+            b"mfro",
+            0,
+            0,
+            &(mfra_size as u32).to_be_bytes(),
+        ));
+        let mut mfra = Vec::new();
+        push_box(&mut mfra, b"mfra", &mfra_body);
+        assert_eq!(mfra.len(), 273_720);
+        assert_eq!(
+            moov.len() + mfra.len(),
+            if wide { 6_247_736 } else { 6_190_136 }
+        );
+        println!(
+            "2h/60fps/3 AAC {}: sample tables={table_bytes:?}; moov={} bytes; synthetic mfra={} bytes; combined={} bytes",
+            if wide { "co64" } else { "stco" },
+            moov.len(),
+            mfra.len(),
+            moov.len() + mfra.len()
+        );
+    }
+}
+
 // --- box builders ---------------------------------------------------------
 
 fn full_flags(kind: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
@@ -260,6 +581,157 @@ fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
 fn top_level(path: &std::path::Path) -> Vec<[u8; 4]> {
     let (_, boxes, _) = scan(path).unwrap();
     boxes.iter().map(|b| b.kind).collect()
+}
+
+/// Widen the init duration fields, as a long-running muxer can do. Keep
+/// creation/modification times zero; preserve all fields following duration.
+fn wide_duration_headers(buf: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    for b in children(buf, 0, buf.len()).unwrap() {
+        let raw = slice(buf, &b);
+        match &b.kind {
+            b"moov" | b"trak" | b"mdia" => {
+                push_box(&mut out, &b.kind, &wide_duration_headers(&raw[8..]));
+            }
+            b"mvhd" | b"mdhd" | b"tkhd" => {
+                let duration_at = if &b.kind == b"tkhd" { 28 } else { 24 };
+                let mut body = vec![0; 16]; // 64-bit creation/modification
+                body.extend_from_slice(&raw[20..duration_at]);
+                body.extend_from_slice(&(be32(raw, duration_at).unwrap() as u64).to_be_bytes());
+                body.extend_from_slice(&raw[duration_at + 4..]);
+                out.extend_from_slice(&full_flags(
+                    &b.kind,
+                    1,
+                    be32(raw, 8).unwrap() & 0xffffff,
+                    &body,
+                ));
+            }
+            _ => out.extend_from_slice(raw),
+        }
+    }
+    out
+}
+
+#[test]
+fn compressed_time_over_two_hours_and_u32_ticks() {
+    // Only three bytes of media: 2h+ at 600 kHz crosses the 32-bit clock
+    // boundary without waiting, encoding hours of frames, or huge tables.
+    let delta = 2_200_000_000u32;
+    let origin = (1u64 << 32) + 123;
+    let first = [(delta, 1, 0, 0)];
+    let last = [(delta, 1, 0, 0), (600_000, 1, 0, -10)];
+    let bytes = timeline_fixture(
+        *b"vide",
+        600_000,
+        &[(&first, Some(origin)), (&last, Some(origin + delta as u64))],
+    );
+    let path = write_temp("boundary-long-clock", &wide_duration_headers(&bytes));
+    let duration = 2 * delta as u64 + 600_000;
+    let before = read(&path).unwrap();
+    assert!(duration > u32::MAX as u64);
+    assert!(duration as f64 / 600_000.0 > 7200.0);
+    assert_eq!(before.tracks[0].duration, duration);
+    assert_eq!(before.tracks[0].first_pts, origin as f64 / 600_000.0);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    assert_eq!(
+        regular_packet_times(&path),
+        vec![
+            (0, 0, delta),
+            (delta as i64, delta as i64, delta),
+            (2 * delta as i64, 2 * delta as i64 - 10, 600_000),
+        ]
+    );
+    let after = read(&path).unwrap();
+    assert_eq!(after.tracks[0].duration, duration);
+    assert_eq!(after.duration, duration * 1000 / 600_000);
+    assert_eq!(after.tracks[0].samples, 3);
+    assert_eq!(after.tracks[0].bytes, 3);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn sparse_mdat_over_four_gib_preserves_co64_and_payload() {
+    // Never read/copy the whole fixture: the extended mdat is a sparse hole.
+    // No `keep` copy is requested, so finalization only appends metadata.
+    let tracks = [TrackFixture {
+        id: 1,
+        handler: *b"vide",
+        timescale: 1000,
+        duration: 0,
+        flags: 7,
+        tables: empty_tables(),
+    }];
+    let prefix = [ftyp(), init_moov(1000, &tracks)].concat();
+    let path = write_temp("boundary-sparse-mdat", &prefix);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let large_size = (1u64 << 32) + 4096;
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(&1u32.to_be_bytes()).unwrap();
+    file.write_all(b"mdat").unwrap();
+    file.write_all(&large_size.to_be_bytes()).unwrap();
+    let moof_offset = prefix.len() as u64 + large_size;
+    file.seek(SeekFrom::Start(moof_offset)).unwrap();
+    let samples = [(1000, 4, 0, 0)];
+    let fragment = moof_at(
+        moof_offset,
+        &[TrafSpec {
+            track_id: 1,
+            defaults: None,
+            samples: &samples,
+            data_offset: true,
+        }],
+    );
+    let payload_offset = moof_offset + fragment.len() as u64 + 8;
+    file.write_all(&fragment).unwrap();
+    file.write_all(&mdat(b"test")).unwrap();
+    drop(file);
+    let original_len = std::fs::metadata(&path).unwrap().len();
+    assert!(payload_offset > u32::MAX as u64);
+    assert_eq!(read(&path).unwrap().tracks[0].bytes, 4);
+    finalize(&path, &Layout::default(), CrashAt::None, None, None).unwrap();
+    let (mut file, boxes, len) = scan(&path).unwrap();
+    assert!(len > original_len && len - original_len < 16384);
+    let moov = boxes.iter().rfind(|b| b.kind == MOOV).unwrap();
+    let moov = read_at(&mut file, moov.start, moov.size).unwrap();
+    assert_eq!(chunk_offsets(&moov, 0), vec![payload_offset]);
+    assert!(moov.windows(4).any(|kind| kind == b"co64"));
+    assert_eq!(read_at(&mut file, payload_offset, 4).unwrap(), b"test");
+    let after = read(&path).unwrap();
+    assert_eq!(after.tracks[0].samples, 1);
+    assert_eq!(after.tracks[0].duration, 1000);
+    // Independent demuxer evidence, when the development image provides it.
+    // The opaque sample entry is not decodable; packet positions still are.
+    match std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "packet=pos,size",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&path)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                stdout.trim().trim_end_matches(','),
+                format!("4,{payload_offset}")
+            );
+            println!("ffprobe sparse packet size,pos: {}", stdout.trim());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP external sparse packet evidence (ffprobe unavailable)");
+        }
+        Err(error) => panic!("ffprobe: {error}"),
+    }
+    std::fs::remove_file(path).unwrap();
 }
 
 fn opt_flags(sync: bool) -> u32 {
