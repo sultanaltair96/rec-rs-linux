@@ -434,7 +434,8 @@ impl TargetState {
 
     fn removed_message(&self, event: &str) -> String {
         format!(
-            "PipeWire screen-cast node {} (serial {}) was removed ({event})",
+            "the shared screen may have gone away (display disconnected or sharing ended): \
+             PipeWire screen-cast node {} (serial {}) was removed ({event})",
             self.node_id,
             self.serial.as_deref().unwrap_or("unknown")
         )
@@ -534,10 +535,7 @@ fn resolve_target(
                         "rec: debug: screen core.error: id {id}, seq {seq}, res {res}: {message}"
                     );
                 }
-                set_error(
-                    &error,
-                    format!("PipeWire stopped or its remote failed: {message}"),
-                );
+                set_error(&error, remote_failed_message(message));
                 main.quit();
             }
         })
@@ -583,6 +581,10 @@ fn resolve_target(
             state,
         },
     ))
+}
+
+fn remote_failed_message(message: &str) -> String {
+    format!("PipeWire stopped or its remote failed: {message}")
 }
 
 fn on_state(data: &mut StreamData, old: pw::stream::StreamState, new: pw::stream::StreamState) {
@@ -1200,6 +1202,26 @@ mod tests {
             assert!(message.contains(event));
             assert!(!state.borrow().present);
         }
+    }
+
+    #[test]
+    fn pipewire_death_and_display_loss_have_distinct_messages() {
+        let remote = remote_failed_message("connection reset");
+        assert_eq!(
+            remote,
+            "PipeWire stopped or its remote failed: connection reset"
+        );
+        assert!(!remote.contains("display disconnected"));
+        let target = TargetState {
+            node_id: 42,
+            serial: Some("1234".into()),
+            present: false,
+        };
+        let removed = target.removed_message("registry.global_remove");
+        assert!(removed.starts_with(
+            "the shared screen may have gone away (display disconnected or sharing ended):"
+        ));
+        assert!(!removed.contains("PipeWire stopped"));
     }
 
     #[test]

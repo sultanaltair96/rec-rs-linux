@@ -61,6 +61,11 @@ impl Shared {
     }
 }
 
+/// Keep the source's diagnosis: transport failure is not evidence of display loss.
+fn screen_capture_failure(error: &str) -> String {
+    format!("screen capture stopped: {error}")
+}
+
 /// The warning shown when a started screen source delivers nothing for 3 s.
 /// Upstream points at the Screen Recording grant; on Linux the actionable
 /// equivalent is the portal's screen-sharing request.
@@ -637,10 +642,7 @@ impl Session {
                     .as_ref()
                     .and_then(|e| e.lock().unwrap().clone())
                 {
-                    pacer_shared.fail(format!(
-                        "screen capture stopped: the shared screen may have gone away \
-                         (display disconnected or sharing ended): {error}"
-                    ));
+                    pacer_shared.fail(screen_capture_failure(&error));
                     break;
                 }
                 let now = media_types::now();
@@ -1237,6 +1239,21 @@ mod tests {
             "{NO_FRAMES_WARNING}"
         );
         assert!(NO_FRAMES_WARNING.starts_with("rec: warning: no screen frames after 3s"));
+    }
+
+    #[test]
+    fn screen_failure_preserves_transport_vs_display_diagnosis() {
+        let remote = screen_capture_failure("PipeWire stopped or its remote failed: disconnected");
+        assert_eq!(
+            remote,
+            "screen capture stopped: PipeWire stopped or its remote failed: disconnected"
+        );
+        assert!(!remote.contains("display disconnected"));
+        let display = "the shared screen may have gone away (display disconnected or sharing ended): target removed";
+        assert_eq!(
+            screen_capture_failure(display),
+            format!("screen capture stopped: {display}")
+        );
     }
 
     #[test]
