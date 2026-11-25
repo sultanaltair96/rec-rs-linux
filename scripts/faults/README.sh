@@ -33,6 +33,24 @@
 # D-Bus activation environment export allows portal restart without a blocking
 # container keyring dialog at startup. Outstanding/in-flight portal request
 # cancellation is not injected: no deterministic request barrier exists here.
+# Combined idle-app dock burst (inside dev.sh, REC_BIN + OUT_DIR required):
+#   sh scripts/faults/cases.sh dock
+# Two fresh private headless sessions exercise sink-first and video-first
+# removal AND return. Synthetic screen + camera Video/Source nodes and default
+# Audio/Sink are registry-checked; the real app's granted portal screen node is
+# also destroyed. Requires automatic first-frame recovery without user action,
+# no recorder/output file, panic-free quit. dbus-monitor counts CreateSession,
+# SelectSources and Start Request paths until Response/Close: >=6 requests,
+# max outstanding exactly 1, final 0. OpenPipeWireRemote is not a Request.
+# Evidence: app.log, portal-bus.log, producer logs and session.log in OUT_DIR.
+# Limits: app consumes the REAL portal screen, not rec_fault_screen; camera
+# is only advertised (native camera backend uses V4L2), and idle system audio
+# is disabled. Thus this is combined graph churn THROUGH idle app recovery,
+# NOT synthetic camera-frame consumption/fallback or sink-monitor recovery.
+# Outstanding counter observes immediately answered real portal requests; it
+# does NOT inject cancellation while a picker/request is deliberately pending.
+# Run in the dev container only: headless.sh isolates runtime/bus but does not
+# disable physical WirePlumber monitors like session.sh does.
 # Restart: the entire owned PipeWire/Pulse/WirePlumber stack, not host services.
 # Camera: GStreamer ball, YUY2 640x480@30, PipeWire Video/Source node named
 # rec_fault_camera. Synthetic fallback for tests without a camera; NOT a V4L2
